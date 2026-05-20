@@ -1,0 +1,121 @@
+[project]
+name = "disambiguation"
+version = "0.1.0"
+description = "Disambiguation"
+readme = "README.md"
+authors = [{ name = "Masum Billal", email = "billalmasum93@gmail.com" }]
+
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.12.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+
+
+[tool.ruff]
+line-length = 120
+exclude = [
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "*.egg-info",
+    ".pytest_cache",
+    "node_modules",
+    "backend/alembic",
+    "scripts/migrations/**"
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+preview = true
+
+ignore = [
+    "D", # pydocstyle
+    "CPY", # copyright
+    "RUF029", # async doesn't use await
+    "ARG001", # Unused function argument
+    # "LOG", # own logger
+    "FBT", # boolean type
+    "ANN401", # Dynamic typed
+    "SLF001", # private property
+    "PLR0913", # too many arguments
+    "PLR0917", # too many positional arguments
+    "TRY300", # try except else
+    "ERA001", # commented code
+    "COM812", # no trailing comma
+    "TD002", # author in TODO
+    "ANN202", # private return type
+    "PLR6301", # could be method or static
+    "TRY003", # long message outside exception
+    "EM101", # exception literal
+    "INP001", # implicit namespace package
+]
+
+# [tool.ruff.format]
+# skip-magic-trailing-comma = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.per-file-ignores]
+"*tests/*.py" = [
+    "S101",    # asserts allowed in tests...
+    # "ARG",     # Unused function args -> fixtures nevertheless are functionally relevant...
+    # "FBT",     # Don't care about booleans as positional arguments in tests, e.g. via @pytest.mark.parametrize()
+    # "PLR2004", # Magic value used in comparison, ...
+    # "S311",    # Standard pseudo-random generators are not suitable for cryptographic purposes
+]
+
+[tool.bandit]
+exclude_dirs = ['tests', '.venv', 'venv', 'alembic', 'scripts']
+
+[tool.bandit.assert_used]
+skips = ['*_test.py', '*/test_*.py', 'tests/*', '.venv/*', 'venv/*']
+
+
+[tool.mypy]
+python_version = "3.12"
+exclude = []
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12"]
+build-backend = "uv_build"
+
+
+
+[tool.uv]
+cache-keys = [{ file = "uv.lock" }, { git = { commit = true } }]
+concurrent-builds = 4
+concurrent-downloads = 4
+concurrent-installs = 4
+
+[tool.uv.build-backend]
+module-root = ""
