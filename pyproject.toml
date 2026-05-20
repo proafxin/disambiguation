@@ -8,6 +8,7 @@ authors = [{ name = "Masum Billal", email = "billalmasum93@gmail.com" }]
 requires-python = ">=3.13"
 dependencies = [
     "torch>=2.12.0",
+    "datasets>=4.8.5",
 ]
 
 [dependency-groups]
