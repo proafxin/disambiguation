@@ -1,6 +1,6 @@
 [project]
 name = "disambiguation"
-version = "0.1.0"
+version = "0.1.1"
 description = "Disambiguation"
 readme = "README.md"
 authors = [{ name = "Masum Billal", email = "billalmasum93@gmail.com" }]
@@ -15,6 +15,7 @@ dependencies = [
     "transformers>=5.9.0",
     "sentencepiece>=0.2.1",
     "protobuf>=7.35.0",
+    "xgboost-cu13>=3.2.0",
 ]
 
 [dependency-groups]
