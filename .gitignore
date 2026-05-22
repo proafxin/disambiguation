@@ -221,3 +221,4 @@ data/*
 models/*.pt
 RESEARCH.md
 cache/*
+log*.txt
