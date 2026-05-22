@@ -221,7 +221,7 @@ def build_features(doc: DocCache, chain: Chain, cand_sent: int, cand_token: int,
     ], dtype=np.float32)
 
 
-NUM_FEATURES = 48
+NUM_FEATURES = 51
 
 FEATURE_NAMES = [
     "o_pos", "o_dep", "o_gender", "o_number", "o_is_subj",
@@ -239,6 +239,7 @@ FEATURE_NAMES = [
     "propn_first_occurrence_distance", "propn_doc_frequency",
     "cand_sent_propn_count", "cand_token_pos_in_sent", "origin_doc_position",
     "chain_progress", "prior_same_pos_count", "cand_in_quotes",
+    "cur_is_subj", "cand_is_subj_graph_resolved", "cand_is_subj_no_graph",
 ]
 
 

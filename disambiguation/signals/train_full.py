@@ -302,6 +302,9 @@ def build_features_batch(
     features[:, 45] = chain_progress
     features[:, 46] = float(prior_same_pos)
     features[:, 47] = cand_in_quotes
+    features[:, 48] = float(cur[6])
+    features[:, 49] = c_all[:, 6] * graph_resolved
+    features[:, 50] = c_all[:, 6] * (1.0 - graph_resolved)
     return features
 
 

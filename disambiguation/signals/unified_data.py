@@ -55,6 +55,22 @@ def load_litbank_docs(num_docs: int | None = None) -> list[UnifiedDocument]:
     return docs
 
 
+def load_conll2012_docs(num_docs: int | None = None) -> list[UnifiedDocument]:
+    ds = load_from_disk("data/conll2012")
+    data = ds["train"]
+    n = min(num_docs, data.num_rows) if num_docs else data.num_rows
+    docs = []
+    for i in range(n):
+        sample = data[i]
+        docs.append(UnifiedDocument(
+            doc_id=sample["doc_id"],
+            sentences=sample["sentences"],
+            clusters=sample["mention_clusters"],
+            source="conll2012",
+        ))
+    return docs
+
+
 def load_combined(preco_docs: int = 500, litbank_docs: int = 80) -> list[UnifiedDocument]:
     docs = []
     docs.extend(load_preco_docs(preco_docs))
