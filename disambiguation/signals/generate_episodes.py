@@ -4,17 +4,17 @@ from pathlib import Path
 
 import numpy as np
 
-from disambiguation.signals.abstract_features import NUM_FEATURES, POS_IDS
-from disambiguation.signals.resolution_graph import ResolutionGraph
-from disambiguation.signals.train_full import CachedData, build_features_batch
+from disambiguation.signals.abstract_features import NUM_FEATURES
+from disambiguation.signals.chunk_cache import ChunkCache
+from disambiguation.signals.train_full import CachedData, generate_doc_episodes
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 EPISODES_DIR = CACHE_DIR / "episodes"
 
-# Gulliver's Travels doc index — always excluded from training
 GULLIVERS_DOC_IDX = 36676
-# A few other very long chains to keep in test only (top 5 longest in LitBank)
-HELD_OUT_DOC_INDICES = {36676}  # can add more if needed
+HELD_OUT_DOC_INDICES = {36676}
+
+CHUNK_SIZE = 10_000_000
 
 
 def generate_doc_episodes_filtered(
@@ -23,38 +23,33 @@ def generate_doc_episodes_filtered(
     window_tokens: int,
     max_chain_length: int | None = None,
     min_chain_length: int | None = None,
-) -> tuple[list, list]:
-    from disambiguation.signals.train_full import generate_doc_episodes
-
+) -> tuple[list, list, list]:
     if max_chain_length is None and min_chain_length is None:
         return generate_doc_episodes(cache, doc_idx, window_tokens)
 
-    # Filter clusters by chain length before generating episodes
-    start_gsi, end_gsi, source, orig_idx = cache.doc_boundaries[doc_idx]
-    clusters = cache.clusters[doc_idx]
-
-    # Temporarily replace clusters with filtered version
-    filtered_clusters = []
-    for cluster in clusters:
-        chain_len = len(cluster)
-        if max_chain_length is not None and chain_len > max_chain_length:
-            continue
-        if min_chain_length is not None and chain_len < min_chain_length:
-            continue
-        filtered_clusters.append(cluster)
-
-    if not filtered_clusters:
-        return [], []
-
-    # Temporarily patch the cache clusters for this doc
     original_clusters = cache.clusters[doc_idx]
+    filtered_clusters = [
+        c for c in original_clusters
+        if (max_chain_length is None or len(c) <= max_chain_length)
+        and (min_chain_length is None or len(c) >= min_chain_length)
+    ]
+    if not filtered_clusters:
+        return [], [], []
+
     cache.clusters[doc_idx] = filtered_clusters
     try:
-        feats, labels = generate_doc_episodes(cache, doc_idx, window_tokens)
+        feats, labels, ranks = generate_doc_episodes(cache, doc_idx, window_tokens)
     finally:
         cache.clusters[doc_idx] = original_clusters
+    return feats, labels, ranks
 
-    return feats, labels
+
+def _chunk_dir(dataset_name: str, window_tokens: int, suffix: str) -> Path:
+    return EPISODES_DIR / f"{dataset_name}_w{window_tokens}{suffix}"
+
+
+def _manifest_path(dataset_name: str, window_tokens: int, suffix: str) -> Path:
+    return _chunk_dir(dataset_name, window_tokens, suffix) / "manifest.json"
 
 
 def generate_dataset_episodes(
@@ -72,57 +67,132 @@ def generate_dataset_episodes(
     if min_chain_length is not None:
         suffix += f"_minhop{min_chain_length}"
 
-    output_path = EPISODES_DIR / f"{dataset_name}_w{window_tokens}{suffix}.npz"
-    if output_path.exists():
-        data = np.load(output_path)
-        n = data["X"].shape[0]
-        pos = int(data["y"].sum())
-        print(f"  {dataset_name}{suffix} w={window_tokens}: already exists ({n:,} eps, pos_rate={pos/max(n,1):.4f})")
-        return n, pos
+    manifest = _manifest_path(dataset_name, window_tokens, suffix)
+    if manifest.exists():
+        with open(manifest) as f:
+            m = json.load(f)
+        print(f"  {dataset_name}{suffix} w={window_tokens}: already exists "
+              f"({m['total_episodes']:,} eps, {m['num_chunks']} chunks, pos_rate={m['pos_rate']:.4f})")
+        return m["total_episodes"], m["total_positive"]
 
-    # Filter out held-out docs
     if exclude_doc_indices:
         doc_indices = [d for d in doc_indices if d not in exclude_doc_indices]
 
+    out_dir = _chunk_dir(dataset_name, window_tokens, suffix)
+    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  {dataset_name}{suffix} w={window_tokens}: {len(doc_indices)} docs...")
     start = time.time()
 
-    all_features = []
-    all_labels = []
-    doc_boundaries = []
-    batch_size = 200
+    doc_map: dict[int, tuple[int, int, int]] = {}
 
-    for i in range(0, len(doc_indices), batch_size):
-        batch = doc_indices[i:i + batch_size]
-        for doc_idx in batch:
-            start_ep = len(all_features)
-            feats, labels = generate_doc_episodes_filtered(
-                cache, doc_idx, window_tokens, max_chain_length, min_chain_length
-            )
-            all_features.extend(feats)
-            all_labels.extend(labels)
-            doc_boundaries.append((doc_idx, start_ep, len(all_features)))
+    chunk_idx = 0
+    chunk_X: list[np.ndarray] = []
+    chunk_y: list[int] = []
+    chunk_ranks: list[int] = []
+    total_eps = 0
+    total_pos = 0
 
-        processed = min(i + batch_size, len(doc_indices))
-        elapsed = time.time() - start
-        rate = processed / max(elapsed, 1e-6)
-        remaining = (len(doc_indices) - processed) / max(rate, 1e-6)
-        print(f"    {processed}/{len(doc_indices)} docs, {len(all_features):,} eps, {rate:.1f} docs/s, ~{remaining:.0f}s left")
+    def _flush_chunk() -> None:
+        nonlocal chunk_idx, chunk_X, chunk_y, chunk_ranks
+        if not chunk_X:
+            return
+        np.save(out_dir / f"chunk_{chunk_idx:04d}_X.npy", np.array(chunk_X, dtype=np.float32))
+        np.save(out_dir / f"chunk_{chunk_idx:04d}_y.npy", np.array(chunk_y, dtype=np.int32))
+        np.save(out_dir / f"chunk_{chunk_idx:04d}_ranks.npy", np.array(chunk_ranks, dtype=np.int32))
+        chunk_idx += 1
+        chunk_X = []
+        chunk_y = []
+        chunk_ranks = []
 
-    if not all_features:
-        return 0, 0
+    for i, doc_idx in enumerate(doc_indices):
+        feats, labels, ranks = generate_doc_episodes_filtered(
+            cache, doc_idx, window_tokens, max_chain_length, min_chain_length
+        )
+        if not feats:
+            continue
 
-    X = np.array(all_features, dtype=np.float32)
-    y = np.array(all_labels, dtype=np.int32)
-    boundaries = np.array(doc_boundaries, dtype=np.int64)
+        n = len(feats)
+        if chunk_X and len(chunk_X) + n > CHUNK_SIZE:
+            _flush_chunk()
 
-    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_path, X=X, y=y, boundaries=boundaries)
+        row_start = len(chunk_X)
+        chunk_X.extend(feats)
+        chunk_y.extend(labels)
+        chunk_ranks.extend(ranks)
+        doc_map[doc_idx] = (chunk_idx, row_start, row_start + n)
+        total_eps += n
+        total_pos += sum(labels)
+
+        if (i + 1) % 200 == 0:
+            elapsed = time.time() - start
+            rate = (i + 1) / max(elapsed, 1e-6)
+            remaining = (len(doc_indices) - i - 1) / max(rate, 1e-6)
+            print(f"    {i+1}/{len(doc_indices)} docs, {total_eps:,} eps, "
+                  f"{rate:.1f} docs/s, ~{remaining:.0f}s left")
+
+    _flush_chunk()
+
+    manifest_data = {
+        "dataset": dataset_name,
+        "window_tokens": window_tokens,
+        "suffix": suffix,
+        "total_episodes": total_eps,
+        "total_positive": total_pos,
+        "pos_rate": total_pos / max(total_eps, 1),
+        "num_chunks": chunk_idx,
+        "chunk_size": CHUNK_SIZE,
+        "doc_map": {str(k): list(v) for k, v in doc_map.items()},
+    }
+    with open(manifest, "w") as f:
+        json.dump(manifest_data, f)
 
     elapsed = time.time() - start
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"    Saved: {X.shape[0]:,} episodes, pos_rate={y.mean():.4f}, {elapsed:.0f}s, {size_mb:.0f} MB")
-    return X.shape[0], int(y.sum())
+    size_mb = sum(f.stat().st_size for f in out_dir.iterdir()) / (1024 * 1024)
+    print(f"    Saved: {total_eps:,} eps in {chunk_idx} chunks, "
+          f"pos_rate={total_pos/max(total_eps,1):.4f}, {elapsed:.0f}s, {size_mb:.0f} MB")
+    return total_eps, total_pos
+
+
+_chunk_cache = ChunkCache()
+
+
+def load_episodes_for_docs(
+    dataset_name: str,
+    doc_indices: np.ndarray,
+    window_tokens: int,
+    suffix: str = "",
+) -> tuple[np.ndarray, np.ndarray]:
+    manifest = _manifest_path(dataset_name, window_tokens, suffix)
+    if not manifest.exists():
+        return np.empty((0, NUM_FEATURES), dtype=np.float32), np.empty(0, dtype=np.int32)
+
+    with open(manifest) as f:
+        m = json.load(f)
+
+    doc_map = {int(k): tuple(v) for k, v in m["doc_map"].items()}
+    out_dir = _chunk_dir(dataset_name, window_tokens, suffix)
+
+    chunks_needed: dict[int, list[tuple[int, int, int]]] = {}
+    for doc_idx in doc_indices:
+        if int(doc_idx) not in doc_map:
+            continue
+        ci, rs, re = doc_map[int(doc_idx)]
+        chunks_needed.setdefault(ci, []).append((ci, rs, re))
+
+    if not chunks_needed:
+        return np.empty((0, NUM_FEATURES), dtype=np.float32), np.empty(0, dtype=np.int32)
+
+    X_parts, y_parts = [], []
+    for ci in sorted(chunks_needed):
+        X_chunk, y_chunk = _chunk_cache.load(
+            out_dir / f"chunk_{ci:04d}_X.npy",
+            out_dir / f"chunk_{ci:04d}_y.npy",
+        )
+        for _, rs, re in chunks_needed[ci]:
+            X_parts.append(X_chunk[rs:re])
+            y_parts.append(y_chunk[rs:re])
+
+    return np.concatenate(X_parts), np.concatenate(y_parts)
 
 
 def generate_all() -> None:
@@ -139,34 +209,32 @@ def generate_all() -> None:
         print(f"WINDOW = {window} tokens")
         print(f"{'='*60}")
 
-        # Standard episodes (all chains, exclude held-out docs)
         for name, r in ranges.items():
             doc_indices = list(range(r["start_doc"], r["end_doc"]))
             generate_dataset_episodes(cache, name, doc_indices, window,
                                       exclude_doc_indices=HELD_OUT_DOC_INDICES)
 
-        # Table 5: low-hop training data (chains ≤10 hops)
-        # Only for LitBank (has the long chains worth filtering)
         r = ranges["litbank"]
         litbank_docs = [d for d in range(r["start_doc"], r["end_doc"]) if d not in HELD_OUT_DOC_INDICES]
         generate_dataset_episodes(cache, "litbank", litbank_docs, window, max_chain_length=10)
 
-        # Table 5: high-hop test data (chains >50 hops) — includes held-out docs
         all_litbank = list(range(r["start_doc"], r["end_doc"]))
         generate_dataset_episodes(cache, "litbank_hihop", all_litbank, window, min_chain_length=50)
 
-        # Gulliver's held-out (all chains)
         generate_dataset_episodes(cache, "gullivers", [GULLIVERS_DOC_IDX], window)
 
-    # Summary
     print(f"\n{'='*60}")
     print("SUMMARY")
     print(f"{'='*60}")
-    total_size = sum(f.stat().st_size for f in EPISODES_DIR.iterdir()) / (1024**2)
-    print(f"Total on disk: {total_size:.0f} MB")
-    for f in sorted(EPISODES_DIR.iterdir()):
-        data = np.load(f)
-        print(f"  {f.name:40s} {data['X'].shape[0]:>10,} episodes  pos_rate={data['y'].mean():.4f}")
+    for d in sorted(EPISODES_DIR.iterdir()):
+        if d.is_dir():
+            mp = d / "manifest.json"
+            if mp.exists():
+                with open(mp) as f:
+                    m = json.load(f)
+                size_mb = sum(f.stat().st_size for f in d.iterdir()) / (1024 * 1024)
+                print(f"  {d.name:45s} {m['total_episodes']:>12,} eps  "
+                      f"pos_rate={m['pos_rate']:.4f}  {size_mb:.0f} MB")
 
 
 if __name__ == "__main__":

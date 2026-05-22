@@ -16,8 +16,7 @@ from disambiguation.signals.resolution_graph import ResolutionGraph
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 MAX_HOPS = 512
 TOP_K = 20
-# Confidence threshold to commit a link to the resolution graph
-COMMIT_THRESHOLD = 0.7
+NEG_SAMPLES = 4
 
 
 class CachedData:
@@ -29,34 +28,17 @@ class CachedData:
         self.token_data = ti["data"].astype(np.float32)
         self.sent_offsets = ti["offsets"]
 
-        se = np.load(CACHE_DIR / "sentence_embeddings.npz")
-        self.sent_embs = se["data"].astype(np.float32)
-        norms = np.linalg.norm(self.sent_embs, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        self.sent_embs_normed = self.sent_embs / norms
-
-        ne = np.load(CACHE_DIR / "noun_embeddings.npz")
-        self.noun_embs = ne["data"].astype(np.float32)
-        noun_norms = np.linalg.norm(self.noun_embs, axis=1, keepdims=True)
-        noun_norms = np.where(noun_norms == 0, 1.0, noun_norms)
-        self.noun_embs_normed = self.noun_embs / noun_norms
-
         with open(CACHE_DIR / "metadata.json") as f:
             meta = json.load(f)
         self.doc_boundaries = meta["doc_boundaries"]
-        self.noun_positions = meta["noun_positions"]
 
         with open(CACHE_DIR / "clusters.json") as f:
             self.clusters = json.load(f)
 
-        self.noun_lookup = {}
-        for i, (gsi, ti) in enumerate(self.noun_positions):
-            self.noun_lookup[(gsi, ti)] = i
-
         elapsed = time.time() - start
-        ram = (self.token_data.nbytes + self.sent_embs.nbytes + self.noun_embs.nbytes) / (1024**3)
+        ram = self.token_data.nbytes / (1024**3)
         print(f"  Loaded in {elapsed:.1f}s, {ram:.2f} GB RAM")
-        print(f"  {len(self.doc_boundaries)} docs, {len(self.sent_offsets)-1} sents, {len(self.noun_positions)} nouns")
+        print(f"  {len(self.doc_boundaries)} docs, {len(self.sent_offsets)-1} sents")
 
     def get_token_info(self, global_sent_idx: int, token_idx: int) -> np.ndarray:
         return self.token_data[int(self.sent_offsets[global_sent_idx]) + token_idx]
@@ -64,34 +46,137 @@ class CachedData:
     def get_sent_length(self, global_sent_idx: int) -> int:
         return int(self.sent_offsets[global_sent_idx + 1] - self.sent_offsets[global_sent_idx])
 
-    def cosine_sim_batch(self, query_idx: int, cand_indices: np.ndarray) -> np.ndarray:
-        return self.sent_embs_normed[query_idx] @ self.sent_embs_normed[cand_indices].T
 
 
-def build_propn_stats(cache: CachedData, start_gsi: int, end_gsi: int) -> dict:
-    first_abs: dict[tuple, int] = {}  # (gsi, ti) -> first absolute position
-    type_freq: dict[tuple, int] = {}  # token feature fingerprint -> count
-    type_first: dict[tuple, int] = {}  # token feature fingerprint -> first abs pos
+def build_doc_arrays(cache: CachedData, start_gsi: int, end_gsi: int) -> dict:
+    doc_start_abs = int(cache.sent_offsets[start_gsi])
+    doc_end_abs = int(cache.sent_offsets[end_gsi])
+    doc_len = doc_end_abs - doc_start_abs
+
+    pos_slice = cache.token_data[doc_start_abs:doc_end_abs, 0].astype(np.int32)
+
+    # Per-sentence propn counts and quote masks (indexed by gsi - start_gsi)
+    n_sents = end_gsi - start_gsi
+    sent_propn_counts = np.zeros(n_sents, dtype=np.int32)
+    sent_quote_masks = []
+    PUNCT_ID = POS_IDS.get("PUNCT", 13)
+    for i, gsi in enumerate(range(start_gsi, end_gsi)):
+        sent_len = cache.get_sent_length(gsi)
+        sent_abs = int(cache.sent_offsets[gsi])
+        sent_pos = cache.token_data[sent_abs:sent_abs + sent_len, 0].astype(np.int32)
+        sent_propn_counts[i] = int(np.sum(sent_pos == POS_IDS["PROPN"]))
+        sent_quote_masks.append((sent_pos == PUNCT_ID))
+
+    # POS cumulative counts for prior_same_pos (indexed by abs_pos - doc_start_abs)
+    pos_cumcounts = {}
+    for pos_id in np.unique(pos_slice):
+        mask = pos_slice == pos_id
+        pos_cumcounts[int(pos_id)] = np.cumsum(mask)
+
+    # PROPN salience arrays (indexed by abs_pos - doc_start_abs)
+    propn_type_first = np.full(doc_len, -1, dtype=np.int64)   # first abs_pos of this type
+    propn_type_freq = np.zeros(doc_len, dtype=np.int32)
+    fp_first: dict[tuple, int] = {}
+    fp_freq: dict[tuple, int] = {}
     for gsi in range(start_gsi, end_gsi):
         sent_len = cache.get_sent_length(gsi)
         for ti in range(sent_len):
             info = cache.get_token_info(gsi, ti)
-            if info[0] != POS_IDS["PROPN"]:
+            if int(info[0]) != POS_IDS["PROPN"]:
                 continue
-            key = (gsi, ti)
-            abs_pos = int(cache.sent_offsets[gsi]) + ti
-            first_abs[key] = abs_pos
-            # Fingerprint: pos, dep, gender, number as a tuple (ignores sent_position etc.)
             fp = (int(info[0]), int(info[1]), int(info[2]), int(info[3]))
-            type_freq[fp] = type_freq.get(fp, 0) + 1
-            if fp not in type_first:
-                type_first[fp] = abs_pos
-    stats = {}
-    for key, abs_pos in first_abs.items():
-        info = cache.get_token_info(key[0], key[1])
-        fp = (int(info[0]), int(info[1]), int(info[2]), int(info[3]))
-        stats[key] = (type_first[fp], type_freq.get(fp, 1))
-    return stats
+            abs_pos = int(cache.sent_offsets[gsi]) + ti
+            doc_pos = abs_pos - doc_start_abs
+            fp_freq[fp] = fp_freq.get(fp, 0) + 1
+            if fp not in fp_first:
+                fp_first[fp] = abs_pos
+            propn_type_first[doc_pos] = fp_first[fp]
+            propn_type_freq[doc_pos] = fp_freq[fp]
+
+    return {
+        "doc_start_abs": doc_start_abs,
+        "doc_len": doc_len,
+        "pos_cumcounts": pos_cumcounts,
+        "sent_propn_counts": sent_propn_counts,
+        "sent_quote_masks": sent_quote_masks,
+        "propn_type_first": propn_type_first,
+        "propn_type_freq": propn_type_freq,
+    }
+
+
+def _structural_candidates(
+    cache: CachedData,
+    cur_abs: int,
+    gsi_lo: int,
+    gsi_hi: int,
+    start_gsi: int,
+    end_gsi: int,
+    window_tokens: int,
+    visited_abs: np.ndarray,
+    doc_start_abs: int,
+    doc_len: int,
+    resolved_gender: int,
+    resolved_number: int,
+    graph_cluster_ids: np.ndarray,
+    chain_deps: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    range_start = int(cache.sent_offsets[gsi_lo])
+    range_end = int(cache.sent_offsets[gsi_hi])
+    if range_end <= range_start:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+    abs_positions = np.arange(range_start, range_end, dtype=np.int64)
+    tokens_in_range = cache.token_data[range_start:range_end, 0]
+    gender_in_range = cache.token_data[range_start:range_end, 2]
+    number_in_range = cache.token_data[range_start:range_end, 3]
+
+    nominal_mask = np.isin(tokens_in_range, [POS_IDS["NOUN"], POS_IDS["PROPN"], POS_IDS["PRON"]])
+    window_mask = np.abs(abs_positions - cur_abs) <= window_tokens
+
+    doc_rel = abs_positions - doc_start_abs
+    valid_doc_rel = (doc_rel >= 0) & (doc_rel < doc_len)
+    visited_mask = np.zeros(len(abs_positions), dtype=bool)
+    valid_idx = np.where(valid_doc_rel)[0]
+    visited_mask[valid_idx] = visited_abs[doc_rel[valid_idx]]
+
+    # Structural pre-filter: keep if gender/number compatible OR PROPN OR in graph
+    gender_ok = (
+        (resolved_gender == 3) | (gender_in_range == 3) | (gender_in_range == resolved_gender)
+    )
+    number_ok = (
+        (resolved_number == 2) | (number_in_range == 2) | (number_in_range == resolved_number)
+    )
+    morph_ok = gender_ok & number_ok
+    is_propn = tokens_in_range == POS_IDS["PROPN"]
+    in_graph = np.zeros(len(abs_positions), dtype=bool)
+    in_graph[valid_idx] = graph_cluster_ids[doc_rel[valid_idx]] >= 0
+
+    # For NOUN candidates: require dep role is salient or appears in chain history
+    SALIENT_DEPS = np.array([0, 1, 2, 3, 5, 11, 12], dtype=np.float32)  # nsubj,obj,obl,nmod,appos,root,nsubj:pass
+    dep_in_range = cache.token_data[range_start:range_end, 1]
+    is_noun = tokens_in_range == POS_IDS["NOUN"]
+    dep_salient = np.isin(dep_in_range, SALIENT_DEPS)
+    dep_in_chain = np.isin(dep_in_range, chain_deps) if len(chain_deps) > 0 else np.zeros(len(abs_positions), dtype=bool)
+    noun_dep_ok = ~is_noun | dep_salient | dep_in_chain
+
+    structural_ok = (morph_ok | is_propn | in_graph) & noun_dep_ok
+
+    valid_mask = nominal_mask & window_mask & ~visited_mask & structural_ok
+    valid_abs_arr = abs_positions[valid_mask]
+
+    if len(valid_abs_arr) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+    gsi_range = np.arange(gsi_lo, gsi_hi)
+    sent_ends = cache.sent_offsets[gsi_range + 1]
+    gsi_indices = np.searchsorted(sent_ends, valid_abs_arr, side="right")
+    valid_filter = gsi_indices < len(gsi_range)
+    valid_abs_arr = valid_abs_arr[valid_filter]
+    gsi_indices = gsi_indices[valid_filter]
+    cand_gsis = gsi_range[gsi_indices]
+    cand_tis = valid_abs_arr - cache.sent_offsets[cand_gsis]
+
+    return cand_gsis, cand_tis, valid_abs_arr
 
 
 def build_features_batch(
@@ -105,15 +190,23 @@ def build_features_batch(
     resolved_number: int,
     chain_deps: np.ndarray,
     chain_pos: np.ndarray,
-    chain_noun_indices: list[int],
-    ranks: np.ndarray,
     num_cands: int,
     num_gender_match: int,
     num_propn_cands: int,
-    graph: ResolutionGraph,
-    origin_key: tuple,
-    propn_stats: dict,
-    cur_abs: int,
+    graph_cluster_ids: np.ndarray,
+    graph_confidences: np.ndarray,
+    origin_cluster_id: int,
+    doc_start_abs: int,
+    propn_first_abs: np.ndarray,
+    propn_type_first: np.ndarray,
+    propn_type_freq: np.ndarray,
+    sent_propn_counts: np.ndarray,
+    sent_quote_mask: np.ndarray,
+    sent_offsets_doc: np.ndarray,
+    origin_doc_pos: float,
+    prior_same_pos: int,
+    chain_progress: float,
+    start_gsi: int,
 ) -> np.ndarray:
     n = len(cand_gsis)
     o = cache.get_token_info(origin_gsi, origin_ti)
@@ -145,114 +238,133 @@ def build_features_batch(
     # Verb/head association (vectorized)
     verb_id = POS_IDS["VERB"]
     bhv = ((o[13] == verb_id) & (c_all[:, 13] == verb_id)).astype(np.float32)
-    shpo = (o[13] == c_all[:, 13]).astype(np.float32)
-    shpc = (cur[13] == c_all[:, 13]).astype(np.float32)
     sht = ((cand_gsis == current_gsi) & (c_all[:, 12] >= 0) & (cur[12] >= 0) & (c_all[:, 12] == cur[12])).astype(np.float32)
     cva = ((c_all[:, 13] == verb_id) & ((c_all[:, 6] == 1) | (c_all[:, 7] == 1))).astype(np.float32)
     ova = float(o[13] == verb_id and (o[6] == 1 or o[7] == 1))
 
-    # Noun similarity (vectorized)
-    noun_sims = np.zeros(n, dtype=np.float32)
-    if chain_noun_indices:
-        chain_embs = cache.noun_embs_normed[chain_noun_indices]
-        for i in range(n):
-            idx = cache.noun_lookup.get((int(cand_gsis[i]), int(cand_tis[i])), -1)
-            if idx >= 0:
-                noun_sims[i] = float((chain_embs @ cache.noun_embs_normed[idx]).max())
-
-    # Graph signals
-    graph_resolved = np.zeros(n, dtype=np.float32)
+    # Graph signals — vectorized via pre-built arrays
+    cand_abs_doc = cand_abs - doc_start_abs
+    valid_abs = (cand_abs_doc >= 0) & (cand_abs_doc < len(graph_cluster_ids))
+    cand_cluster_ids = np.full(n, -1, dtype=np.int32)
+    cand_cluster_ids[valid_abs] = graph_cluster_ids[cand_abs_doc[valid_abs]]
+    graph_resolved = (cand_cluster_ids >= 0).astype(np.float32)
     graph_confidence = np.zeros(n, dtype=np.float32)
-    graph_same_cluster = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        ckey = (int(cand_gsis[i]), int(cand_tis[i]))
-        graph_resolved[i] = float(graph.is_resolved(ckey))
-        graph_confidence[i] = graph.get_confidence(ckey)
-        graph_same_cluster[i] = float(graph.same_cluster(origin_key, ckey))
+    graph_confidence[valid_abs] = graph_confidences[cand_abs_doc[valid_abs]]
+    graph_same_cluster = ((cand_cluster_ids >= 0) & (cand_cluster_ids == origin_cluster_id)).astype(np.float32)
 
-    # PROPN first-occurrence and frequency signals
+    # PROPN salience — vectorized via pre-built per-token arrays
     propn_is_first = np.zeros(n, dtype=np.float32)
     propn_first_dist = np.zeros(n, dtype=np.float32)
     propn_freq = np.zeros(n, dtype=np.float32)
+    propn_mask = c_all[:, 0] == POS_IDS["PROPN"]
+    if propn_mask.any():
+        pm_abs = cand_abs[propn_mask] - doc_start_abs
+        valid_pm = (pm_abs >= 0) & (pm_abs < len(propn_first_abs))
+        pm_abs_v = pm_abs[valid_pm]
+        first_abs_vals = propn_type_first[pm_abs_v]
+        propn_is_first_vals = (cand_abs[propn_mask][valid_pm] == (first_abs_vals + doc_start_abs)).astype(np.float32)
+        propn_first_dist_vals = np.abs(cur_abs - (first_abs_vals + doc_start_abs)).astype(np.float32)
+        propn_freq_vals = propn_type_freq[pm_abs_v].astype(np.float32)
+        idx = np.where(propn_mask)[0][valid_pm]
+        propn_is_first[idx] = propn_is_first_vals
+        propn_first_dist[idx] = propn_first_dist_vals
+        propn_freq[idx] = propn_freq_vals
+
+    # Discourse context — vectorized
+    cand_token_pos_in_sent = cand_tis.astype(np.float32)
+    cand_sent_propn_count = np.array(
+        [sent_propn_counts[int(g) - start_gsi] if 0 <= int(g) - start_gsi < len(sent_propn_counts) else 0
+         for g in cand_gsis], dtype=np.float32
+    )
+    # Quote adjacency
+    cand_in_quotes = np.zeros(n, dtype=np.float32)
     for i in range(n):
-        ckey = (int(cand_gsis[i]), int(cand_tis[i]))
-        if ckey in propn_stats:
-            first_abs_pos, freq = propn_stats[ckey]
-            cand_abs_pos = int(cache.sent_offsets[cand_gsis[i]]) + int(cand_tis[i])
-            propn_is_first[i] = float(cand_abs_pos == first_abs_pos)
-            propn_first_dist[i] = float(abs(cur_abs - first_abs_pos))
-            propn_freq[i] = float(freq)
+        gsi_off = int(cand_gsis[i]) - start_gsi
+        if 0 <= gsi_off < len(sent_quote_mask):
+            ti = int(cand_tis[i])
+            qmask = sent_quote_mask[gsi_off]
+            if len(qmask) > 0:
+                cand_in_quotes[i] = float(
+                    (ti > 0 and qmask[ti - 1]) or (ti + 1 < len(qmask) and qmask[ti + 1])
+                )
+
+    sdc = (c_all[:, 1] == cur[1]).astype(np.float32)
+    sdo = (c_all[:, 1] == o[1]).astype(np.float32)
 
     features = np.empty((n, NUM_FEATURES), dtype=np.float32)
     features[:, 0] = o[0]; features[:, 1] = o[1]; features[:, 2] = o[2]; features[:, 3] = o[3]
-    features[:, 4] = o[6]; features[:, 5] = o[8]
-    features[:, 6] = cur[0]; features[:, 7] = cur[1]; features[:, 8] = cur[2]; features[:, 9] = cur[3]
-    features[:, 10] = cur[6]; features[:, 11] = cur[8]
-    features[:, 12] = c_all[:, 0]; features[:, 13] = c_all[:, 1]
-    features[:, 14] = c_all[:, 2]; features[:, 15] = c_all[:, 3]
-    features[:, 16] = c_all[:, 4]; features[:, 17] = c_all[:, 6]
-    features[:, 18] = c_all[:, 7]; features[:, 19] = c_all[:, 8]
-    features[:, 20] = (c_all[:, 1] == cur[1]).astype(np.float32)
-    features[:, 21] = (c_all[:, 1] == o[1]).astype(np.float32)
-    features[:, 22] = (c_all[:, 0] == cur[0]).astype(np.float32)
-    features[:, 23] = (c_all[:, 6] == o[6]).astype(np.float32)
-    features[:, 24] = c_all[:, 9]
-    features[:, 25] = (cand_gsis == current_gsi).astype(np.float32)
-    features[:, 26] = np.abs(cand_abs - cur_abs).astype(np.float32)
-    features[:, 27] = np.abs(cand_gsis - current_gsi).astype(np.float32)
-    features[:, 28] = hop_count
-    features[:, 29] = gmo; features[:, 30] = nmo
-    features[:, 31] = gmc; features[:, 32] = nmc
-    features[:, 33] = rgm; features[:, 34] = rnm
-    features[:, 35] = dep_con; features[:, 36] = pos_con; features[:, 37] = ipt
-    features[:, 38] = bhv; features[:, 39] = shpo; features[:, 40] = shpc
-    features[:, 41] = sht; features[:, 42] = cva; features[:, 43] = ova
-    features[:, 44] = ranks.astype(np.float32)
-    features[:, 45] = num_cands; features[:, 46] = num_gender_match
-    features[:, 47] = num_propn_cands; features[:, 48] = noun_sims
-    features[:, 49] = graph_resolved
-    features[:, 50] = graph_confidence
-    features[:, 51] = graph_same_cluster
-    features[:, 52] = propn_is_first
-    features[:, 53] = propn_first_dist
-    features[:, 54] = propn_freq
+    features[:, 4] = o[6]
+    features[:, 5] = cur[0]; features[:, 6] = cur[1]; features[:, 7] = cur[2]; features[:, 8] = cur[3]
+    features[:, 9] = c_all[:, 0]; features[:, 10] = c_all[:, 1]
+    features[:, 11] = c_all[:, 2]; features[:, 12] = c_all[:, 3]
+    features[:, 13] = c_all[:, 4]; features[:, 14] = c_all[:, 6]
+    features[:, 15] = (c_all[:, 0] == cur[0]).astype(np.float32)
+    features[:, 16] = c_all[:, 9]
+    features[:, 17] = (cand_gsis == current_gsi).astype(np.float32)
+    features[:, 18] = np.abs(cand_abs - cur_abs).astype(np.float32)
+    features[:, 19] = np.abs(cand_gsis - current_gsi).astype(np.float32)
+    features[:, 20] = hop_count
+    features[:, 21] = gmo; features[:, 22] = nmo
+    features[:, 23] = gmc; features[:, 24] = nmc
+    features[:, 25] = rgm; features[:, 26] = rnm
+    features[:, 27] = dep_con; features[:, 28] = pos_con; features[:, 29] = ipt
+    features[:, 30] = sdc; features[:, 31] = sdo
+    features[:, 32] = bhv; features[:, 33] = sht; features[:, 34] = cva; features[:, 35] = ova
+    features[:, 36] = num_cands; features[:, 37] = num_gender_match; features[:, 38] = num_propn_cands
+    features[:, 39] = graph_resolved; features[:, 40] = graph_confidence; features[:, 41] = graph_same_cluster
+    features[:, 42] = propn_is_first; features[:, 43] = propn_first_dist; features[:, 44] = propn_freq
+    features[:, 45] = cand_sent_propn_count
+    features[:, 46] = cand_token_pos_in_sent
+    features[:, 47] = float(origin_doc_pos)
+    features[:, 48] = chain_progress
+    features[:, 49] = float(prior_same_pos)
+    features[:, 50] = cand_in_quotes
     return features
 
 
-def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 150) -> tuple[list[np.ndarray], list[int]]:
+def generate_doc_episodes(
+    cache: CachedData,
+    doc_idx: int,
+    window_tokens: int = 150,
+    rng: np.random.Generator | None = None,
+) -> tuple[list[np.ndarray], list[int], list[int]]:
+    if rng is None:
+        rng = np.random.default_rng(doc_idx)
+
     start_gsi, end_gsi, source, orig_idx = cache.doc_boundaries[doc_idx]
     clusters = cache.clusters[doc_idx]
 
-    features_list = []
-    labels_list = []
+    features_list: list[np.ndarray] = []
+    labels_list: list[int] = []
+    ranks_list: list[int] = []  # embedding rank for benchmark analysis
 
-    # One resolution graph per document — shared across all mentions
     graph = ResolutionGraph()
-    propn_stats = build_propn_stats(cache, start_gsi, end_gsi)
+    doc_arrays = build_doc_arrays(cache, start_gsi, end_gsi)
+    doc_start_abs = doc_arrays["doc_start_abs"]
+    doc_len = doc_arrays["doc_len"]
 
-    # Pre-register all PROPN mentions as potential canonical entities
+    # Pre-register all PROPN mentions
     for cluster in clusters:
         for mention in cluster:
             si, st, en = mention
             gsi = start_gsi + si
             if gsi < end_gsi and st < cache.get_sent_length(gsi):
-                info = cache.get_token_info(gsi, st)
-                if info[0] == POS_IDS["PROPN"]:
+                if cache.get_token_info(gsi, st)[0] == POS_IDS["PROPN"]:
                     graph.add_mention((gsi, st), is_propn=True)
 
     for cluster in clusters:
         if len(cluster) < 2:
             continue
 
-        correct_positions = set()
+        correct_abs = set()
         for mention in cluster:
-            si, st, en = mention
+            si, st, _ = mention
             gsi = start_gsi + si
             if gsi < end_gsi:
-                correct_positions.add((gsi, st))
+                correct_abs.add(int(cache.sent_offsets[gsi]) + st)
 
         for mention in cluster:
-            si, st, en = mention
+            si, st, _ = mention
             origin_gsi = start_gsi + si
             if origin_gsi >= end_gsi:
                 continue
@@ -263,106 +375,115 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
             if origin_info[0] == POS_IDS["PROPN"]:
                 continue
 
+            # Skip if already resolved: cluster has a PROPN or a graph-resolved canonical
+            graph_cluster_ids_pre, _ = graph.build_abs_arrays(
+                cache.sent_offsets, doc_start_abs, doc_len
+            )
+            origin_abs_pre = int(cache.sent_offsets[origin_gsi]) + st
+            if origin_abs_pre - doc_start_abs < doc_len:
+                if graph_cluster_ids_pre[origin_abs_pre - doc_start_abs] >= 0:
+                    continue
+
+            origin_abs = int(cache.sent_offsets[origin_gsi]) + st
+            origin_doc_pos = (origin_abs - doc_start_abs) / max(doc_len - 1, 1)
+            origin_pos_id = int(origin_info[0])
+            cum = doc_arrays["pos_cumcounts"].get(origin_pos_id)
+            prior_same_pos = int(cum[origin_abs - doc_start_abs - 1]) if cum is not None and origin_abs - doc_start_abs > 0 else 0
+
             current_gsi = origin_gsi
             current_ti = st
-            visited = {(origin_gsi, st)}
+            visited_abs = np.zeros(doc_len, dtype=bool)
+            visited_abs[origin_abs - doc_start_abs] = True
+
             resolved_gender = int(origin_info[2]) if origin_info[2] != 3 else 3
             resolved_number = int(origin_info[3]) if origin_info[3] != 2 else 2
             chain_deps = np.array([int(origin_info[1])], dtype=np.float32)
             chain_pos = np.array([int(origin_info[0])], dtype=np.float32)
-            chain_noun_indices = []
-
-            origin_noun_idx = cache.noun_lookup.get((origin_gsi, st), -1)
-            if origin_noun_idx >= 0:
-                chain_noun_indices.append(origin_noun_idx)
 
             for hop in range(MAX_HOPS):
                 cur_abs = int(cache.sent_offsets[current_gsi]) + current_ti
                 gsi_lo = max(start_gsi, current_gsi - 20)
                 gsi_hi = min(end_gsi, current_gsi + 20)
 
-                range_start = int(cache.sent_offsets[gsi_lo])
-                range_end = int(cache.sent_offsets[gsi_hi])
-                if range_end <= range_start:
+                graph_cluster_ids, graph_confidences = graph.build_abs_arrays(
+                    cache.sent_offsets, doc_start_abs, doc_len
+                )
+                origin_cluster_id = graph_cluster_ids[origin_abs - doc_start_abs] if origin_abs - doc_start_abs < doc_len else -1
+
+                cand_gsis, cand_tis, valid_abs_arr = _structural_candidates(
+                    cache, cur_abs, gsi_lo, gsi_hi, start_gsi, end_gsi,
+                    window_tokens, visited_abs, doc_start_abs, doc_len,
+                    resolved_gender, resolved_number, graph_cluster_ids,
+                    chain_deps,
+                )
+
+                if len(cand_gsis) == 0:
                     break
 
-                tokens_in_range = cache.token_data[range_start:range_end, 0]
-                abs_positions = np.arange(range_start, range_end)
+                # Limit to TOP_K
+                top_cand_gsis = cand_gsis[:TOP_K]
+                top_cand_tis = cand_tis[:TOP_K]
+                top_abs = valid_abs_arr[:TOP_K]
 
-                nominal_mask = np.isin(tokens_in_range, [POS_IDS["NOUN"], POS_IDS["PROPN"], POS_IDS["PRON"]])
-                window_mask = np.abs(abs_positions - cur_abs) <= window_tokens
-                valid_abs = abs_positions[nominal_mask & window_mask]
-
-                if len(valid_abs) == 0:
-                    break
-
-                gsi_range = np.arange(gsi_lo, gsi_hi)
-                sent_ends = cache.sent_offsets[gsi_range + 1]
-
-                gsi_indices = np.searchsorted(sent_ends, valid_abs, side="right")
-                valid_filter = gsi_indices < len(gsi_range)
-                valid_abs = valid_abs[valid_filter]
-                gsi_indices = gsi_indices[valid_filter]
-
-                gsis = gsi_range[gsi_indices]
-                tis = valid_abs - cache.sent_offsets[gsis]
-
-                candidates = [
-                    (int(gsi), int(ti), int(ap))
-                    for gsi, ti, ap in zip(gsis, tis, valid_abs)
-                    if (int(gsi), int(ti)) not in visited
-                ]
-
-                if not candidates:
-                    break
-
-                cand_gsis_arr = np.array([c[0] for c in candidates])
-                sims = cache.cosine_sim_batch(origin_gsi, cand_gsis_arr)
-                top_indices = np.argsort(-sims)[:TOP_K]
-
-                all_gsis = np.array([c[0] for c in candidates])
-                all_tis = np.array([c[1] for c in candidates])
-                all_starts = cache.sent_offsets[all_gsis]
-                all_pos = cache.token_data[all_starts + all_tis, 0]
-                all_gender = cache.token_data[all_starts + all_tis, 2]
-
+                # Competition features
+                all_pos = cache.token_data[valid_abs_arr, 0]
+                all_gender = cache.token_data[valid_abs_arr, 2]
                 num_propn = int(np.sum(all_pos == POS_IDS["PROPN"]))
                 num_gm = int(np.sum(
                     (all_gender == 3) | (all_gender == resolved_gender) | (resolved_gender == 3)
                 ))
 
-                top_cand_gsis = np.array([candidates[idx][0] for idx in top_indices])
-                top_cand_tis = np.array([candidates[idx][1] for idx in top_indices])
-                top_ranks = np.arange(len(top_indices))
+                chain_progress = float(hop) / max(doc_len - 1, 1)
 
                 batch_features = build_features_batch(
                     cache, origin_gsi, st, current_gsi, current_ti,
                     top_cand_gsis, top_cand_tis,
                     hop, resolved_gender, resolved_number,
-                    chain_deps, chain_pos, chain_noun_indices,
-                    top_ranks, len(candidates), num_gm, num_propn,
-                    graph, (origin_gsi, st),
-                    propn_stats, cur_abs,
+                    chain_deps, chain_pos,
+                    len(cand_gsis), num_gm, num_propn,
+                    graph_cluster_ids, graph_confidences, origin_cluster_id,
+                    doc_start_abs,
+                    doc_arrays["propn_type_first"],
+                    doc_arrays["propn_type_first"],
+                    doc_arrays["propn_type_freq"],
+                    doc_arrays["sent_propn_counts"],
+                    doc_arrays["sent_quote_masks"],
+                    cache.sent_offsets[start_gsi:end_gsi + 1],
+                    origin_doc_pos, prior_same_pos, chain_progress,
+                    start_gsi,
                 )
 
-                for i, idx in enumerate(top_indices):
-                    cgsi, cti, _ = candidates[idx]
-                    is_correct = (cgsi, cti) in correct_positions
-                    features_list.append(batch_features[i])
-                    labels_list.append(1 if is_correct else 0)
+                # Labels
+                is_correct = np.isin(top_abs, list(correct_abs))
 
-                correct_cands = [
-                    (idx, candidates[idx][2])
-                    for idx, (gsi, ti, _) in enumerate(candidates)
-                    if (gsi, ti) in correct_positions
-                ]
-                if not correct_cands:
+                pos_idx = np.where(is_correct)[0]
+                neg_idx = np.where(~is_correct)[0]
+                if len(neg_idx) > NEG_SAMPLES:
+                    neg_idx = rng.choice(neg_idx, size=NEG_SAMPLES, replace=False)
+                keep = np.concatenate([pos_idx, neg_idx])
+                for i in keep:
+                    features_list.append(batch_features[i])
+                    labels_list.append(int(is_correct[i]))
+                    ranks_list.append(int(i))
+
+                # Teacher forcing: advance to nearest correct candidate in full pool
+                correct_in_pool = np.isin(valid_abs_arr, list(correct_abs))
+                if not correct_in_pool.any():
                     break
 
-                best_idx = min(correct_cands, key=lambda x: abs(x[1] - cur_abs))[0]
-                next_gsi, next_ti, _ = candidates[best_idx]
+                correct_pool_abs = valid_abs_arr[correct_in_pool]
+                nearest_idx = np.argmin(np.abs(correct_pool_abs - cur_abs))
+                next_abs = int(correct_pool_abs[nearest_idx])
 
-                visited.add((next_gsi, next_ti))
+                gsi_range = np.arange(gsi_lo, gsi_hi)
+                sent_ends = cache.sent_offsets[gsi_range + 1]
+                next_gsi_idx = np.searchsorted(sent_ends, next_abs, side="right")
+                if next_gsi_idx >= len(gsi_range):
+                    break
+                next_gsi = int(gsi_range[next_gsi_idx])
+                next_ti = next_abs - int(cache.sent_offsets[next_gsi])
+
+                visited_abs[next_abs - doc_start_abs] = True
                 current_gsi = next_gsi
                 current_ti = next_ti
 
@@ -370,7 +491,6 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
                 chain_deps = np.append(chain_deps, next_info[1])
                 chain_pos = np.append(chain_pos, next_info[0])
 
-                # Commit this link to the resolution graph
                 next_is_propn = bool(next_info[0] == POS_IDS["PROPN"])
                 graph.link(
                     (origin_gsi, st), (next_gsi, next_ti),
@@ -378,35 +498,45 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
                     is_b_propn=next_is_propn,
                 )
 
-                next_noun_idx = cache.noun_lookup.get((next_gsi, next_ti), -1)
-                if next_noun_idx >= 0:
-                    chain_noun_indices.append(next_noun_idx)
-
                 if resolved_gender == 3 and next_info[2] != 3:
                     resolved_gender = int(next_info[2])
                 if resolved_number == 2 and next_info[3] != 2:
                     resolved_number = int(next_info[3])
 
-                if next_info[0] == POS_IDS["PROPN"]:
+                if next_is_propn:
                     break
 
-    return features_list, labels_list
+    return features_list, labels_list, ranks_list
 
 
 def train_full(num_train_docs: int = 1000, num_test_docs: int = 200, window_tokens: int = 150) -> None:
     cache = CachedData()
 
+    with open(CACHE_DIR / "dataset_ranges.json") as f:
+        ranges = json.load(f)
+
     rng = np.random.default_rng(42)
-    all_indices = rng.permutation(len(cache.doc_boundaries))
-    train_indices = all_indices[:num_train_docs]
-    test_indices = all_indices[num_train_docs:num_train_docs + num_test_docs]
+
+    dataset_docs = {name: np.arange(r["start_doc"], r["end_doc"]) for name, r in ranges.items()}
+
+    # Stratified split: 80/20 within each dataset, capped at requested totals
+    train_indices, test_indices = [], []
+    for name, docs in dataset_docs.items():
+        shuffled = rng.permutation(docs)
+        n_train = max(1, int(len(shuffled) * 0.8))
+        train_indices.extend(shuffled[:n_train])
+        test_indices.extend(shuffled[n_train:])
+        print(f"  {name}: {n_train} train, {len(shuffled) - n_train} test (from {len(docs)} docs)")
+
+    train_indices = rng.permutation(train_indices)[:num_train_docs]
+    test_indices = rng.permutation(test_indices)[:num_test_docs]
 
     print(f"\nGenerating train episodes ({num_train_docs} docs)...")
     start = time.time()
     train_features, train_labels = [], []
 
     for i, doc_idx in enumerate(train_indices):
-        feats, labels = generate_doc_episodes(cache, int(doc_idx), window_tokens)
+        feats, labels, _ = generate_doc_episodes(cache, int(doc_idx), window_tokens)
         train_features.extend(feats)
         train_labels.extend(labels)
         if (i + 1) % 100 == 0:
@@ -419,7 +549,7 @@ def train_full(num_train_docs: int = 1000, num_test_docs: int = 200, window_toke
     print(f"\nGenerating test episodes ({num_test_docs} docs)...")
     test_features, test_labels = [], []
     for doc_idx in test_indices:
-        feats, labels = generate_doc_episodes(cache, int(doc_idx), window_tokens)
+        feats, labels, _ = generate_doc_episodes(cache, int(doc_idx), window_tokens)
         test_features.extend(feats)
         test_labels.extend(labels)
 

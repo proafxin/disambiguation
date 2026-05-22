@@ -5,13 +5,9 @@ import numpy as np
 
 @dataclass
 class ResolutionGraph:
-    # Maps (gsi, ti) -> cluster_id
     mention_to_cluster: dict = field(default_factory=dict)
-    # Maps cluster_id -> canonical (gsi, ti) if known, else None
     cluster_to_canonical: dict = field(default_factory=dict)
-    # Maps cluster_id -> set of (gsi, ti)
     cluster_members: dict = field(default_factory=dict)
-    # Maps (gsi, ti) -> confidence of best link established
     mention_confidence: dict = field(default_factory=dict)
     _next_cluster_id: int = 0
 
@@ -28,7 +24,6 @@ class ResolutionGraph:
             self._new_cluster(mention, is_propn)
 
     def link(self, mention_a: tuple, mention_b: tuple, confidence: float, is_b_propn: bool = False) -> None:
-        # Ensure both are in graph
         if mention_a not in self.mention_to_cluster:
             self._new_cluster(mention_a)
         if mention_b not in self.mention_to_cluster:
@@ -40,13 +35,11 @@ class ResolutionGraph:
         if cid_a == cid_b:
             return
 
-        # Merge smaller cluster into larger
         members_a = self.cluster_members[cid_a]
         members_b = self.cluster_members[cid_b]
         canonical_a = self.cluster_to_canonical[cid_a]
         canonical_b = self.cluster_to_canonical[cid_b]
 
-        # Keep the cluster with a known canonical, or the larger one
         if canonical_b is not None and canonical_a is None:
             keep, drop = cid_b, cid_a
         elif canonical_a is not None:
@@ -56,19 +49,16 @@ class ResolutionGraph:
         else:
             keep, drop = cid_b, cid_a
 
-        # Merge
         for m in self.cluster_members[drop]:
             self.mention_to_cluster[m] = keep
             self.cluster_members[keep].add(m)
 
-        # Propagate canonical
         if self.cluster_to_canonical[drop] is not None and self.cluster_to_canonical[keep] is None:
             self.cluster_to_canonical[keep] = self.cluster_to_canonical[drop]
 
         del self.cluster_members[drop]
         del self.cluster_to_canonical[drop]
 
-        # Update confidence
         self.mention_confidence[mention_a] = max(self.mention_confidence.get(mention_a, 0.0), confidence)
         self.mention_confidence[mention_b] = max(self.mention_confidence.get(mention_b, 0.0), confidence)
 
@@ -91,3 +81,18 @@ class ResolutionGraph:
 
     def get_confidence(self, mention: tuple) -> float:
         return self.mention_confidence.get(mention, 0.0)
+
+    def build_abs_arrays(
+        self,
+        sent_offsets: np.ndarray,
+        doc_start_abs: int,
+        doc_len: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cluster_ids = np.full(doc_len, -1, dtype=np.int32)
+        confidences = np.zeros(doc_len, dtype=np.float32)
+        for (gsi, ti), cid in self.mention_to_cluster.items():
+            abs_pos = int(sent_offsets[gsi]) + ti - doc_start_abs
+            if 0 <= abs_pos < doc_len:
+                cluster_ids[abs_pos] = cid
+                confidences[abs_pos] = self.mention_confidence.get((gsi, ti), 0.0)
+        return cluster_ids, confidences

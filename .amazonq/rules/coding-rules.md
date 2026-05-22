@@ -6,3 +6,4 @@
 - No general exception handling or silent bug swallowing — only catch exceptions you know how to handle properly
 - No global or nonlocal variables
 - No nested, local, or inline functions — all functions must be defined at module top level
+- use `uv run python` for running python scripts

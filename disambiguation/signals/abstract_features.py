@@ -221,25 +221,25 @@ def build_features(doc: DocCache, chain: Chain, cand_sent: int, cand_token: int,
     ], dtype=np.float32)
 
 
-NUM_FEATURES = 55
+NUM_FEATURES = 51
 
 FEATURE_NAMES = [
-    "o_pos", "o_dep", "o_gender", "o_number", "o_is_subj", "o_is_poss",
-    "cur_pos", "cur_dep", "cur_gender", "cur_number", "cur_is_subj", "cur_is_poss",
-    "c_pos", "c_dep", "c_gender", "c_number", "c_person", "c_is_subj", "c_is_obj", "c_is_poss",
-    "same_dep_current", "same_dep_origin", "same_pos_current", "same_subj_origin",
-    "c_depth_to_root", "same_sentence",
+    "o_pos", "o_dep", "o_gender", "o_number", "o_is_subj",
+    "cur_pos", "cur_dep", "cur_gender", "cur_number",
+    "c_pos", "c_dep", "c_gender", "c_number", "c_person", "c_is_subj",
+    "same_pos_current", "c_depth_to_root", "same_sentence",
     "token_distance", "sent_distance", "hop_count",
     "gender_match_origin", "number_match_origin",
     "gender_match_current", "number_match_current",
     "resolved_gender_match", "resolved_number_match",
     "dep_consistent", "pos_consistent", "is_propn_terminal",
-    "both_heads_verb", "same_head_pos_origin", "same_head_pos_current",
-    "same_head_token", "cand_is_verb_arg", "origin_is_verb_arg",
-    "rank", "num_cands", "num_gender_match_cands", "num_propn_cands",
-    "noun_sim_to_chain",
+    "same_dep_current", "same_dep_origin",
+    "both_heads_verb", "same_head_token", "cand_is_verb_arg", "origin_is_verb_arg",
+    "num_cands", "num_gender_match_cands", "num_propn_cands",
     "graph_candidate_resolved", "graph_candidate_confidence", "graph_same_cluster_as_origin",
     "propn_is_first_occurrence", "propn_first_occurrence_distance", "propn_doc_frequency",
+    "cand_sent_propn_count", "cand_token_pos_in_sent", "origin_doc_position",
+    "chain_progress", "prior_same_pos_count", "cand_in_quotes",
 ]
 
 
