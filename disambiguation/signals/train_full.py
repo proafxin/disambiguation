@@ -502,7 +502,7 @@ def generate_doc_episodes(
     return features_list, labels_list, ranks_list
 
 
-def train_full(num_train_docs: int = 1000, num_test_docs: int = 200, window_tokens: int = 150) -> None:
+def train_full(window_tokens: int = 150) -> None:
     cache = CachedData()
 
     with open(CACHE_DIR / "dataset_ranges.json") as f:
@@ -510,19 +510,22 @@ def train_full(num_train_docs: int = 1000, num_test_docs: int = 200, window_toke
 
     rng = np.random.default_rng(42)
 
-    dataset_docs = {name: np.arange(r["start_doc"], r["end_doc"]) for name, r in ranges.items()}
+    GULLIVER_IDX = 36676
 
-    # Stratified split: 80/20 within each dataset, capped at requested totals
+    # 2:1 stratified split per dataset, Gulliver held out
     train_indices, test_indices = [], []
-    for name, docs in dataset_docs.items():
+    for name, r in ranges.items():
+        docs = np.array([i for i in range(r["start_doc"], r["end_doc"]) if i != GULLIVER_IDX])
         shuffled = rng.permutation(docs)
-        n_train = max(1, int(len(shuffled) * 0.8))
+        n_train = int(len(shuffled) * 2 / 3)
         train_indices.extend(shuffled[:n_train])
         test_indices.extend(shuffled[n_train:])
         print(f"  {name}: {n_train} train, {len(shuffled) - n_train} test (from {len(docs)} docs)")
 
-    train_indices = rng.permutation(train_indices)[:num_train_docs]
-    test_indices = rng.permutation(test_indices)[:num_test_docs]
+    train_indices = rng.permutation(train_indices)
+    test_indices = rng.permutation(test_indices)
+    num_train_docs = len(train_indices)
+    num_test_docs = len(test_indices)
 
     print(f"\nGenerating train episodes ({num_train_docs} docs)...")
     start = time.time()
@@ -532,7 +535,7 @@ def train_full(num_train_docs: int = 1000, num_test_docs: int = 200, window_toke
         feats, labels, _ = generate_doc_episodes(cache, int(doc_idx), window_tokens)
         train_features.extend(feats)
         train_labels.extend(labels)
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 500 == 0:
             print(f"  {i+1}/{num_train_docs} docs, {len(train_features)} episodes")
 
     X_train = np.array(train_features)
@@ -592,4 +595,4 @@ def train_full(num_train_docs: int = 1000, num_test_docs: int = 200, window_toke
 
 
 if __name__ == "__main__":
-    train_full(num_train_docs=1000, num_test_docs=200, window_tokens=150)
+    train_full(window_tokens=150)
