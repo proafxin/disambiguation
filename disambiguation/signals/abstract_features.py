@@ -54,6 +54,7 @@ class DocCache:
     sentences: list[list[str]]
     clusters: list[list[list[int]]]
     token_info: list[list[TokenInfo]]
+    mention_embeddings: dict = field(default_factory=dict)  # (si, ti) -> np.ndarray for NOUN/PROPN
     sentence_lengths: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -76,6 +77,7 @@ class Chain:
     resolved_number: int = 2
     chain_deps: list[int] = field(default_factory=list)
     chain_pos: list[int] = field(default_factory=list)
+    chain_noun_embs: list[np.ndarray] = field(default_factory=list)
     has_seen_propn: int = 0
 
 
@@ -120,6 +122,7 @@ def precompute(
     config: dict,
     embed_store: EmbeddingStore,
     spacy_nlp,
+    mention_embedder=None,
 ) -> DocCache:
     parsed_doc = parse_document(doc.sentences, parser, tokenizer, config, device="cuda")
     num_sents = len(doc.sentences)
@@ -135,16 +138,32 @@ def precompute(
             infos.append(TokenInfo(0, 0, 3, 2, 0, 5, 0, 0, 0, 0, 0, 0.0))
         token_info.append(infos[:target_len])
 
+    # Compute mention embeddings for NOUN/PROPN
+    mention_embeddings = {}
+    if mention_embedder is not None:
+        texts = []
+        keys = []
+        for si, sent in enumerate(doc.sentences):
+            for ti in range(min(len(sent), len(token_info[si]))):
+                if token_info[si][ti].pos in (POS_IDS["NOUN"], POS_IDS["PROPN"]):
+                    texts.append(sent[ti])
+                    keys.append((si, ti))
+        if texts:
+            embs = mention_embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+            for key, emb in zip(keys, embs):
+                mention_embeddings[key] = emb.astype(np.float32)
+
     return DocCache(
         parsed=parsed_doc,
         sentence_embeddings=sentence_embeddings,
         sentences=doc.sentences,
         clusters=doc.clusters,
         token_info=token_info,
+        mention_embeddings=mention_embeddings,
     )
 
 
-def build_features(doc: DocCache, chain: Chain, cand_sent: int, cand_token: int, rank: int, num_cands: int, num_gender_match: int, num_propn_cands: int) -> np.ndarray:
+def build_features(doc: DocCache, chain: Chain, cand_sent: int, cand_token: int, rank: int, num_cands: int, num_gender_match: int, num_propn_cands: int, noun_sim_to_chain: float = 0.0) -> np.ndarray:
     origin_info = doc.token_info[chain.origin_sent][chain.origin_token]
     current_info = doc.token_info[chain.current_sent][chain.current_token]
     cand_info = doc.token_info[cand_sent][cand_token]
@@ -183,7 +202,7 @@ def build_features(doc: DocCache, chain: Chain, cand_sent: int, cand_token: int,
         int(cand_info.pos == current_info.pos),
         int(cand_info.is_subject == origin_info.is_subject),
         cand_info.depth_to_root,
-        int(cand_sent == chain.current_sent),  # same sentence
+        int(cand_sent == chain.current_sent),
         # Distance (3)
         abs(cand_abs - current_abs),
         abs(cand_sent - chain.current_sent),
@@ -197,10 +216,12 @@ def build_features(doc: DocCache, chain: Chain, cand_sent: int, cand_token: int,
         is_propn_after_pron_chain,
         # Competition (4)
         rank, num_cands, num_gender_match, num_propn_cands,
+        # Noun embedding similarity to chain (1)
+        noun_sim_to_chain,
     ], dtype=np.float32)
 
 
-NUM_FEATURES = 42
+NUM_FEATURES = 43
 
 FEATURE_NAMES = [
     "o_pos", "o_dep", "o_gender", "o_number", "o_is_subj", "o_is_poss",
@@ -214,6 +235,7 @@ FEATURE_NAMES = [
     "resolved_gender_match", "resolved_number_match",
     "dep_consistent", "pos_consistent", "is_propn_terminal",
     "rank", "num_cands", "num_gender_match_cands", "num_propn_cands",
+    "noun_sim_to_chain",
 ]
 
 
@@ -240,6 +262,10 @@ def generate_episodes(doc: DocCache, sent_idx: int, start_token: int, end_token:
     if origin_info.pos == POS_IDS["PROPN"]:
         return []
 
+    origin_noun_embs = []
+    if (sent_idx, start_token) in doc.mention_embeddings:
+        origin_noun_embs.append(doc.mention_embeddings[(sent_idx, start_token)])
+
     chain = Chain(
         origin_sent=sent_idx,
         origin_token=start_token,
@@ -251,6 +277,7 @@ def generate_episodes(doc: DocCache, sent_idx: int, start_token: int, end_token:
         resolved_number=origin_info.number if origin_info.number != 2 else 2,
         chain_deps=[origin_info.dep],
         chain_pos=[origin_info.pos],
+        chain_noun_embs=origin_noun_embs,
     )
 
     results = []
@@ -293,7 +320,20 @@ def generate_episodes(doc: DocCache, sent_idx: int, start_token: int, end_token:
             csi, cti, _ = all_candidates[idx]
             is_correct = (csi, cti) in correct_positions
 
-            features = build_features(doc, chain, csi, cti, rank, len(all_candidates), num_gender_match, num_propn_cands)
+            # Compute noun embedding similarity to chain (only for NOUN/PROPN candidates)
+            noun_sim = 0.0
+            cand_key = (csi, cti)
+            if cand_key in doc.mention_embeddings and chain.chain_noun_embs:
+                cand_emb = doc.mention_embeddings[cand_key]
+                cand_norm = np.linalg.norm(cand_emb) + 1e-8
+                best = 0.0
+                for chain_emb in chain.chain_noun_embs:
+                    s = float(np.dot(cand_emb, chain_emb) / (cand_norm * (np.linalg.norm(chain_emb) + 1e-8)))
+                    if s > best:
+                        best = s
+                noun_sim = best
+
+            features = build_features(doc, chain, csi, cti, rank, len(all_candidates), num_gender_match, num_propn_cands, noun_sim)
             results.append((features, 1 if is_correct else 0))
 
         # Teacher forcing
@@ -316,6 +356,10 @@ def generate_episodes(doc: DocCache, sent_idx: int, start_token: int, end_token:
         next_info = doc.token_info[next_si][next_ti]
         chain.chain_deps.append(next_info.dep)
         chain.chain_pos.append(next_info.pos)
+
+        # Add noun embedding to chain if NOUN/PROPN
+        if (next_si, next_ti) in doc.mention_embeddings:
+            chain.chain_noun_embs.append(doc.mention_embeddings[(next_si, next_ti)])
 
         if chain.resolved_gender == 3 and next_info.gender != 3:
             chain.resolved_gender = next_info.gender

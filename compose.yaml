@@ -1,0 +1,21 @@
+services:
+  stardust_db:
+    image: pgvector/pgvector:pg17
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    command: postgres -c max_connections=400
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  postgres_data:

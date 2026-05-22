@@ -220,3 +220,4 @@ ARCHITECTURE.md
 data/*
 models/*.pt
 RESEARCH.md
+cache/*
