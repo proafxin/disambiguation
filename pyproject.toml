@@ -1,6 +1,6 @@
 [project]
 name = "disambiguation"
-version = "0.1.1"
+version = "0.1.2"
 description = "Disambiguation"
 readme = "README.md"
 authors = [{ name = "Masum Billal", email = "billalmasum93@gmail.com" }]
@@ -16,6 +16,8 @@ dependencies = [
     "sentencepiece>=0.2.1",
     "protobuf>=7.35.0",
     "xgboost-cu13>=3.2.0",
+    "en-core-web-trf>=3.8.0",
+    "cupy-cuda13x>=14.0.1",
 ]
 
 [dependency-groups]
@@ -38,6 +40,7 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 en-core-web-lg = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" }
+en-core-web-trf = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.8.0/en_core_web_trf-3.8.0-py3-none-any.whl" }
 
 
 [tool.ruff]

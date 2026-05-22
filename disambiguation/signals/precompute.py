@@ -67,7 +67,146 @@ def _doc_to_text_and_offsets(sentences: list[list[str]]) -> tuple[str, list[int]
     return " ".join(tokens), offsets
 
 
-def precompute_conll2012() -> None:
+def precompute_unified() -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    preco_ds = load_from_disk("data/preco")["train"]
+    litbank_ds = load_from_disk("data/litbank")["train"]
+    corefud_ds = load_from_disk("data/corefud")
+
+    all_sentences: list[tuple[str, int]] = []
+    doc_boundaries = []
+    clusters_by_doc = []
+    sent_offset = 0
+
+    print("Loading PreCo...")
+    for doc_idx in range(preco_ds.num_rows):
+        sample = preco_ds[doc_idx]
+        start = sent_offset
+        for sent in sample["sentences"]:
+            all_sentences.append((" ".join(sent), len(sent)))
+            sent_offset += 1
+        doc_boundaries.append((start, sent_offset, "preco", doc_idx))
+        clusters_by_doc.append(sample["mention_clusters"])
+
+    print("Loading LitBank...")
+    for doc_idx in range(litbank_ds.num_rows):
+        sample = litbank_ds[doc_idx]
+        start = sent_offset
+        for sent in sample["sentences"]:
+            all_sentences.append((" ".join(sent), len(sent)))
+            sent_offset += 1
+        doc_boundaries.append((start, sent_offset, "litbank", doc_idx))
+        clusters = [[[m[0], m[1], m[2] + 1] for m in chain] for chain in sample["coref_chains"]]
+        clusters_by_doc.append(clusters)
+
+    print("Loading CorefUD...")
+    for split_name in ["train", "validation"]:
+        split_data = corefud_ds[split_name]
+        for doc_idx in range(len(split_data)):
+            sample = split_data[doc_idx]
+            start = sent_offset
+            sent_id_to_local = {}
+            for si, sent in enumerate(sample["sentences"]):
+                tokens = [tok["form"] for tok in sent["tokens"]]
+                all_sentences.append((" ".join(tokens), len(tokens)))
+                sent_id_to_local[sent["sent_id"]] = si
+                sent_offset += 1
+            doc_boundaries.append((start, sent_offset, "corefud", doc_idx))
+            clusters = []
+            for entity in sample["coref_entities"]:
+                if len(entity) < 2:
+                    continue
+                cluster = []
+                for mention in entity:
+                    sid = mention["sent_id"]
+                    if sid not in sent_id_to_local:
+                        continue
+                    si = sent_id_to_local[sid]
+                    span = mention["span"]
+                    if "-" in span:
+                        parts = span.split("-")
+                        st = int(parts[0]) - 1
+                        en = int(parts[1])
+                    else:
+                        st = int(span) - 1
+                        en = st + 1
+                    cluster.append([si, st, en])
+                if len(cluster) >= 2:
+                    clusters.append(cluster)
+            clusters_by_doc.append(clusters)
+
+    total_sents = len(all_sentences)
+    total_docs = len(doc_boundaries)
+    print(f"Combined: {total_docs} docs, {total_sents} sentences")
+
+    import thinc.api
+    thinc.api.set_gpu_allocator("pytorch")
+    thinc.api.require_gpu(0)
+    nlp = spacy.load("en_core_web_trf", disable=["ner", "lemmatizer", "senter"])
+    print(f"Pipeline: {nlp.pipe_names}")
+
+    texts = [s[0] for s in all_sentences]
+    token_counts = [s[1] for s in all_sentences]
+
+    all_token_infos = []
+    sent_offsets_arr = np.zeros(total_sents + 1, dtype=np.int64)
+    token_offset = 0
+    start_time = time.time()
+
+    def sent_stream():
+        for i, text in enumerate(texts):
+            yield text, i
+
+    results: dict[int, list] = {}
+    for spacy_doc, sent_idx in nlp.pipe(sent_stream(), as_tuples=True, batch_size=4096):
+        target_len = token_counts[sent_idx]
+        sent_start = spacy_doc[0].i if len(spacy_doc) > 0 else 0
+        features = [_extract_token_features(token, sent_start, target_len) for token in spacy_doc[:target_len]]
+        while len(features) < target_len:
+            features.append([0, 0, 3, 2, 0, 5, 0, 0, 0, 0, 0, 0.0, -1, 0, 0])
+        results[sent_idx] = features
+        if (sent_idx + 1) % 100000 == 0:
+            print(f"  {sent_idx+1}/{total_sents} sents ({time.time()-start_time:.0f}s)")
+
+    for i in range(total_sents):
+        sent_offsets_arr[i] = token_offset
+        for feat in results[i]:
+            all_token_infos.append(feat)
+        token_offset += token_counts[i]
+    sent_offsets_arr[total_sents] = token_offset
+
+    print(f"  spaCy done: {time.time()-start_time:.1f}s, {token_offset} tokens")
+
+    token_data = np.array(all_token_infos, dtype=np.float32)
+    np.savez_compressed(CACHE_DIR / "token_infos.npz", data=token_data, offsets=sent_offsets_arr)
+    print(f"  token_infos: {token_data.shape}, {token_data.nbytes/(1024**2):.0f} MB")
+
+    metadata = {
+        "doc_boundaries": doc_boundaries,
+        "total_docs": total_docs,
+        "total_sents": total_sents,
+        "token_info_dim": TOKEN_INFO_DIM,
+    }
+    with open(CACHE_DIR / "metadata.json", "w") as f:
+        json.dump(metadata, f)
+
+    with open(CACHE_DIR / "clusters.json", "w") as f:
+        json.dump(clusters_by_doc, f)
+
+    dataset_ranges: dict[str, dict] = {}
+    for i, (start, end, source, orig_idx) in enumerate(doc_boundaries):
+        if source not in dataset_ranges:
+            dataset_ranges[source] = {"start_doc": i, "end_doc": i + 1}
+        else:
+            dataset_ranges[source]["end_doc"] = i + 1
+    with open(CACHE_DIR / "dataset_ranges.json", "w") as f:
+        json.dump(dataset_ranges, f, indent=2)
+
+    print(f"Cache complete. Sources: {dataset_ranges}")
+
+
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load existing cache
@@ -88,7 +227,10 @@ def precompute_conll2012() -> None:
     total_new_sents = sum(len(sents) for sents, _ in docs)
     print(f"  {len(docs)} docs, {total_new_sents} sentences")
 
-    nlp = spacy.load("en_core_web_lg", disable=["ner", "lemmatizer"])
+    import thinc.api
+    thinc.api.set_gpu_allocator("pytorch")
+    thinc.api.require_gpu(0)
+    nlp = spacy.load("en_core_web_trf", disable=["ner", "lemmatizer", "senter"])
 
     all_token_infos = []
     new_sent_offsets = []  # token offset per sentence
@@ -110,7 +252,7 @@ def precompute_conll2012() -> None:
     results: dict[int, dict[int, list]] = {i: {} for i in range(len(docs))}
     processed = 0
 
-    for spacy_doc, (doc_idx, sent_idx) in nlp.pipe(sent_stream(), as_tuples=True, batch_size=512):
+    for spacy_doc, (doc_idx, sent_idx) in nlp.pipe(sent_stream(), as_tuples=True, batch_size=4096):
         sent_len = doc_sent_lens[doc_idx][sent_idx]
         results[doc_idx][sent_idx] = [
             _extract_token_features(token, 0, sent_len)
@@ -165,4 +307,5 @@ def precompute_conll2012() -> None:
 
 
 if __name__ == "__main__":
+    precompute_unified()
     precompute_conll2012()
