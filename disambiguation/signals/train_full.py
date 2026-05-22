@@ -118,7 +118,6 @@ def _structural_candidates(
     resolved_gender: int,
     resolved_number: int,
     graph_cluster_ids: np.ndarray,
-    chain_deps: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     range_start = int(cache.sent_offsets[gsi_lo])
     range_end = int(cache.sent_offsets[gsi_hi])
@@ -150,16 +149,7 @@ def _structural_candidates(
     is_propn = tokens_in_range == POS_IDS["PROPN"]
     in_graph = np.zeros(len(abs_positions), dtype=bool)
     in_graph[valid_idx] = graph_cluster_ids[doc_rel[valid_idx]] >= 0
-
-    # For NOUN candidates: require dep role is salient or appears in chain history
-    SALIENT_DEPS = np.array([0, 1, 2, 3, 5, 11, 12], dtype=np.float32)  # nsubj,obj,obl,nmod,appos,root,nsubj:pass
-    dep_in_range = cache.token_data[range_start:range_end, 1]
-    is_noun = tokens_in_range == POS_IDS["NOUN"]
-    dep_salient = np.isin(dep_in_range, SALIENT_DEPS)
-    dep_in_chain = np.isin(dep_in_range, chain_deps) if len(chain_deps) > 0 else np.zeros(len(abs_positions), dtype=bool)
-    noun_dep_ok = ~is_noun | dep_salient | dep_in_chain
-
-    structural_ok = (morph_ok | is_propn | in_graph) & noun_dep_ok
+    structural_ok = morph_ok | is_propn | in_graph
 
     valid_mask = nominal_mask & window_mask & ~visited_mask & structural_ok
     valid_abs_arr = abs_positions[valid_mask]
@@ -407,16 +397,17 @@ def generate_doc_episodes(
                     cache, cur_abs, gsi_lo, gsi_hi, start_gsi, end_gsi,
                     window_tokens, visited_abs, doc_start_abs, doc_len,
                     resolved_gender, resolved_number, graph_cluster_ids,
-                    chain_deps,
                 )
 
                 if len(cand_gsis) == 0:
                     break
 
-                # Limit to TOP_K
-                top_cand_gsis = cand_gsis[:TOP_K]
-                top_cand_tis = cand_tis[:TOP_K]
-                top_abs = valid_abs_arr[:TOP_K]
+                # Take TOP_K closest by token distance to cur_abs
+                distances = np.abs(valid_abs_arr - cur_abs)
+                top_indices = np.argsort(distances)[:TOP_K]
+                top_cand_gsis = cand_gsis[top_indices]
+                top_cand_tis = cand_tis[top_indices]
+                top_abs = valid_abs_arr[top_indices]
 
                 # Competition features
                 all_pos = cache.token_data[valid_abs_arr, 0]
@@ -556,7 +547,7 @@ def train_full(window_tokens: int = 150) -> None:
     print("\nTraining XGBoost (GPU)...")
     start = time.time()
     model = xgb.XGBClassifier(
-        n_estimators=500, max_depth=10, learning_rate=0.1,
+        n_estimators=300, max_depth=20, learning_rate=0.05,
         subsample=0.8, min_child_weight=10, device="cuda",
         tree_method="hist", random_state=42,
     )
