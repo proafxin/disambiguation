@@ -68,6 +68,32 @@ class CachedData:
         return self.sent_embs_normed[query_idx] @ self.sent_embs_normed[cand_indices].T
 
 
+def build_propn_stats(cache: CachedData, start_gsi: int, end_gsi: int) -> dict:
+    first_abs: dict[tuple, int] = {}  # (gsi, ti) -> first absolute position
+    type_freq: dict[tuple, int] = {}  # token feature fingerprint -> count
+    type_first: dict[tuple, int] = {}  # token feature fingerprint -> first abs pos
+    for gsi in range(start_gsi, end_gsi):
+        sent_len = cache.get_sent_length(gsi)
+        for ti in range(sent_len):
+            info = cache.get_token_info(gsi, ti)
+            if info[0] != POS_IDS["PROPN"]:
+                continue
+            key = (gsi, ti)
+            abs_pos = int(cache.sent_offsets[gsi]) + ti
+            first_abs[key] = abs_pos
+            # Fingerprint: pos, dep, gender, number as a tuple (ignores sent_position etc.)
+            fp = (int(info[0]), int(info[1]), int(info[2]), int(info[3]))
+            type_freq[fp] = type_freq.get(fp, 0) + 1
+            if fp not in type_first:
+                type_first[fp] = abs_pos
+    stats = {}
+    for key, abs_pos in first_abs.items():
+        info = cache.get_token_info(key[0], key[1])
+        fp = (int(info[0]), int(info[1]), int(info[2]), int(info[3]))
+        stats[key] = (type_first[fp], type_freq.get(fp, 1))
+    return stats
+
+
 def build_features_batch(
     cache: CachedData,
     origin_gsi: int, origin_ti: int,
@@ -86,6 +112,8 @@ def build_features_batch(
     num_propn_cands: int,
     graph: ResolutionGraph,
     origin_key: tuple,
+    propn_stats: dict,
+    cur_abs: int,
 ) -> np.ndarray:
     n = len(cand_gsis)
     o = cache.get_token_info(origin_gsi, origin_ti)
@@ -132,8 +160,7 @@ def build_features_batch(
             if idx >= 0:
                 noun_sims[i] = float((chain_embs @ cache.noun_embs_normed[idx]).max())
 
-    # Graph signals (3 new features)
-    # For each candidate: is it already resolved? confidence? same cluster as origin?
+    # Graph signals
     graph_resolved = np.zeros(n, dtype=np.float32)
     graph_confidence = np.zeros(n, dtype=np.float32)
     graph_same_cluster = np.zeros(n, dtype=np.float32)
@@ -142,6 +169,19 @@ def build_features_batch(
         graph_resolved[i] = float(graph.is_resolved(ckey))
         graph_confidence[i] = graph.get_confidence(ckey)
         graph_same_cluster[i] = float(graph.same_cluster(origin_key, ckey))
+
+    # PROPN first-occurrence and frequency signals
+    propn_is_first = np.zeros(n, dtype=np.float32)
+    propn_first_dist = np.zeros(n, dtype=np.float32)
+    propn_freq = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        ckey = (int(cand_gsis[i]), int(cand_tis[i]))
+        if ckey in propn_stats:
+            first_abs_pos, freq = propn_stats[ckey]
+            cand_abs_pos = int(cache.sent_offsets[cand_gsis[i]]) + int(cand_tis[i])
+            propn_is_first[i] = float(cand_abs_pos == first_abs_pos)
+            propn_first_dist[i] = float(abs(cur_abs - first_abs_pos))
+            propn_freq[i] = float(freq)
 
     features = np.empty((n, NUM_FEATURES), dtype=np.float32)
     features[:, 0] = o[0]; features[:, 1] = o[1]; features[:, 2] = o[2]; features[:, 3] = o[3]
@@ -170,10 +210,12 @@ def build_features_batch(
     features[:, 44] = ranks.astype(np.float32)
     features[:, 45] = num_cands; features[:, 46] = num_gender_match
     features[:, 47] = num_propn_cands; features[:, 48] = noun_sims
-    # Graph signals
     features[:, 49] = graph_resolved
     features[:, 50] = graph_confidence
     features[:, 51] = graph_same_cluster
+    features[:, 52] = propn_is_first
+    features[:, 53] = propn_first_dist
+    features[:, 54] = propn_freq
     return features
 
 
@@ -186,6 +228,7 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
 
     # One resolution graph per document — shared across all mentions
     graph = ResolutionGraph()
+    propn_stats = build_propn_stats(cache, start_gsi, end_gsi)
 
     # Pre-register all PROPN mentions as potential canonical entities
     for cluster in clusters:
@@ -299,6 +342,7 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
                     chain_deps, chain_pos, chain_noun_indices,
                     top_ranks, len(candidates), num_gm, num_propn,
                     graph, (origin_gsi, st),
+                    propn_stats, cur_abs,
                 )
 
                 for i, idx in enumerate(top_indices):
