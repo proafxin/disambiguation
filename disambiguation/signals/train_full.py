@@ -11,10 +11,13 @@ from disambiguation.signals.abstract_features import (
     NUM_FEATURES,
     FEATURE_NAMES,
 )
+from disambiguation.signals.resolution_graph import ResolutionGraph
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 MAX_HOPS = 512
 TOP_K = 20
+# Confidence threshold to commit a link to the resolution graph
+COMMIT_THRESHOLD = 0.7
 
 
 class CachedData:
@@ -81,6 +84,8 @@ def build_features_batch(
     num_cands: int,
     num_gender_match: int,
     num_propn_cands: int,
+    graph: ResolutionGraph,
+    origin_key: tuple,
 ) -> np.ndarray:
     n = len(cand_gsis)
     o = cache.get_token_info(origin_gsi, origin_ti)
@@ -127,6 +132,17 @@ def build_features_batch(
             if idx >= 0:
                 noun_sims[i] = float((chain_embs @ cache.noun_embs_normed[idx]).max())
 
+    # Graph signals (3 new features)
+    # For each candidate: is it already resolved? confidence? same cluster as origin?
+    graph_resolved = np.zeros(n, dtype=np.float32)
+    graph_confidence = np.zeros(n, dtype=np.float32)
+    graph_same_cluster = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        ckey = (int(cand_gsis[i]), int(cand_tis[i]))
+        graph_resolved[i] = float(graph.is_resolved(ckey))
+        graph_confidence[i] = graph.get_confidence(ckey)
+        graph_same_cluster[i] = float(graph.same_cluster(origin_key, ckey))
+
     features = np.empty((n, NUM_FEATURES), dtype=np.float32)
     features[:, 0] = o[0]; features[:, 1] = o[1]; features[:, 2] = o[2]; features[:, 3] = o[3]
     features[:, 4] = o[6]; features[:, 5] = o[8]
@@ -154,6 +170,10 @@ def build_features_batch(
     features[:, 44] = ranks.astype(np.float32)
     features[:, 45] = num_cands; features[:, 46] = num_gender_match
     features[:, 47] = num_propn_cands; features[:, 48] = noun_sims
+    # Graph signals
+    features[:, 49] = graph_resolved
+    features[:, 50] = graph_confidence
+    features[:, 51] = graph_same_cluster
     return features
 
 
@@ -163,6 +183,19 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
 
     features_list = []
     labels_list = []
+
+    # One resolution graph per document — shared across all mentions
+    graph = ResolutionGraph()
+
+    # Pre-register all PROPN mentions as potential canonical entities
+    for cluster in clusters:
+        for mention in cluster:
+            si, st, en = mention
+            gsi = start_gsi + si
+            if gsi < end_gsi and st < cache.get_sent_length(gsi):
+                info = cache.get_token_info(gsi, st)
+                if info[0] == POS_IDS["PROPN"]:
+                    graph.add_mention((gsi, st), is_propn=True)
 
     for cluster in clusters:
         if len(cluster) < 2:
@@ -265,6 +298,7 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
                     hop, resolved_gender, resolved_number,
                     chain_deps, chain_pos, chain_noun_indices,
                     top_ranks, len(candidates), num_gm, num_propn,
+                    graph, (origin_gsi, st),
                 )
 
                 for i, idx in enumerate(top_indices):
@@ -291,6 +325,14 @@ def generate_doc_episodes(cache: CachedData, doc_idx: int, window_tokens: int = 
                 next_info = cache.get_token_info(next_gsi, next_ti)
                 chain_deps = np.append(chain_deps, next_info[1])
                 chain_pos = np.append(chain_pos, next_info[0])
+
+                # Commit this link to the resolution graph
+                next_is_propn = bool(next_info[0] == POS_IDS["PROPN"])
+                graph.link(
+                    (origin_gsi, st), (next_gsi, next_ti),
+                    confidence=1.0,
+                    is_b_propn=next_is_propn,
+                )
 
                 next_noun_idx = cache.noun_lookup.get((next_gsi, next_ti), -1)
                 if next_noun_idx >= 0:

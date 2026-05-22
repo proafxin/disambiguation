@@ -221,7 +221,7 @@ def build_features(doc: DocCache, chain: Chain, cand_sent: int, cand_token: int,
     ], dtype=np.float32)
 
 
-NUM_FEATURES = 49
+NUM_FEATURES = 52
 
 FEATURE_NAMES = [
     "o_pos", "o_dep", "o_gender", "o_number", "o_is_subj", "o_is_poss",
@@ -238,6 +238,7 @@ FEATURE_NAMES = [
     "same_head_token", "cand_is_verb_arg", "origin_is_verb_arg",
     "rank", "num_cands", "num_gender_match_cands", "num_propn_cands",
     "noun_sim_to_chain",
+    "graph_candidate_resolved", "graph_candidate_confidence", "graph_same_cluster_as_origin",
 ]
 
 
