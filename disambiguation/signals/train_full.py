@@ -253,7 +253,6 @@ def build_features_batch(
     graph_same_cluster = ((cand_cluster_ids >= 0) & (cand_cluster_ids == origin_cluster_id)).astype(np.float32)
 
     # PROPN salience — vectorized via pre-built per-token arrays
-    propn_is_first = np.zeros(n, dtype=np.float32)
     propn_first_dist = np.zeros(n, dtype=np.float32)
     propn_freq = np.zeros(n, dtype=np.float32)
     propn_mask = c_all[:, 0] == POS_IDS["PROPN"]
@@ -262,11 +261,9 @@ def build_features_batch(
         valid_pm = (pm_abs >= 0) & (pm_abs < len(propn_first_abs))
         pm_abs_v = pm_abs[valid_pm]
         first_abs_vals = propn_type_first[pm_abs_v]
-        propn_is_first_vals = (cand_abs[propn_mask][valid_pm] == (first_abs_vals + doc_start_abs)).astype(np.float32)
         propn_first_dist_vals = np.abs(cur_abs - (first_abs_vals + doc_start_abs)).astype(np.float32)
         propn_freq_vals = propn_type_freq[pm_abs_v].astype(np.float32)
         idx = np.where(propn_mask)[0][valid_pm]
-        propn_is_first[idx] = propn_is_first_vals
         propn_first_dist[idx] = propn_first_dist_vals
         propn_freq[idx] = propn_freq_vals
 
@@ -288,9 +285,6 @@ def build_features_batch(
                     (ti > 0 and qmask[ti - 1]) or (ti + 1 < len(qmask) and qmask[ti + 1])
                 )
 
-    sdc = (c_all[:, 1] == cur[1]).astype(np.float32)
-    sdo = (c_all[:, 1] == o[1]).astype(np.float32)
-
     features = np.empty((n, NUM_FEATURES), dtype=np.float32)
     features[:, 0] = o[0]; features[:, 1] = o[1]; features[:, 2] = o[2]; features[:, 3] = o[3]
     features[:, 4] = o[6]
@@ -308,17 +302,16 @@ def build_features_batch(
     features[:, 23] = gmc; features[:, 24] = nmc
     features[:, 25] = rgm; features[:, 26] = rnm
     features[:, 27] = dep_con; features[:, 28] = pos_con; features[:, 29] = ipt
-    features[:, 30] = sdc; features[:, 31] = sdo
-    features[:, 32] = bhv; features[:, 33] = sht; features[:, 34] = cva; features[:, 35] = ova
-    features[:, 36] = num_cands; features[:, 37] = num_gender_match; features[:, 38] = num_propn_cands
-    features[:, 39] = graph_resolved; features[:, 40] = graph_confidence; features[:, 41] = graph_same_cluster
-    features[:, 42] = propn_is_first; features[:, 43] = propn_first_dist; features[:, 44] = propn_freq
-    features[:, 45] = cand_sent_propn_count
-    features[:, 46] = cand_token_pos_in_sent
-    features[:, 47] = float(origin_doc_pos)
-    features[:, 48] = chain_progress
-    features[:, 49] = float(prior_same_pos)
-    features[:, 50] = cand_in_quotes
+    features[:, 30] = bhv; features[:, 31] = sht; features[:, 32] = cva; features[:, 33] = ova
+    features[:, 34] = num_cands; features[:, 35] = num_gender_match; features[:, 36] = num_propn_cands
+    features[:, 37] = graph_resolved; features[:, 38] = graph_confidence; features[:, 39] = graph_same_cluster
+    features[:, 40] = propn_first_dist; features[:, 41] = propn_freq
+    features[:, 42] = cand_sent_propn_count
+    features[:, 43] = cand_token_pos_in_sent
+    features[:, 44] = float(origin_doc_pos)
+    features[:, 45] = chain_progress
+    features[:, 46] = float(prior_same_pos)
+    features[:, 47] = cand_in_quotes
     return features
 
 
