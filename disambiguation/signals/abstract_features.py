@@ -1,3 +1,10 @@
+ENT_TYPE_IDS = {
+    "PERSON": 0, "ORG": 1, "GPE": 2, "LOC": 3, "NORP": 4,
+    "FAC": 5, "PRODUCT": 6, "EVENT": 7, "WORK_OF_ART": 8,
+    "": 9,  # not an entity
+    # DATE/TIME/MONEY/PERCENT/QUANTITY/ORDINAL/CARDINAL → fallback len(ENT_TYPE_IDS)
+}
+
 POS_IDS = {
     "PROPN": 0, "NOUN": 1, "PRON": 2, "ADJ": 3, "VERB": 4, "DET": 5,
     "ADP": 6, "AUX": 7, "ADV": 8, "SCONJ": 9, "CCONJ": 10, "PART": 11,
@@ -15,7 +22,7 @@ GENDER_IDS = {"Masc": 0, "Fem": 1, "Neut": 2, "unknown": 3}
 NUMBER_IDS = {"Sing": 0, "Plur": 1, "unknown": 2}
 PRONTYPE_IDS = {"Prs": 0, "Art": 1, "Dem": 2, "Rel": 3, "Int": 4, "unknown": 5}
 
-NUM_FEATURES = 51
+NUM_FEATURES = 54
 
 FEATURE_NAMES = [
     "o_pos", "o_dep", "o_gender", "o_number", "o_is_subj",
@@ -34,4 +41,5 @@ FEATURE_NAMES = [
     "cand_sent_propn_count", "cand_token_pos_in_sent", "origin_doc_position",
     "chain_progress", "prior_same_pos_count", "cand_in_quotes",
     "cur_is_subj", "cand_is_subj_graph_resolved", "cand_is_subj_no_graph",
+    "o_ent_type", "cur_ent_type", "c_ent_type",
 ]

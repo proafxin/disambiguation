@@ -9,12 +9,12 @@ from disambiguation.signals.abstract_features import POS_IDS, NUM_FEATURES
 from disambiguation.signals.resolution_graph import ResolutionGraph
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
-SPACY_TRF_DIR = CACHE_DIR / "spacy_trf"
 DATA_DIR = CACHE_DIR.parent / "data"
+SPACY_TRF_DIR = DATA_DIR / "spacy_trf"
 MAX_HOPS = 512
 TOP_K = 20
 NEG_SAMPLES = 4
-N_TOKEN_FEATURES = 15
+N_TOKEN_FEATURES = 16
 
 DATASET_CONFIG = [
     ("preco", ["train"]),
@@ -64,7 +64,7 @@ def _clusters(ds_name: str, sample: dict) -> list[list[list[int]]]:
 
 class CachedData:
     def __init__(self) -> None:
-        print("Loading cache from spacy_trf...")
+        print("Loading spacy_trf data...")
         start = time.time()
 
         all_parts: list[np.ndarray] = []
@@ -383,6 +383,9 @@ def build_features_batch(
     features[:, 48] = float(cur[6])
     features[:, 49] = c_all[:, 6] * graph_resolved
     features[:, 50] = c_all[:, 6] * (1.0 - graph_resolved)
+    features[:, 51] = o[15]
+    features[:, 52] = cur[15]
+    features[:, 53] = c_all[:, 15]
     return features
 
 
