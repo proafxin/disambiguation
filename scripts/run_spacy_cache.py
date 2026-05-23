@@ -44,7 +44,7 @@ def load_nlp() -> spacy.Language:
     trf = nlp.get_pipe("transformer")
     ws = find_strided_spans(trf.model)
     if ws:
-        ws.attrs["batch_size"] = 384
+        ws.attrs["batch_size"] = 192
         print(f"  with_strided_spans batch_size: {ws.attrs['batch_size']}")
     print(f"  pipeline: {nlp.pipe_names}")
     return nlp
@@ -200,7 +200,7 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
         ex_fill = [int(offsets[i]) for i in range(n)]
         n_done = 0
 
-    pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=16)
+    pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=8)
     remaining = chunk_meta[n_done:]
 
     for i, (doc, (ex_idx, chunk_sent_lens)) in enumerate(tqdm(
