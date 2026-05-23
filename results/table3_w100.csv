@@ -1,0 +1,2 @@
+experiment,train_source,test_source,ap,precision,recall,f1,pron_pron_r,pron_noun_r,pron_propn_r,noun_propn_r,test_episodes,gull_ap,gull_precision,gull_recall,gull_f1,gull_episodes
+t3_unified,all_stratified_2:1,all_stratified_2:1,0.9130,0.8603,0.8029,0.8306,0.8884,0.1647,0.8295,0.0826,149420,0.9963,0.9815,0.9622,0.9718,3339

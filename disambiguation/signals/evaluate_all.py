@@ -1,5 +1,6 @@
 import csv
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -23,8 +24,14 @@ WINDOW_LENGTHS = [100, 150, 200]
 
 XGB_PARAMS = dict(
     n_estimators=500, max_depth=10, learning_rate=0.1,
-    subsample=0.8, min_child_weight=10, device="cuda",
-    tree_method="hist", random_state=42,
+    subsample=0.8, min_child_weight=10, max_bin=1024,
+    device="cuda", tree_method="hist", random_state=42,
+)
+
+XGB_PARAMS_QUICK = dict(
+    n_estimators=20, max_depth=6, learning_rate=0.1,
+    subsample=0.8, min_child_weight=5, max_bin=256,
+    device="cuda", tree_method="hist", random_state=42,
 )
 
 
@@ -142,22 +149,33 @@ def _evaluate(model: xgb.XGBClassifier, X: np.ndarray, y: np.ndarray) -> dict:
     }
 
 
-def _train_or_load(model_key: str, window: int, X_train: np.ndarray, y_train: np.ndarray) -> xgb.XGBClassifier:
-    path = MODELS_DIR / f"{model_key}_w{window}.ubj"
-    model = xgb.XGBClassifier(**XGB_PARAMS, early_stopping_rounds=30)
+def _train_or_load(
+    model_key: str,
+    window: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    models_dir: Path,
+    quick: bool = False,
+) -> xgb.XGBClassifier:
+    path = models_dir / f"{model_key}_w{window}.ubj"
+    params = XGB_PARAMS_QUICK if quick else XGB_PARAMS
+    early_stopping = None if quick else 30
+    model = xgb.XGBClassifier(**params, early_stopping_rounds=early_stopping)
     if path.exists():
         model.load_model(str(path))
         print(f"    Loaded: {path.name}")
     else:
         print(f"    Training on {len(X_train):,} episodes...")
         rng = np.random.default_rng(42)
-        n_val = max(1000, len(X_train) // 10)
+        n_val = max(100 if quick else 1000, len(X_train) // 10)
         idx = rng.permutation(len(X_train))
         X_val, y_val = X_train[idx[:n_val]], y_train[idx[:n_val]]
         X_tr, y_tr = X_train[idx[n_val:]], y_train[idx[n_val:]]
-        model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=50)
+        fit_kwargs = {} if quick else {"eval_set": [(X_val, y_val)], "verbose": 50}
+        model.fit(X_tr, y_tr, **fit_kwargs)
         model.save_model(str(path))
-        print(f"    Saved: {path.name} ({model.best_iteration + 1} trees)")
+        trees = getattr(model, "best_iteration", model.n_estimators - 1) + 1
+        print(f"    Saved: {path.name} ({trees} trees)")
     return model
 
 
@@ -214,12 +232,14 @@ def _write_table_csv(table_num: int, all_results: list, window: int) -> None:
             ])
 
 
-def run_all_experiments() -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    results_path = RESULTS_DIR / "all_metrics.json"
+def run_all_experiments(quick: bool = False) -> None:
+    models_dir = MODELS_DIR / ("quick" if quick else "full")
+    results_dir = RESULTS_DIR / ("quick" if quick else "full")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / "all_metrics.json"
 
-    if results_path.exists():
+    if results_path.exists() and not quick:
         with open(results_path) as f:
             all_results = json.load(f)
         done_keys = {
@@ -231,6 +251,9 @@ def run_all_experiments() -> None:
     else:
         all_results = []
         done_keys = set()
+
+    if quick:
+        print("QUICK TEST MODE — 200 docs/dataset, 20 trees, w=100 only")
 
     with open(CACHE_DIR / "dataset_ranges.json") as f:
         ranges = json.load(f)
@@ -267,7 +290,7 @@ def run_all_experiments() -> None:
             print(f"    SKIP: empty training data")
             return
 
-        model = _train_or_load(model_key, window, X_train, y_train)
+        model = _train_or_load(model_key, window, X_train, y_train, models_dir, quick)
         test_m = _evaluate(model, X_test, y_test)
         gull_m = _evaluate(model, X_gull, y_gull)
 
@@ -293,7 +316,10 @@ def run_all_experiments() -> None:
         done_keys.add(key)
         _save()
 
-    for window in WINDOW_LENGTHS:
+    windows = [100] if quick else WINDOW_LENGTHS
+    quick_cap = 200
+
+    for window in windows:
         print(f"\n{'='*70}\nWINDOW = {window} tokens\n{'='*70}")
 
         store = _build_flat_store(window, ranges)
@@ -302,20 +328,28 @@ def run_all_experiments() -> None:
         if len(X_gull) == 0:
             print(f"  WARNING: no Gulliver's episodes for w={window} — benchmark will be empty")
 
+        def _cap(docs: np.ndarray) -> np.ndarray:
+            return docs[:quick_cap] if quick else docs
+
         # --- Table 1: Individual 2:1 split (4 datasets) ---
+        # Splits cached for T3 reuse — T3 train/test = union of T1 splits per dataset
         print("\n--- Table 1: Individual 2:1 split ---")
+        t1_train: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        t1_test: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for ds in DATASETS:
             if ds not in ranges:
                 continue
-            docs = rng.permutation(_get_docs(ds, ranges, exclude_gullivers=True))
+            docs = _cap(rng.permutation(_get_docs(ds, ranges, exclude_gullivers=True)))
             n = len(docs) * 2 // 3
             X_tr, y_tr = _slice(store, ds, docs[:n])
             X_te, y_te = _slice(store, ds, docs[n:])
+            t1_train[ds] = (X_tr, y_tr)
+            t1_test[ds] = (X_te, y_te)
             _run(f"t1_{ds}", f"t1_{ds}", 1, ds, ds, window,
                  X_tr, y_tr, X_te, y_te, X_gull, y_gull)
 
-        # --- Table 2: Cross-dataset (train on 3, test on 1) ---
-        print("\n--- Table 2: Cross-dataset (3→1) ---")
+        # --- Table 2: Blind cross-dataset validation (train on 3, test on 1) ---
+        print("\n--- Table 2: Blind cross-dataset validation ---")
         for test_ds in DATASETS:
             if test_ds not in ranges:
                 continue
@@ -323,35 +357,25 @@ def run_all_experiments() -> None:
             for td in DATASETS:
                 if td == test_ds or td not in ranges:
                     continue
-                X, y = _slice(store, td, _get_docs(td, ranges, exclude_gullivers=True))
+                X, y = _slice(store, td, _cap(_get_docs(td, ranges, exclude_gullivers=True)))
                 if len(X) > 0:
                     train_Xs.append(X)
                     train_ys.append(y)
             if not train_Xs:
                 continue
             X_tr, y_tr = _shuffle_concat(train_Xs, train_ys, rng)
-            X_te, y_te = _slice(store, test_ds, _get_docs(test_ds, ranges))
+            X_te, y_te = _slice(store, test_ds, _cap(_get_docs(test_ds, ranges)))
             train_label = "+".join(d for d in DATASETS if d != test_ds and d in ranges)
             _run(f"t2_test_{test_ds}", f"t2_test_{test_ds}", 2,
                  train_label, test_ds, window,
                  X_tr, y_tr, X_te, y_te, X_gull, y_gull)
 
-        # --- Table 3: Unified stratified (2:1 per dataset, then mix) ---
+        # --- Table 3: Unified stratified — reuses T1 splits directly ---
         print("\n--- Table 3: Unified stratified ---")
-        tr_Xs, tr_ys, te_Xs, te_ys = [], [], [], []
-        for ds in DATASETS:
-            if ds not in ranges:
-                continue
-            docs = rng.permutation(_get_docs(ds, ranges, exclude_gullivers=True))
-            n = len(docs) * 2 // 3
-            X_tr, y_tr = _slice(store, ds, docs[:n])
-            X_te, y_te = _slice(store, ds, docs[n:])
-            if len(X_tr) > 0:
-                tr_Xs.append(X_tr)
-                tr_ys.append(y_tr)
-            if len(X_te) > 0:
-                te_Xs.append(X_te)
-                te_ys.append(y_te)
+        tr_Xs = [t1_train[ds][0] for ds in DATASETS if ds in t1_train and len(t1_train[ds][0]) > 0]
+        tr_ys = [t1_train[ds][1] for ds in DATASETS if ds in t1_train and len(t1_train[ds][0]) > 0]
+        te_Xs = [t1_test[ds][0] for ds in DATASETS if ds in t1_test and len(t1_test[ds][0]) > 0]
+        te_ys = [t1_test[ds][1] for ds in DATASETS if ds in t1_test and len(t1_test[ds][0]) > 0]
         if tr_Xs and te_Xs:
             X_tr, y_tr = _shuffle_concat(tr_Xs, tr_ys, rng)
             _run("t3_unified", "t3_unified", 3,
@@ -365,8 +389,8 @@ def run_all_experiments() -> None:
         for ds in DATASETS:
             if ds not in ranges:
                 continue
-            train_docs = _get_docs(ds, ranges, exclude_gullivers=True)
-            all_docs = _get_docs(ds, ranges)
+            train_docs = _cap(_get_docs(ds, ranges, exclude_gullivers=True))
+            all_docs = _cap(_get_docs(ds, ranges))
             X_tr, y_tr = _slice(store, ds, train_docs, max_rank=50)
             X_te, y_te = _slice(store, ds, all_docs, min_rank=51)
             if len(X_tr) > 0:
@@ -411,4 +435,4 @@ def run_all_experiments() -> None:
 
 
 if __name__ == "__main__":
-    run_all_experiments()
+    run_all_experiments(quick="--quick" in sys.argv)
