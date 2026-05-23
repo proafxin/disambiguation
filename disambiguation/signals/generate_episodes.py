@@ -1,6 +1,5 @@
 import concurrent.futures
 import json
-import multiprocessing as mp
 import time
 from pathlib import Path
 
@@ -10,11 +9,9 @@ from disambiguation.signals.train_full import CachedData, generate_doc_episodes
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 EPISODES_DIR = CACHE_DIR / "episodes"
+BATCH_SIZE = 1000
 
 GULLIVERS_DOC_IDX = 36676
-
-# Set in main process before forking; workers inherit via CoW — never written by workers.
-_fork_cache: CachedData | None = None
 
 
 def episode_dir(dataset_name: str, window_tokens: int) -> Path:
@@ -44,35 +41,68 @@ def generate_dataset_episodes(
     print(f"  {dataset_name} w={window_tokens}: {len(doc_indices)} docs...")
     start = time.time()
 
-    all_X: list[np.ndarray] = []
-    all_y: list[int] = []
-    all_ranks: list[int] = []
+    batch_X: list[np.ndarray] = []
+    batch_y: list[int] = []
+    batch_ranks: list[int] = []
     doc_map: dict[int, tuple[int, int]] = {}
+    chunk_paths: list[tuple[Path, Path, Path]] = []
+    total_eps = 0
     total_pos = 0
+
+    def flush_batch() -> None:
+        nonlocal total_eps
+        if not batch_X:
+            return
+        idx = len(chunk_paths)
+        cx = out_dir / f"_chunk_{idx}_X.npy"
+        cy = out_dir / f"_chunk_{idx}_y.npy"
+        cr = out_dir / f"_chunk_{idx}_ranks.npy"
+        np.save(cx, np.array(batch_X, dtype=np.float32))
+        np.save(cy, np.array(batch_y, dtype=np.int32))
+        np.save(cr, np.array(batch_ranks, dtype=np.int32))
+        chunk_paths.append((cx, cy, cr))
+        total_eps += len(batch_X)
+        batch_X.clear()
+        batch_y.clear()
+        batch_ranks.clear()
 
     for i, doc_idx in enumerate(doc_indices):
         feats, labels, ranks = generate_doc_episodes(cache, doc_idx, window_tokens)
         if not feats:
             continue
-        rs = len(all_X)
-        all_X.extend(feats)
-        all_y.extend(labels)
-        all_ranks.extend(ranks)
-        doc_map[doc_idx] = (rs, len(all_X))
+        rs = total_eps + len(batch_X)
+        batch_X.extend(feats)
+        batch_y.extend(labels)
+        batch_ranks.extend(ranks)
+        doc_map[doc_idx] = (rs, total_eps + len(batch_X))
         total_pos += sum(labels)
+
+        if len(batch_X) >= BATCH_SIZE:
+            flush_batch()
 
         if (i + 1) % 1000 == 0 or (i + 1) == len(doc_indices):
             elapsed = time.time() - start
             rate = (i + 1) / max(elapsed, 1e-6)
             remaining = (len(doc_indices) - i - 1) / max(rate, 1e-6)
             print(f"    [{dataset_name} w={window_tokens}] "
-                  f"{i+1}/{len(doc_indices)} docs, {len(all_X):,} eps, "
+                  f"{i+1}/{len(doc_indices)} docs, {total_eps + len(batch_X):,} eps, "
                   f"{rate:.1f} docs/s, ~{remaining:.0f}s left")
 
-    total_eps = len(all_X)
-    np.save(out_dir / "X.npy", np.array(all_X, dtype=np.float32))
-    np.save(out_dir / "y.npy", np.array(all_y, dtype=np.int32))
-    np.save(out_dir / "ranks.npy", np.array(all_ranks, dtype=np.int32))
+    flush_batch()
+
+    if len(chunk_paths) == 1:
+        cx, cy, cr = chunk_paths[0]
+        cx.rename(out_dir / "X.npy")
+        cy.rename(out_dir / "y.npy")
+        cr.rename(out_dir / "ranks.npy")
+    else:
+        np.save(out_dir / "X.npy", np.concatenate([np.load(cx) for cx, _, _ in chunk_paths]))
+        np.save(out_dir / "y.npy", np.concatenate([np.load(cy) for _, cy, _ in chunk_paths]))
+        np.save(out_dir / "ranks.npy", np.concatenate([np.load(cr) for _, _, cr in chunk_paths]))
+        for cx, cy, cr in chunk_paths:
+            cx.unlink()
+            cy.unlink()
+            cr.unlink()
 
     with open(mpath, "w") as f:
         json.dump({
@@ -91,41 +121,32 @@ def generate_dataset_episodes(
     return total_eps, total_pos
 
 
-def _task_worker(args: tuple[str, list[int], int]) -> str:
-    ds, doc_indices, window = args
-    generate_dataset_episodes(_fork_cache, ds, doc_indices, window)
-    return f"{ds} w={window}"
-
-
 def generate_all() -> None:
-    global _fork_cache
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
 
-    _fork_cache = CachedData()  # writes dataset_ranges.json as a side effect
+    cache = CachedData()
 
     with open(CACHE_DIR / "dataset_ranges.json") as f:
         ranges = json.load(f)
 
     window_lengths = [100, 150, 200]
-    ctx = mp.get_context("fork")
 
     for name, r in ranges.items():
         doc_indices = list(range(r["start_doc"], r["end_doc"]))
-        tasks: list[tuple[str, list[int], int]] = [
-            (name, doc_indices, window) for window in window_lengths
-        ]
-        print(f"\nDataset {name}: {len(doc_indices)} docs, {len(tasks)} windows in parallel...")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=len(window_lengths), mp_context=ctx) as executor:
-            futures = {executor.submit(_task_worker, t): t for t in tasks}
+        print(f"\nDataset {name}: {len(doc_indices)} docs, {len(window_lengths)} windows in parallel...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(window_lengths)) as executor:
+            futures = {
+                executor.submit(generate_dataset_episodes, cache, name, doc_indices, w): w
+                for w in window_lengths
+            }
             for fut in concurrent.futures.as_completed(futures):
-                t = futures[fut]
+                w = futures[fut]
                 try:
-                    print(f"  {fut.result()} complete")
+                    fut.result()
+                    print(f"  {name} w={w} complete")
                 except Exception as exc:
-                    print(f"  {t[0]} w={t[2]} FAILED: {exc}")
+                    print(f"  {name} w={w} FAILED: {exc}")
                     raise
-
-    _fork_cache = None
 
     print(f"\n{'='*60}\nSUMMARY\n{'='*60}")
     for d in sorted(EPISODES_DIR.iterdir()):

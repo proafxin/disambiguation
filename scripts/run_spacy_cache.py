@@ -1,26 +1,15 @@
 import gc
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
-import numpy as np
 import spacy
 import spacy.tokens
 import torch
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
 
-from disambiguation.signals.abstract_features import (
-    DEP_IDS,
-    ENT_TYPE_IDS,
-    GENDER_IDS,
-    NUMBER_IDS,
-    POS_IDS,
-    PRONTYPE_IDS,
-)
-
 MAX_TOKENS = 4000
-MAX_DEPTH = 20
-N_FEATURES = 16
 CHECKPOINT_INTERVAL = 2000
 CACHE_DIR = Path("data/spacy_trf")
 DATA_DIR = Path("data")
@@ -44,12 +33,13 @@ def find_strided_spans(model: object) -> object | None:
 
 
 def load_nlp() -> spacy.Language:
-    spacy.prefer_gpu()
+    gpu = spacy.prefer_gpu()
+    print(f"  GPU: {gpu}")
     nlp = spacy.load("en_core_web_trf", disable=["senter", "lemmatizer"])
     trf = nlp.get_pipe("transformer")
     ws = find_strided_spans(trf.model)
     if ws:
-        ws.attrs["batch_size"] = 192
+        ws.attrs["batch_size"] = 32
         print(f"  with_strided_spans batch_size: {ws.attrs['batch_size']}")
     print(f"  pipeline: {nlp.pipe_names}")
     return nlp
@@ -90,68 +80,16 @@ def make_doc(nlp: spacy.Language, tokens: list, sent_lens: list) -> spacy.tokens
     return spacy.tokens.Doc(nlp.vocab, words=tokens, sent_starts=sent_starts)
 
 
-def compute_depth(token: spacy.tokens.Token) -> int:
-    depth = 0
-    cur = token
-    while cur.head != cur and depth < MAX_DEPTH:
-        cur = cur.head
-        depth += 1
-    return depth
-
-
-def fill_doc_features(doc: spacy.tokens.Doc, sent_lens: list, data: np.ndarray, start_pos: int) -> int:
-    n_tokens = sum(sent_lens)
-    buf = np.empty((n_tokens, N_FEATURES), dtype=np.float32)
-    pos = 0
-    abs_p = 0
-    for sl in sent_lens:
-        sent_start = abs_p
-        for i in range(abs_p, abs_p + sl):
-            tok = doc[i]
-            morph = tok.morph.to_dict()
-            dep = tok.dep_
-            ti = i - sent_start
-            head_rel = tok.head.i - sent_start if tok.head != tok else -1
-            buf[pos, 0] = POS_IDS.get(tok.pos_, len(POS_IDS))
-            buf[pos, 1] = DEP_IDS.get(dep, len(DEP_IDS))
-            buf[pos, 2] = GENDER_IDS.get(morph.get("Gender", "unknown"), 3)
-            buf[pos, 3] = NUMBER_IDS.get(morph.get("Number", "unknown"), 2)
-            buf[pos, 4] = int(morph.get("Person", "0"))
-            buf[pos, 5] = PRONTYPE_IDS.get(morph.get("PronType", "unknown"), 5)
-            buf[pos, 6] = int(dep in {"nsubj", "nsubj:pass", "nsubj:outer", "csubj"})
-            buf[pos, 7] = int(dep in {"obj", "iobj"})
-            buf[pos, 8] = int(dep == "nmod:poss")
-            buf[pos, 9] = compute_depth(tok)
-            buf[pos, 10] = tok.n_lefts + tok.n_rights
-            buf[pos, 11] = ti / max(sl - 1, 1)
-            buf[pos, 12] = head_rel
-            buf[pos, 13] = POS_IDS.get(tok.head.pos_, len(POS_IDS))
-            buf[pos, 14] = DEP_IDS.get(tok.head.dep_, len(DEP_IDS))
-            buf[pos, 15] = ENT_TYPE_IDS.get(tok.ent_type_, len(ENT_TYPE_IDS))
-            pos += 1
-        abs_p += sl
-    end_pos = int(start_pos) + n_tokens
-    data[start_pos:end_pos] = buf
-    return end_pos
-
-
-def save_checkpoint(ckpt_path: Path, ex_fill: list, n_done: int) -> None:
-    tmp = ckpt_path.with_name(ckpt_path.stem + ".tmp.npz")
-    np.savez(str(tmp), ex_fill=np.array(ex_fill, dtype=np.int64), n_done=np.array([n_done]))
-    tmp.replace(ckpt_path)
-
-
-def build_chunk_meta(ds: Dataset, ds_name: str) -> tuple[list, np.ndarray, int]:
+def build_chunk_meta(ds: Dataset, ds_name: str) -> tuple[list, list]:
     chunk_meta: list[tuple[int, list[int]]] = []
-    doc_token_counts: list[int] = []
-    for ex_idx, ex in enumerate(ds):
+    doc_chunk_counts: list[int] = []
+    for ex in ds:
         sents = get_sentences(ex, ds_name)
-        doc_token_counts.append(sum(len(s) for s in sents))
-        for _, chunk_sent_lens in split_into_chunks(sents, MAX_TOKENS):
-            chunk_meta.append((ex_idx, chunk_sent_lens))
-    offsets = np.zeros(len(doc_token_counts) + 1, dtype=np.int64)
-    offsets[1:] = np.cumsum(doc_token_counts)
-    return chunk_meta, offsets, int(offsets[-1])
+        chunks = split_into_chunks(sents, MAX_TOKENS)
+        doc_chunk_counts.append(len(chunks))
+        for _, chunk_sent_lens in chunks:
+            chunk_meta.append((len(doc_chunk_counts) - 1, chunk_sent_lens))
+    return chunk_meta, doc_chunk_counts
 
 
 def doc_stream(
@@ -166,13 +104,36 @@ def doc_stream(
             chunk_idx += 1
 
 
-def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
-    out_data = CACHE_DIR / f"{ds_name}_{split}_data.npy"
-    out_offsets = CACHE_DIR / f"{ds_name}_{split}_offsets.npy"
-    tmp_data = CACHE_DIR / f"{ds_name}_{split}_data.tmp.npy"
-    ckpt_path = CACHE_DIR / f"{ds_name}_{split}_checkpoint.npz"
+def load_checkpoint(ds_name: str, split: str, ckpt_path: Path) -> tuple[int, int]:
+    if ckpt_path.exists():
+        with ckpt_path.open(encoding="utf-8") as f:
+            ckpt = json.load(f)
+        print(f"  resuming from chunk {ckpt['n_done']}")
+        return ckpt["n_done"], ckpt.get("n_written_chunks", ckpt["n_done"] // CHECKPOINT_INTERVAL)
+    for p in CACHE_DIR.glob(f"{ds_name}_{split}_chunk_*.spacy"):
+        p.unlink()
+    return 0, 0
 
-    if out_data.exists() and out_offsets.exists():
+
+def merge_and_save(ds_name: str, split: str, out_docs: Path) -> None:
+    chunk_files = sorted(
+        CACHE_DIR.glob(f"{ds_name}_{split}_chunk_*.spacy"),
+        key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
+    )
+    final_bin = spacy.tokens.DocBin(store_user_data=True)
+    for cp in chunk_files:
+        final_bin.merge(spacy.tokens.DocBin(store_user_data=True).from_disk(cp))
+    final_bin.to_disk(out_docs)
+    for cp in chunk_files:
+        cp.unlink()
+
+
+def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
+    out_docs = CACHE_DIR / f"{ds_name}_{split}.spacy"
+    out_meta = CACHE_DIR / f"{ds_name}_{split}_meta.json"
+    ckpt_path = CACHE_DIR / f"{ds_name}_{split}_checkpoint.json"
+
+    if out_docs.exists() and out_meta.exists():
         print(f"skip {ds_name}/{split} — cache exists")
         return
     if not (DATA_DIR / ds_name).exists():
@@ -188,49 +149,47 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     n = len(ds)
     print(f"\n{ds_name}/{split}: {n} examples")
 
-    chunk_meta, offsets, total_tokens = build_chunk_meta(ds, ds_name)
+    chunk_meta, doc_chunk_counts = build_chunk_meta(ds, ds_name)
     n_chunks = len(chunk_meta)
-    print(f"  {n_chunks} chunks, {total_tokens} tokens")
+    print(f"  {n_chunks} chunks")
 
-    if tmp_data.exists() and ckpt_path.exists():
-        ckpt = np.load(str(ckpt_path))
-        ex_fill = list(ckpt["ex_fill"])
-        n_done = int(ckpt["n_done"][0])
-        data = np.memmap(str(tmp_data), dtype=np.float32, mode="r+", shape=(total_tokens, N_FEATURES))
-        print(f"  resuming from chunk {n_done}/{n_chunks}")
-    else:
-        if tmp_data.exists():
-            tmp_data.unlink()
-        data = np.memmap(str(tmp_data), dtype=np.float32, mode="w+", shape=(total_tokens, N_FEATURES))
-        ex_fill = [int(offsets[i]) for i in range(n)]
-        n_done = 0
+    n_done, n_written_chunks = load_checkpoint(ds_name, split, ckpt_path)
 
     pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=8)
     remaining = chunk_meta[n_done:]
+    doc_bin = spacy.tokens.DocBin(store_user_data=True)
 
     for i, (doc, (ex_idx, chunk_sent_lens)) in enumerate(
         tqdm(zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}")
     ):
-        ex_fill[ex_idx] = fill_doc_features(doc, chunk_sent_lens, data, ex_fill[ex_idx])
+        doc.user_data["sent_lens"] = chunk_sent_lens
+        doc.user_data["ex_idx"] = ex_idx
+        doc_bin.add(doc)
+
         if (i + 1) % CHECKPOINT_INTERVAL == 0:
-            data.flush()
-            save_checkpoint(ckpt_path, ex_fill, n_done + i + 1)
+            chunk_path = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written_chunks}.spacy"
+            doc_bin.to_disk(chunk_path)
+            doc_bin = spacy.tokens.DocBin(store_user_data=True)
+            n_written_chunks += 1
+            with ckpt_path.open("w", encoding="utf-8") as f:
+                json.dump({"n_done": n_done + i + 1, "n_written_chunks": n_written_chunks}, f)
             gc.collect()
 
-    data.flush()
-    del data
+    chunk_path = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written_chunks}.spacy"
+    doc_bin.to_disk(chunk_path)
+    n_written_chunks += 1
 
-    tmp_data.replace(out_data)
-    tmp_np = out_offsets.with_name(out_offsets.stem + ".tmp.npy")
-    np.save(str(tmp_np), offsets)
-    tmp_np.replace(out_offsets)
+    merge_and_save(ds_name, split, out_docs)
+
+    with out_meta.open("w", encoding="utf-8") as f:
+        json.dump({"n_examples": n, "n_chunks": n_chunks, "doc_chunk_counts": doc_chunk_counts}, f)
 
     if ckpt_path.exists():
         ckpt_path.unlink()
 
-    print(f"  saved: {total_tokens} tokens, {n} examples")
+    print(f"  saved: {n_chunks} chunks, {n} examples")
 
-    del ds, ds_dict, chunk_meta, offsets, ex_fill
+    del ds, ds_dict, chunk_meta, doc_chunk_counts, doc_bin
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
