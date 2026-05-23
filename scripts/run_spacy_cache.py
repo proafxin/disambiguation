@@ -126,9 +126,12 @@ def merge_and_save(ds_name: str, split: str, out_docs: Path) -> None:
         CACHE_DIR.glob(f"{ds_name}_{split}_chunk_*.spacy"),
         key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
     )
+    print(f"  merging {len(chunk_files)} chunks...")
     final_bin = spacy.tokens.DocBin(store_user_data=True)
-    for cp in chunk_files:
+    for i, cp in enumerate(chunk_files):
         final_bin.merge(spacy.tokens.DocBin(store_user_data=True).from_disk(cp))
+        print(f"  merged {i + 1}/{len(chunk_files)}")
+    print(f"  writing {out_docs.name}...")
     final_bin.to_disk(out_docs)
     for cp in chunk_files:
         cp.unlink()
@@ -158,14 +161,18 @@ def writer_worker(
 
         if n_processed % CHECKPOINT_INTERVAL == 0:
             cp = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written}.spacy"
-            doc_bin.to_disk(cp)
+            tmp = cp.with_suffix(".tmp.spacy")
+            doc_bin.to_disk(tmp)
+            tmp.rename(cp)
             with ckpt_path.open("w", encoding="utf-8") as f:
                 json.dump({"n_done": n_done_offset + n_processed, "n_written_chunks": n_written + 1}, f)
             doc_bin = spacy.tokens.DocBin(store_user_data=True)
             n_written += 1
 
     cp = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written}.spacy"
-    doc_bin.to_disk(cp)
+    tmp = cp.with_suffix(".tmp.spacy")
+    doc_bin.to_disk(tmp)
+    tmp.rename(cp)
 
 
 def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
