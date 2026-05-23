@@ -218,6 +218,8 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     for doc, (ex_idx, chunk_sent_lens) in tqdm(
         zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}"
     ):
+        doc.tensor = doc.tensor[:0]
+        doc._.trf_data = None
         q.put((doc, ex_idx, chunk_sent_lens))
 
     q.put(None)
