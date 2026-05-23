@@ -10,10 +10,8 @@ from sklearn.metrics import average_precision_score, f1_score, precision_score, 
 
 from disambiguation.signals.abstract_features import FEATURE_NAMES, NUM_FEATURES, POS_IDS
 from disambiguation.signals.generate_episodes import (
-    EPISODES_DIR, HELD_OUT_DOC_INDICES, _chunk_dir, _manifest_path,
+    EPISODES_DIR, GULLIVERS_DOC_IDX, episode_dir, manifest_path,
 )
-
-GULLIVERS_DOC_IDX = 36676
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 RESULTS_DIR = Path(__file__).parent.parent.parent / "results"
@@ -37,31 +35,19 @@ XGB_PARAMS_QUICK = dict(
 
 def _build_flat_store(window: int, ranges: dict) -> dict:
     store: dict = {}
-    all_ds = list(ranges.keys()) + ["gullivers"]
     t0 = time.time()
     total_mb = 0.0
-    for ds in all_ds:
-        manifest = _manifest_path(ds, window)
-        if not manifest.exists():
+    for ds in ranges:
+        mpath = manifest_path(ds, window)
+        if not mpath.exists():
             continue
-        with open(manifest) as f:
+        with open(mpath) as f:
             m = json.load(f)
-        doc_map = {int(k): v for k, v in m["doc_map"].items()}
-        out_dir = _chunk_dir(ds, window)
-        X_parts, y_parts, r_parts, chunk_offsets = [], [], [], [0]
-        for ci in range(m["num_chunks"]):
-            X_parts.append(np.load(out_dir / f"chunk_{ci:04d}_X.npy"))
-            y_parts.append(np.load(out_dir / f"chunk_{ci:04d}_y.npy"))
-            r_parts.append(np.load(out_dir / f"chunk_{ci:04d}_ranks.npy"))
-            chunk_offsets.append(chunk_offsets[-1] + len(X_parts[-1]))
-        X_flat = np.concatenate(X_parts) if len(X_parts) > 1 else X_parts[0]
-        y_flat = np.concatenate(y_parts) if len(y_parts) > 1 else y_parts[0]
-        r_flat = np.concatenate(r_parts) if len(r_parts) > 1 else r_parts[0]
-        del X_parts, y_parts, r_parts
-        doc_rows = {
-            doc_idx: (chunk_offsets[ci] + rs, chunk_offsets[ci] + re)
-            for doc_idx, (ci, rs, re) in doc_map.items()
-        }
+        out_dir = episode_dir(ds, window)
+        X_flat = np.load(out_dir / "X.npy")
+        y_flat = np.load(out_dir / "y.npy")
+        r_flat = np.load(out_dir / "ranks.npy")
+        doc_rows = {int(k): (v[0], v[1]) for k, v in m["doc_map"].items()}
         store[ds] = {"X": X_flat, "y": y_flat, "ranks": r_flat, "doc_rows": doc_rows}
         total_mb += X_flat.nbytes / 1024 / 1024
     print(f"  Loaded {total_mb:.0f} MB into RAM in {time.time() - t0:.1f}s")
@@ -330,7 +316,7 @@ def run_all_experiments(quick: bool = False) -> None:
 
         store = _build_flat_store(window, ranges)
 
-        X_gull, y_gull = _slice(store, "gullivers", np.array([GULLIVERS_DOC_IDX]))
+        X_gull, y_gull = _slice(store, "litbank", np.array([GULLIVERS_DOC_IDX]))
         if len(X_gull) == 0:
             print(f"  WARNING: no Gulliver's episodes for w={window} — benchmark will be empty")
 
@@ -440,5 +426,64 @@ def run_all_experiments(quick: bool = False) -> None:
     print(f"\nAll done. Results in {RESULTS_DIR}/")
 
 
+def probe_features(n_train_docs: int = 500, n_test_docs: int = 250, window: int = 100) -> None:
+    with open(CACHE_DIR / "dataset_ranges.json") as f:
+        ranges = json.load(f)
+
+    store = _build_flat_store(window, ranges)
+    available = [ds for ds in DATASETS if ds in store]
+    if not available:
+        print("No episodes found — run generate_episodes first")
+        return
+
+    rng = np.random.default_rng(42)
+    tr_Xs, tr_ys, te_Xs, te_ys = [], [], [], []
+    for ds in available:
+        docs = rng.permutation(_get_docs(ds, ranges, exclude_gullivers=True))
+        n_tr = min(n_train_docs, len(docs) * 2 // 3)
+        n_te = min(n_test_docs, len(docs) - n_tr)
+        X_tr_ds, y_tr_ds = _slice(store, ds, docs[:n_tr])
+        X_te_ds, y_te_ds = _slice(store, ds, docs[n_tr : n_tr + n_te])
+        if len(X_tr_ds) > 0:
+            tr_Xs.append(X_tr_ds)
+            tr_ys.append(y_tr_ds)
+        if len(X_te_ds) > 0:
+            te_Xs.append(X_te_ds)
+            te_ys.append(y_te_ds)
+
+    X_tr, y_tr = _shuffle_concat(tr_Xs, tr_ys, rng)
+    X_te, y_te = np.concatenate(te_Xs), np.concatenate(te_ys)
+    print(f"Probe: {len(X_tr):,} train eps (pos={int(y_tr.sum())}), "
+          f"{len(X_te):,} test eps (pos={int(y_te.sum())})")
+
+    n_neg = int((y_tr == 0).sum())
+    n_pos = int((y_tr == 1).sum())
+    spw = n_neg / max(n_pos, 1)
+    model = xgb.XGBClassifier(
+        n_estimators=200, max_depth=8, learning_rate=0.1,
+        subsample=0.8, min_child_weight=5, max_bin=512,
+        device="cuda", tree_method="hist", random_state=42,
+        scale_pos_weight=spw,
+    )
+    model.fit(X_tr, y_tr)
+
+    y_pred = model.predict(X_te)
+    y_prob = model.predict_proba(X_te)[:, 1]
+    print(f"Test: AP={average_precision_score(y_te, y_prob):.4f}  "
+          f"P={precision_score(y_te, y_pred, average='binary', zero_division=0):.4f}  "
+          f"R={recall_score(y_te, y_pred, average='binary', zero_division=0):.4f}  "
+          f"F1={f1_score(y_te, y_pred, average='binary', zero_division=0):.4f}")
+
+    importances = model.feature_importances_
+    order = np.argsort(importances)[::-1]
+    print(f"\n{'Rank':>4}  {'Feature':<35}  {'Importance':>10}")
+    print("-" * 55)
+    for rank, i in enumerate(order, 1):
+        print(f"{rank:>4}  {FEATURE_NAMES[i]:<35}  {importances[i]:>10.4f}")
+
+
 if __name__ == "__main__":
-    run_all_experiments(quick="--quick" in sys.argv)
+    if "--probe" in sys.argv:
+        probe_features()
+    else:
+        run_all_experiments(quick="--quick" in sys.argv)
