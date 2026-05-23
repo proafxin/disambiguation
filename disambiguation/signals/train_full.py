@@ -3,15 +3,9 @@ import time
 from pathlib import Path
 
 import numpy as np
-import xgboost as xgb
 from datasets import load_from_disk
-from sklearn.metrics import average_precision_score
 
-from disambiguation.signals.abstract_features import (
-    POS_IDS,
-    NUM_FEATURES,
-    FEATURE_NAMES,
-)
+from disambiguation.signals.abstract_features import POS_IDS, NUM_FEATURES
 from disambiguation.signals.resolution_graph import ResolutionGraph
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
@@ -450,14 +444,8 @@ def generate_doc_episodes(
             if origin_info[0] == POS_IDS["PROPN"]:
                 continue
 
-            # Skip if already resolved: cluster has a PROPN or a graph-resolved canonical
-            graph_cluster_ids_pre, _ = graph.build_abs_arrays(
-                cache.sent_offsets, doc_start_abs, doc_len
-            )
-            origin_abs_pre = int(cache.sent_offsets[origin_gsi]) + st
-            if origin_abs_pre - doc_start_abs < doc_len:
-                if graph_cluster_ids_pre[origin_abs_pre - doc_start_abs] >= 0:
-                    continue
+            if graph.get_cluster_id((origin_gsi, st)) >= 0:
+                continue
 
             origin_abs = int(cache.sent_offsets[origin_gsi]) + st
             origin_doc_pos = (origin_abs - doc_start_abs) / max(doc_len - 1, 1)
@@ -542,7 +530,7 @@ def generate_doc_episodes(
                 for i in keep:
                     features_list.append(batch_features[i])
                     labels_list.append(int(is_correct[i]))
-                    ranks_list.append(int(i))
+                    ranks_list.append(hop)
 
                 # Teacher forcing: advance to nearest correct candidate in full pool
                 correct_in_pool = correct_mask[valid_abs_arr - doc_start_abs]
@@ -587,97 +575,3 @@ def generate_doc_episodes(
     return features_list, labels_list, ranks_list
 
 
-def train_full(window_tokens: int = 150) -> None:
-    cache = CachedData()
-
-    with open(CACHE_DIR / "dataset_ranges.json") as f:
-        ranges = json.load(f)
-
-    rng = np.random.default_rng(42)
-
-    GULLIVER_IDX = 36676
-
-    # 2:1 stratified split per dataset, Gulliver held out
-    train_indices, test_indices = [], []
-    for name, r in ranges.items():
-        docs = np.array([i for i in range(r["start_doc"], r["end_doc"]) if i != GULLIVER_IDX])
-        shuffled = rng.permutation(docs)
-        n_train = int(len(shuffled) * 2 / 3)
-        train_indices.extend(shuffled[:n_train])
-        test_indices.extend(shuffled[n_train:])
-        print(f"  {name}: {n_train} train, {len(shuffled) - n_train} test (from {len(docs)} docs)")
-
-    train_indices = rng.permutation(train_indices)
-    test_indices = rng.permutation(test_indices)
-    num_train_docs = len(train_indices)
-    num_test_docs = len(test_indices)
-
-    print(f"\nGenerating train episodes ({num_train_docs} docs)...")
-    start = time.time()
-    train_features, train_labels = [], []
-
-    for i, doc_idx in enumerate(train_indices):
-        feats, labels, _ = generate_doc_episodes(cache, int(doc_idx), window_tokens)
-        train_features.extend(feats)
-        train_labels.extend(labels)
-        if (i + 1) % 500 == 0:
-            print(f"  {i+1}/{num_train_docs} docs, {len(train_features)} episodes")
-
-    X_train = np.array(train_features)
-    y_train = np.array(train_labels, dtype=np.int32)
-    print(f"  Train: {X_train.shape[0]} episodes, {time.time()-start:.1f}s, pos_rate={y_train.mean():.4f}")
-
-    print(f"\nGenerating test episodes ({num_test_docs} docs)...")
-    test_features, test_labels = [], []
-    for doc_idx in test_indices:
-        feats, labels, _ = generate_doc_episodes(cache, int(doc_idx), window_tokens)
-        test_features.extend(feats)
-        test_labels.extend(labels)
-
-    X_test = np.array(test_features)
-    y_test = np.array(test_labels, dtype=np.int32)
-    print(f"  Test: {X_test.shape[0]} episodes, pos_rate={y_test.mean():.4f}")
-
-    print("\nTraining XGBoost (GPU)...")
-    start = time.time()
-    model = xgb.XGBClassifier(
-        n_estimators=300, max_depth=20, learning_rate=0.05,
-        subsample=0.8, min_child_weight=10, device="cuda",
-        tree_method="hist", random_state=42,
-    )
-    model.fit(X_train, y_train)
-    print(f"  Training: {time.time()-start:.1f}s")
-
-    y_prob = model.predict_proba(X_test)[:, 1]
-    y_pred = model.predict(X_test)
-    ap = average_precision_score(y_test, y_prob)
-    recall = y_test[y_pred == 1].sum() / max(y_test.sum(), 1)
-    precision = y_test[y_pred == 1].sum() / max(y_pred.sum(), 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-
-    print(f"\n=== Results ===")
-    print(f"AP={ap:.4f}, P={precision:.4f}, R={recall:.4f}, F1={f1:.4f}")
-
-    pron_id = POS_IDS["PRON"]
-    propn_id = POS_IDS["PROPN"]
-    noun_id = POS_IDS["NOUN"]
-    for cand_name, cand_id in [("PRON", pron_id), ("NOUN", noun_id), ("PROPN", propn_id)]:
-        mask = (X_test[:, 0] == pron_id) & (X_test[:, 12] == cand_id)
-        if mask.sum() < 10 or y_test[mask].sum() == 0:
-            continue
-        sub_y = y_test[mask]
-        sub_pred = model.predict(X_test[mask])
-        r = sub_y[sub_pred == 1].sum() / max(sub_y.sum(), 1)
-        print(f"  PRON->{cand_name}: R={r:.4f} (pos={sub_y.sum()})")
-
-    print("\nTop 15 features:")
-    importances = model.feature_importances_
-    for i in np.argsort(importances)[::-1][:15]:
-        print(f"  {FEATURE_NAMES[i]:25s} {importances[i]:.4f}")
-
-    model.save_model(str(CACHE_DIR / "xgb_model.json"))
-    print(f"\nModel saved to {CACHE_DIR / 'xgb_model.json'}")
-
-
-if __name__ == "__main__":
-    train_full(window_tokens=150)
