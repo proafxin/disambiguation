@@ -101,10 +101,10 @@ def generate_all() -> None:
     global _fork_cache
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
 
+    _fork_cache = CachedData()  # writes dataset_ranges.json as a side effect
+
     with open(CACHE_DIR / "dataset_ranges.json") as f:
         ranges = json.load(f)
-
-    _fork_cache = CachedData()
 
     window_lengths = [100, 150, 200]
     tasks: list[tuple[str, list[int], int]] = [
