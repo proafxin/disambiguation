@@ -41,13 +41,13 @@ def _build_flat_store(window: int, ranges: dict) -> dict:
     t0 = time.time()
     total_mb = 0.0
     for ds in all_ds:
-        manifest = _manifest_path(ds, window, "")
+        manifest = _manifest_path(ds, window)
         if not manifest.exists():
             continue
         with open(manifest) as f:
             m = json.load(f)
         doc_map = {int(k): v for k, v in m["doc_map"].items()}
-        out_dir = _chunk_dir(ds, window, "")
+        out_dir = _chunk_dir(ds, window)
         X_parts, y_parts, r_parts, chunk_offsets = [], [], [], [0]
         for ci in range(m["num_chunks"]):
             X_parts.append(np.load(out_dir / f"chunk_{ci:04d}_X.npy"))

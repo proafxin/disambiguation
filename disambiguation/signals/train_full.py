@@ -374,7 +374,8 @@ def build_features_batch(
     features[:, 34] = num_cands; features[:, 35] = num_gender_match; features[:, 36] = num_propn_cands
     features[:, 40] = propn_first_dist; features[:, 41] = propn_freq
     features[:, 42] = cand_sent_propn_count
-    features[:, 43] = cand_tis
+    sent_lens = cache.sent_offsets[cand_gsis + 1] - cache.sent_offsets[cand_gsis]
+    features[:, 43] = cand_tis / np.maximum(sent_lens, 1)
     features[:, 44] = float(origin_doc_pos)
     features[:, 45] = chain_progress
     features[:, 46] = float(prior_same_pos)
@@ -497,7 +498,7 @@ def generate_doc_episodes(
                     (all_gender == 3) | (all_gender == resolved_gender) | (resolved_gender == 3)
                 ))
 
-                chain_progress = float(hop) / max(doc_len - 1, 1)
+                chain_progress = float(cur_abs - doc_start_abs) / max(doc_len - 1, 1)
 
                 chain_deps = np.array(chain_deps_list, dtype=np.float32)
                 chain_pos = np.array(chain_pos_list, dtype=np.float32)
