@@ -95,35 +95,39 @@ def compute_depth(token: spacy.tokens.Token) -> int:
 
 
 def fill_doc_features(doc: spacy.tokens.Doc, sent_lens: list, data: np.ndarray, start_pos: int) -> int:
-    pos = int(start_pos)
+    n_tokens = sum(sent_lens)
+    buf = np.empty((n_tokens, N_FEATURES), dtype=np.float32)
+    pos = 0
     abs_p = 0
     for sl in sent_lens:
         sent_start = abs_p
         for i in range(abs_p, abs_p + sl):
             tok = doc[i]
-            morph = tok.morph
+            morph = tok.morph.to_dict()
             dep = tok.dep_
             ti = i - sent_start
             head_rel = tok.head.i - sent_start if tok.head != tok else -1
-            data[pos, 0] = POS_IDS.get(tok.pos_, len(POS_IDS))
-            data[pos, 1] = DEP_IDS.get(dep, len(DEP_IDS))
-            data[pos, 2] = GENDER_IDS.get(morph.get("Gender", ["unknown"])[0], 3)
-            data[pos, 3] = NUMBER_IDS.get(morph.get("Number", ["unknown"])[0], 2)
-            data[pos, 4] = int(morph.get("Person", ["0"])[0])
-            data[pos, 5] = PRONTYPE_IDS.get(morph.get("PronType", ["unknown"])[0], 5)
-            data[pos, 6] = int(dep in {"nsubj", "nsubj:pass", "nsubj:outer", "csubj"})
-            data[pos, 7] = int(dep in {"obj", "iobj"})
-            data[pos, 8] = int(dep == "nmod:poss")
-            data[pos, 9] = compute_depth(tok)
-            data[pos, 10] = tok.n_lefts + tok.n_rights
-            data[pos, 11] = ti / max(sl - 1, 1)
-            data[pos, 12] = head_rel
-            data[pos, 13] = POS_IDS.get(tok.head.pos_, len(POS_IDS))
-            data[pos, 14] = DEP_IDS.get(tok.head.dep_, len(DEP_IDS))
-            data[pos, 15] = ENT_TYPE_IDS.get(tok.ent_type_, len(ENT_TYPE_IDS))
+            buf[pos, 0] = POS_IDS.get(tok.pos_, len(POS_IDS))
+            buf[pos, 1] = DEP_IDS.get(dep, len(DEP_IDS))
+            buf[pos, 2] = GENDER_IDS.get(morph.get("Gender", "unknown"), 3)
+            buf[pos, 3] = NUMBER_IDS.get(morph.get("Number", "unknown"), 2)
+            buf[pos, 4] = int(morph.get("Person", "0"))
+            buf[pos, 5] = PRONTYPE_IDS.get(morph.get("PronType", "unknown"), 5)
+            buf[pos, 6] = int(dep in {"nsubj", "nsubj:pass", "nsubj:outer", "csubj"})
+            buf[pos, 7] = int(dep in {"obj", "iobj"})
+            buf[pos, 8] = int(dep == "nmod:poss")
+            buf[pos, 9] = compute_depth(tok)
+            buf[pos, 10] = tok.n_lefts + tok.n_rights
+            buf[pos, 11] = ti / max(sl - 1, 1)
+            buf[pos, 12] = head_rel
+            buf[pos, 13] = POS_IDS.get(tok.head.pos_, len(POS_IDS))
+            buf[pos, 14] = DEP_IDS.get(tok.head.dep_, len(DEP_IDS))
+            buf[pos, 15] = ENT_TYPE_IDS.get(tok.ent_type_, len(ENT_TYPE_IDS))
             pos += 1
         abs_p += sl
-    return pos
+    end_pos = int(start_pos) + n_tokens
+    data[start_pos:end_pos] = buf
+    return end_pos
 
 
 def save_checkpoint(ckpt_path: Path, ex_fill: list, n_done: int) -> None:
@@ -196,7 +200,7 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
         ex_fill = [int(offsets[i]) for i in range(n)]
         n_done = 0
 
-    pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=32)
+    pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=16)
     remaining = chunk_meta[n_done:]
 
     for i, (doc, (ex_idx, chunk_sent_lens)) in enumerate(tqdm(
