@@ -8,14 +8,17 @@ import xgboost as xgb
 from sklearn.metrics import average_precision_score, precision_recall_fscore_support
 
 from disambiguation.signals.abstract_features import FEATURE_NAMES, NUM_FEATURES, POS_IDS
-from disambiguation.signals.generate_episodes import HELD_OUT_DOC_INDICES, load_episodes_for_docs
+from disambiguation.signals.generate_episodes import (
+    EPISODES_DIR, HELD_OUT_DOC_INDICES, _chunk_dir, _manifest_path,
+)
+
+GULLIVERS_DOC_IDX = 36676
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 RESULTS_DIR = Path(__file__).parent.parent.parent / "results"
 MODELS_DIR = CACHE_DIR / "models"
 
 DATASETS = ["preco", "litbank", "corefud", "conll2012"]
-GULLIVERS_DOC_IDX = 36676
 WINDOW_LENGTHS = [100, 150, 200]
 
 XGB_PARAMS = dict(
@@ -23,6 +26,75 @@ XGB_PARAMS = dict(
     subsample=0.8, min_child_weight=10, device="cuda",
     tree_method="hist", random_state=42,
 )
+
+
+def _build_flat_store(window: int, ranges: dict) -> dict:
+    store: dict = {}
+    all_ds = list(ranges.keys()) + ["gullivers"]
+    t0 = time.time()
+    total_mb = 0.0
+    for ds in all_ds:
+        manifest = _manifest_path(ds, window, "")
+        if not manifest.exists():
+            continue
+        with open(manifest) as f:
+            m = json.load(f)
+        doc_map = {int(k): v for k, v in m["doc_map"].items()}
+        out_dir = _chunk_dir(ds, window, "")
+        X_parts, y_parts, r_parts, chunk_offsets = [], [], [], [0]
+        for ci in range(m["num_chunks"]):
+            X_parts.append(np.load(out_dir / f"chunk_{ci:04d}_X.npy"))
+            y_parts.append(np.load(out_dir / f"chunk_{ci:04d}_y.npy"))
+            r_parts.append(np.load(out_dir / f"chunk_{ci:04d}_ranks.npy"))
+            chunk_offsets.append(chunk_offsets[-1] + len(X_parts[-1]))
+        X_flat = np.concatenate(X_parts) if len(X_parts) > 1 else X_parts[0]
+        y_flat = np.concatenate(y_parts) if len(y_parts) > 1 else y_parts[0]
+        r_flat = np.concatenate(r_parts) if len(r_parts) > 1 else r_parts[0]
+        del X_parts, y_parts, r_parts
+        doc_rows = {
+            doc_idx: (chunk_offsets[ci] + rs, chunk_offsets[ci] + re)
+            for doc_idx, (ci, rs, re) in doc_map.items()
+        }
+        store[ds] = {"X": X_flat, "y": y_flat, "ranks": r_flat, "doc_rows": doc_rows}
+        total_mb += X_flat.nbytes / 1024 / 1024
+    print(f"  Loaded {total_mb:.0f} MB into RAM in {time.time() - t0:.1f}s")
+    return store
+
+
+def _slice(
+    store: dict,
+    ds: str,
+    doc_indices: np.ndarray,
+    min_rank: int | None = None,
+    max_rank: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if ds not in store or len(doc_indices) == 0:
+        return np.empty((0, NUM_FEATURES), dtype=np.float32), np.empty(0, dtype=np.int32)
+    entry = store[ds]
+    X_flat, y_flat, r_flat, doc_rows = entry["X"], entry["y"], entry["ranks"], entry["doc_rows"]
+    need_ranks = min_rank is not None or max_rank is not None
+    X_parts, y_parts, r_parts = [], [], []
+    for doc_idx in doc_indices:
+        rng_val = doc_rows.get(int(doc_idx))
+        if rng_val is not None:
+            rs, re = rng_val
+            X_parts.append(X_flat[rs:re])
+            y_parts.append(y_flat[rs:re])
+            if need_ranks:
+                r_parts.append(r_flat[rs:re])
+    if not X_parts:
+        return np.empty((0, NUM_FEATURES), dtype=np.float32), np.empty(0, dtype=np.int32)
+    X = np.concatenate(X_parts)
+    y = np.concatenate(y_parts)
+    if need_ranks:
+        r = np.concatenate(r_parts)
+        mask = np.ones(len(r), dtype=bool)
+        if min_rank is not None:
+            mask &= r >= min_rank
+        if max_rank is not None:
+            mask &= r <= max_rank
+        X, y = X[mask], y[mask]
+    return X, y
 
 
 def _evaluate(model: xgb.XGBClassifier, X: np.ndarray, y: np.ndarray) -> dict:
@@ -72,15 +144,20 @@ def _evaluate(model: xgb.XGBClassifier, X: np.ndarray, y: np.ndarray) -> dict:
 
 def _train_or_load(model_key: str, window: int, X_train: np.ndarray, y_train: np.ndarray) -> xgb.XGBClassifier:
     path = MODELS_DIR / f"{model_key}_w{window}.ubj"
-    model = xgb.XGBClassifier(**XGB_PARAMS)
+    model = xgb.XGBClassifier(**XGB_PARAMS, early_stopping_rounds=30)
     if path.exists():
         model.load_model(str(path))
         print(f"    Loaded: {path.name}")
     else:
         print(f"    Training on {len(X_train):,} episodes...")
-        model.fit(X_train, y_train)
+        rng = np.random.default_rng(42)
+        n_val = max(1000, len(X_train) // 10)
+        idx = rng.permutation(len(X_train))
+        X_val, y_val = X_train[idx[:n_val]], y_train[idx[:n_val]]
+        X_tr, y_tr = X_train[idx[n_val:]], y_train[idx[n_val:]]
+        model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=50)
         model.save_model(str(path))
-        print(f"    Saved: {path.name}")
+        print(f"    Saved: {path.name} ({model.best_iteration + 1} trees)")
     return model
 
 
@@ -92,12 +169,6 @@ def _get_docs(ds: str, ranges: dict, exclude_gullivers: bool = False) -> np.ndar
     if exclude_gullivers and ds == "litbank":
         docs = docs[docs != GULLIVERS_DOC_IDX]
     return docs
-
-
-def _load_eps(ds: str, docs: np.ndarray, window: int, suffix: str = "") -> tuple[np.ndarray, np.ndarray]:
-    if len(docs) == 0:
-        return np.empty((0, NUM_FEATURES), dtype=np.float32), np.empty(0, dtype=np.int32)
-    return load_episodes_for_docs(ds, docs, window, suffix=suffix)
 
 
 def _shuffle_concat(Xs: list, ys: list, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -225,7 +296,9 @@ def run_all_experiments() -> None:
     for window in WINDOW_LENGTHS:
         print(f"\n{'='*70}\nWINDOW = {window} tokens\n{'='*70}")
 
-        X_gull, y_gull = _load_eps("gullivers", np.array([GULLIVERS_DOC_IDX]), window)
+        store = _build_flat_store(window, ranges)
+
+        X_gull, y_gull = _slice(store, "gullivers", np.array([GULLIVERS_DOC_IDX]))
         if len(X_gull) == 0:
             print(f"  WARNING: no Gulliver's episodes for w={window} — benchmark will be empty")
 
@@ -236,8 +309,8 @@ def run_all_experiments() -> None:
                 continue
             docs = rng.permutation(_get_docs(ds, ranges, exclude_gullivers=True))
             n = len(docs) * 2 // 3
-            X_tr, y_tr = _load_eps(ds, docs[:n], window)
-            X_te, y_te = _load_eps(ds, docs[n:], window)
+            X_tr, y_tr = _slice(store, ds, docs[:n])
+            X_te, y_te = _slice(store, ds, docs[n:])
             _run(f"t1_{ds}", f"t1_{ds}", 1, ds, ds, window,
                  X_tr, y_tr, X_te, y_te, X_gull, y_gull)
 
@@ -250,14 +323,14 @@ def run_all_experiments() -> None:
             for td in DATASETS:
                 if td == test_ds or td not in ranges:
                     continue
-                X, y = _load_eps(td, _get_docs(td, ranges, exclude_gullivers=True), window)
+                X, y = _slice(store, td, _get_docs(td, ranges, exclude_gullivers=True))
                 if len(X) > 0:
                     train_Xs.append(X)
                     train_ys.append(y)
             if not train_Xs:
                 continue
             X_tr, y_tr = _shuffle_concat(train_Xs, train_ys, rng)
-            X_te, y_te = _load_eps(test_ds, _get_docs(test_ds, ranges), window)
+            X_te, y_te = _slice(store, test_ds, _get_docs(test_ds, ranges))
             train_label = "+".join(d for d in DATASETS if d != test_ds and d in ranges)
             _run(f"t2_test_{test_ds}", f"t2_test_{test_ds}", 2,
                  train_label, test_ds, window,
@@ -271,8 +344,8 @@ def run_all_experiments() -> None:
                 continue
             docs = rng.permutation(_get_docs(ds, ranges, exclude_gullivers=True))
             n = len(docs) * 2 // 3
-            X_tr, y_tr = _load_eps(ds, docs[:n], window)
-            X_te, y_te = _load_eps(ds, docs[n:], window)
+            X_tr, y_tr = _slice(store, ds, docs[:n])
+            X_te, y_te = _slice(store, ds, docs[n:])
             if len(X_tr) > 0:
                 tr_Xs.append(X_tr)
                 tr_ys.append(y_tr)
@@ -294,8 +367,8 @@ def run_all_experiments() -> None:
                 continue
             train_docs = _get_docs(ds, ranges, exclude_gullivers=True)
             all_docs = _get_docs(ds, ranges)
-            X_tr, y_tr = _load_eps(ds, train_docs, window, suffix="_maxhop50")
-            X_te, y_te = _load_eps(ds, all_docs, window, suffix="_minhop51")
+            X_tr, y_tr = _slice(store, ds, train_docs, max_rank=50)
+            X_te, y_te = _slice(store, ds, all_docs, min_rank=51)
             if len(X_tr) > 0:
                 tr_Xs.append(X_tr)
                 tr_ys.append(y_tr)
@@ -308,6 +381,8 @@ def run_all_experiments() -> None:
                  "all_le50hops", "all_gt50hops", window,
                  X_tr, y_tr, np.concatenate(te_Xs), np.concatenate(te_ys),
                  X_gull, y_gull)
+
+        del store
 
     # Write per-table CSVs
     for window in WINDOW_LENGTHS:

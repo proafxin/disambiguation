@@ -208,13 +208,6 @@ def _generate_window(window: int) -> None:
         generate_dataset_episodes(cache, name, doc_indices, window,
                                   exclude_doc_indices=HELD_OUT_DOC_INDICES)
 
-    # Table 4: hop-filtered — ≤50 hops (train), >50 hops (test), all datasets
-    for name, r in ranges.items():
-        all_docs = list(range(r["start_doc"], r["end_doc"]))
-        train_docs = [d for d in all_docs if d not in HELD_OUT_DOC_INDICES]
-        generate_dataset_episodes(cache, name, train_docs, window, max_chain_length=50)
-        generate_dataset_episodes(cache, name, all_docs, window, min_chain_length=51)
-
     # Gulliver's held-out (always separate)
     generate_dataset_episodes(cache, "gullivers", [GULLIVERS_DOC_IDX], window)
 

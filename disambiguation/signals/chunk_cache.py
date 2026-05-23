@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
-MAX_CACHED_CHUNKS = 4
+MAX_CACHED_CHUNKS = 64
 
 
 class ChunkCache:
