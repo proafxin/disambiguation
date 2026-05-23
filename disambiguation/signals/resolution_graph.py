@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 
@@ -10,6 +11,9 @@ class ResolutionGraph:
     cluster_members: dict = field(default_factory=dict)
     mention_confidence: dict = field(default_factory=dict)
     _next_cluster_id: int = 0
+    _cache_valid: bool = False
+    _cached_cluster_ids: Optional[np.ndarray] = None
+    _cached_confidences: Optional[np.ndarray] = None
 
     def _new_cluster(self, mention: tuple, is_propn: bool = False) -> int:
         cid = self._next_cluster_id
@@ -22,6 +26,7 @@ class ResolutionGraph:
     def add_mention(self, mention: tuple, is_propn: bool = False) -> None:
         if mention not in self.mention_to_cluster:
             self._new_cluster(mention, is_propn)
+            self._cache_valid = False
 
     def link(self, mention_a: tuple, mention_b: tuple, confidence: float, is_b_propn: bool = False) -> None:
         if mention_a not in self.mention_to_cluster:
@@ -61,6 +66,7 @@ class ResolutionGraph:
 
         self.mention_confidence[mention_a] = max(self.mention_confidence.get(mention_a, 0.0), confidence)
         self.mention_confidence[mention_b] = max(self.mention_confidence.get(mention_b, 0.0), confidence)
+        self._cache_valid = False
 
     def get_canonical(self, mention: tuple) -> tuple | None:
         cid = self.mention_to_cluster.get(mention)
@@ -88,6 +94,8 @@ class ResolutionGraph:
         doc_start_abs: int,
         doc_len: int,
     ) -> tuple[np.ndarray, np.ndarray]:
+        if self._cache_valid and self._cached_cluster_ids is not None:
+            return self._cached_cluster_ids, self._cached_confidences
         cluster_ids = np.full(doc_len, -1, dtype=np.int32)
         confidences = np.zeros(doc_len, dtype=np.float32)
         for (gsi, ti), cid in self.mention_to_cluster.items():
@@ -95,4 +103,7 @@ class ResolutionGraph:
             if 0 <= abs_pos < doc_len:
                 cluster_ids[abs_pos] = cid
                 confidences[abs_pos] = self.mention_confidence.get((gsi, ti), 0.0)
+        self._cached_cluster_ids = cluster_ids
+        self._cached_confidences = confidences
+        self._cache_valid = True
         return cluster_ids, confidences

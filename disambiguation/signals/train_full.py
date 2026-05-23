@@ -224,7 +224,11 @@ def _structural_candidates(
     gender_in_range = cache.token_data[range_start:range_end, 2]
     number_in_range = cache.token_data[range_start:range_end, 3]
 
-    nominal_mask = np.isin(tokens_in_range, [POS_IDS["NOUN"], POS_IDS["PROPN"], POS_IDS["PRON"]])
+    nominal_mask = (
+        (tokens_in_range == POS_IDS["PROPN"])
+        | (tokens_in_range == POS_IDS["NOUN"])
+        | (tokens_in_range == POS_IDS["PRON"])
+    )
     window_mask = np.abs(abs_positions - cur_abs) <= window_tokens
 
     doc_rel = abs_positions - doc_start_abs
@@ -354,15 +358,18 @@ def build_features_batch(
 
     # Discourse context — vectorized
     cand_token_pos_in_sent = cand_tis.astype(np.float32)
-    cand_sent_propn_count = np.array(
-        [sent_propn_counts[int(g) - start_gsi] if 0 <= int(g) - start_gsi < len(sent_propn_counts) else 0
-         for g in cand_gsis], dtype=np.float32
-    )
+    gsi_local = cand_gsis - start_gsi
+    n_sents = len(sent_propn_counts)
+    valid_gsi = (gsi_local >= 0) & (gsi_local < n_sents)
+    cand_sent_propn_count = np.zeros(n, dtype=np.float32)
+    if valid_gsi.any():
+        cand_sent_propn_count[valid_gsi] = sent_propn_counts[gsi_local[valid_gsi]]
     # Quote adjacency
+    n_qsents = len(sent_quote_mask)
     cand_in_quotes = np.zeros(n, dtype=np.float32)
     for i in range(n):
-        gsi_off = int(cand_gsis[i]) - start_gsi
-        if 0 <= gsi_off < len(sent_quote_mask):
+        gsi_off = int(gsi_local[i])
+        if 0 <= gsi_off < n_qsents:
             ti = int(cand_tis[i])
             qmask = sent_quote_mask[gsi_off]
             if len(qmask) > 0:
@@ -444,6 +451,12 @@ def generate_doc_episodes(
             if gsi < end_gsi:
                 correct_abs.add(int(cache.sent_offsets[gsi]) + st)
 
+        correct_mask = np.zeros(doc_len, dtype=bool)
+        for abs_pos in correct_abs:
+            doc_rel = abs_pos - doc_start_abs
+            if 0 <= doc_rel < doc_len:
+                correct_mask[doc_rel] = True
+
         for mention in cluster:
             si, st, _ = mention
             origin_gsi = start_gsi + si
@@ -478,8 +491,8 @@ def generate_doc_episodes(
 
             resolved_gender = int(origin_info[2]) if origin_info[2] != 3 else 3
             resolved_number = int(origin_info[3]) if origin_info[3] != 2 else 2
-            chain_deps = np.array([int(origin_info[1])], dtype=np.float32)
-            chain_pos = np.array([int(origin_info[0])], dtype=np.float32)
+            chain_deps_list = [int(origin_info[1])]
+            chain_pos_list = [int(origin_info[0])]
 
             for hop in range(MAX_HOPS):
                 cur_abs = int(cache.sent_offsets[current_gsi]) + current_ti
@@ -517,6 +530,8 @@ def generate_doc_episodes(
 
                 chain_progress = float(hop) / max(doc_len - 1, 1)
 
+                chain_deps = np.array(chain_deps_list, dtype=np.float32)
+                chain_pos = np.array(chain_pos_list, dtype=np.float32)
                 batch_features = build_features_batch(
                     cache, origin_gsi, st, current_gsi, current_ti,
                     top_cand_gsis, top_cand_tis,
@@ -535,8 +550,8 @@ def generate_doc_episodes(
                     start_gsi,
                 )
 
-                # Labels
-                is_correct = np.isin(top_abs, list(correct_abs))
+                # Labels — O(1) lookup; positions are bounds-checked by _structural_candidates
+                is_correct = correct_mask[top_abs - doc_start_abs]
 
                 pos_idx = np.where(is_correct)[0]
                 neg_idx = np.where(~is_correct)[0]
@@ -549,7 +564,7 @@ def generate_doc_episodes(
                     ranks_list.append(int(i))
 
                 # Teacher forcing: advance to nearest correct candidate in full pool
-                correct_in_pool = np.isin(valid_abs_arr, list(correct_abs))
+                correct_in_pool = correct_mask[valid_abs_arr - doc_start_abs]
                 if not correct_in_pool.any():
                     break
 
@@ -570,8 +585,8 @@ def generate_doc_episodes(
                 current_ti = next_ti
 
                 next_info = cache.get_token_info(next_gsi, next_ti)
-                chain_deps = np.append(chain_deps, next_info[1])
-                chain_pos = np.append(chain_pos, next_info[0])
+                chain_deps_list.append(int(next_info[1]))
+                chain_pos_list.append(int(next_info[0]))
 
                 next_is_propn = bool(next_info[0] == POS_IDS["PROPN"])
                 graph.link(
