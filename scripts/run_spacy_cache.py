@@ -14,8 +14,9 @@ from disambiguation.signals.abstract_features import (
 )
 
 MAX_TOKENS = 4000
+MAX_DEPTH = 20
 N_FEATURES = 16
-CHECKPOINT_INTERVAL = 5000
+CHECKPOINT_INTERVAL = 2000
 CACHE_DIR = Path("data/spacy_trf")
 DATA_DIR = Path("data")
 
@@ -27,7 +28,7 @@ DATASETS = [
 ]
 
 
-def find_strided_spans(model):
+def find_strided_spans(model: object) -> object | None:
     if model.name == "with_strided_spans":
         return model
     for layer in model.layers:
@@ -84,16 +85,16 @@ def make_doc(nlp: spacy.Language, tokens: list, sent_lens: list) -> spacy.tokens
     return spacy.tokens.Doc(nlp.vocab, words=tokens, sent_starts=sent_starts)
 
 
-def compute_depth(token) -> int:
+def compute_depth(token: spacy.tokens.Token) -> int:
     depth = 0
     cur = token
-    while cur.head != cur and depth < 20:
+    while cur.head != cur and depth < MAX_DEPTH:
         cur = cur.head
         depth += 1
     return depth
 
 
-def fill_doc_features(doc, sent_lens: list, data: np.ndarray, start_pos: int) -> int:
+def fill_doc_features(doc: spacy.tokens.Doc, sent_lens: list, data: np.ndarray, start_pos: int) -> int:
     pos = int(start_pos)
     abs_p = 0
     for sl in sent_lens:
@@ -110,8 +111,8 @@ def fill_doc_features(doc, sent_lens: list, data: np.ndarray, start_pos: int) ->
             data[pos, 3] = NUMBER_IDS.get(morph.get("Number", ["unknown"])[0], 2)
             data[pos, 4] = int(morph.get("Person", ["0"])[0])
             data[pos, 5] = PRONTYPE_IDS.get(morph.get("PronType", ["unknown"])[0], 5)
-            data[pos, 6] = int(dep in ("nsubj", "nsubj:pass", "nsubj:outer", "csubj"))
-            data[pos, 7] = int(dep in ("obj", "iobj"))
+            data[pos, 6] = int(dep in {"nsubj", "nsubj:pass", "nsubj:outer", "csubj"})
+            data[pos, 7] = int(dep in {"obj", "iobj"})
             data[pos, 8] = int(dep == "nmod:poss")
             data[pos, 9] = compute_depth(tok)
             data[pos, 10] = tok.n_lefts + tok.n_rights
