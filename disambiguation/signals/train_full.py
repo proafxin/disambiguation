@@ -149,51 +149,44 @@ def build_doc_arrays(cache: CachedData, start_gsi: int, end_gsi: int) -> dict:
     doc_len = doc_end_abs - doc_start_abs
 
     pos_slice = cache.token_data[doc_start_abs:doc_end_abs, 0].astype(np.int32)
-
-    # Per-sentence propn counts and quote masks (indexed by gsi - start_gsi)
-    n_sents = end_gsi - start_gsi
-    sent_propn_counts = np.zeros(n_sents, dtype=np.int32)
-    sent_quote_masks = []
+    PROPN_ID = POS_IDS["PROPN"]
     PUNCT_ID = POS_IDS.get("PUNCT", 13)
-    for i, gsi in enumerate(range(start_gsi, end_gsi)):
-        sent_len = cache.get_sent_length(gsi)
-        sent_abs = int(cache.sent_offsets[gsi])
-        sent_pos = cache.token_data[sent_abs:sent_abs + sent_len, 0].astype(np.int32)
-        sent_propn_counts[i] = int(np.sum(sent_pos == POS_IDS["PROPN"]))
-        sent_quote_masks.append((sent_pos == PUNCT_ID))
+
+    # Per-sentence PROPN counts via reduceat (no Python loop over sentences)
+    sent_starts_rel = (cache.sent_offsets[start_gsi:end_gsi] - doc_start_abs).astype(np.int64)
+    propn_mask_int = (pos_slice == PROPN_ID).astype(np.int32)
+    sent_propn_counts = np.add.reduceat(propn_mask_int, sent_starts_rel).astype(np.int32)
+
+    # Flat doc-level PUNCT mask for vectorized quote-adjacency in build_features_batch
+    doc_punct_mask = pos_slice == PUNCT_ID
 
     # POS cumulative counts for prior_same_pos (indexed by abs_pos - doc_start_abs)
     pos_cumcounts = {}
     for pos_id in np.unique(pos_slice):
-        mask = pos_slice == pos_id
-        pos_cumcounts[int(pos_id)] = np.cumsum(mask)
+        pos_cumcounts[int(pos_id)] = np.cumsum(pos_slice == pos_id)
 
-    # PROPN salience arrays (indexed by abs_pos - doc_start_abs)
-    propn_type_first = np.full(doc_len, -1, dtype=np.int64)   # first abs_pos of this type
+    # PROPN salience — fully vectorized via fingerprint sort (replaces nested Python loop)
+    propn_type_first = np.full(doc_len, -1, dtype=np.int64)
     propn_type_freq = np.zeros(doc_len, dtype=np.int32)
-    fp_first: dict[tuple, int] = {}
-    fp_freq: dict[tuple, int] = {}
-    for gsi in range(start_gsi, end_gsi):
-        sent_len = cache.get_sent_length(gsi)
-        for ti in range(sent_len):
-            info = cache.get_token_info(gsi, ti)
-            if int(info[0]) != POS_IDS["PROPN"]:
-                continue
-            fp = (int(info[0]), int(info[1]), int(info[2]), int(info[3]))
-            abs_pos = int(cache.sent_offsets[gsi]) + ti
-            doc_pos = abs_pos - doc_start_abs
-            fp_freq[fp] = fp_freq.get(fp, 0) + 1
-            if fp not in fp_first:
-                fp_first[fp] = abs_pos
-            propn_type_first[doc_pos] = fp_first[fp]
-            propn_type_freq[doc_pos] = fp_freq[fp]
+    propn_rel = np.where(pos_slice == PROPN_ID)[0]
+    if len(propn_rel) > 0:
+        pd = cache.token_data[doc_start_abs + propn_rel, :4].astype(np.int32)
+        fp = pd[:, 0] * 3720 + pd[:, 1] * 12 + pd[:, 2] * 3 + pd[:, 3]  # 31*4*3=372, *10
+        order = np.argsort(fp, stable=True)
+        sorted_fp = fp[order]
+        sorted_pos = propn_rel[order]
+        bounds = np.concatenate([[0], np.where(np.diff(sorted_fp))[0] + 1])
+        repeats = np.diff(np.concatenate([bounds, [len(sorted_fp)]]))
+        within_idx = np.arange(len(sorted_fp)) - np.repeat(bounds, repeats)
+        propn_type_freq[sorted_pos] = within_idx + 1
+        propn_type_first[sorted_pos] = doc_start_abs + np.repeat(sorted_pos[bounds], repeats)
 
     return {
         "doc_start_abs": doc_start_abs,
         "doc_len": doc_len,
         "pos_cumcounts": pos_cumcounts,
         "sent_propn_counts": sent_propn_counts,
-        "sent_quote_masks": sent_quote_masks,
+        "doc_punct_mask": doc_punct_mask,
         "propn_type_first": propn_type_first,
         "propn_type_freq": propn_type_freq,
     }
@@ -270,8 +263,9 @@ def _structural_candidates(
 
 def build_features_batch(
     cache: CachedData,
-    origin_gsi: int, origin_ti: int,
-    current_gsi: int, current_ti: int,
+    origin_abs: int,
+    cur_abs: int,
+    current_gsi: int,
     cand_gsis: np.ndarray,
     cand_tis: np.ndarray,
     hop_count: int,
@@ -286,11 +280,11 @@ def build_features_batch(
     graph_confidences: np.ndarray,
     origin_cluster_id: int,
     doc_start_abs: int,
-    propn_first_abs: np.ndarray,
+    doc_len: int,
     propn_type_first: np.ndarray,
     propn_type_freq: np.ndarray,
     sent_propn_counts: np.ndarray,
-    sent_quote_mask: np.ndarray,
+    doc_punct_mask: np.ndarray,
     sent_offsets_doc: np.ndarray,
     origin_doc_pos: float,
     prior_same_pos: int,
@@ -298,40 +292,38 @@ def build_features_batch(
     start_gsi: int,
 ) -> np.ndarray:
     n = len(cand_gsis)
-    o = cache.get_token_info(origin_gsi, origin_ti)
-    cur = cache.get_token_info(current_gsi, current_ti)
+    o = cache.token_data[origin_abs]
+    cur = cache.token_data[cur_abs]
 
-    cur_abs = int(cache.sent_offsets[current_gsi]) + current_ti
-    cand_starts = cache.sent_offsets[cand_gsis]
-    cand_abs = cand_starts + cand_tis
-    c_all = cache.token_data[cand_starts + cand_tis]
+    cand_abs = cache.sent_offsets[cand_gsis] + cand_tis
+    c_all = cache.token_data[cand_abs]
 
-    # Agreement (vectorized)
-    gmo = ((o[2] == 3) | (c_all[:, 2] == 3) | (o[2] == c_all[:, 2])).astype(np.float32)
-    nmo = ((o[3] == 2) | (c_all[:, 3] == 2) | (o[3] == c_all[:, 3])).astype(np.float32)
-    gmc = ((cur[2] == 3) | (c_all[:, 2] == 3) | (cur[2] == c_all[:, 2])).astype(np.float32)
-    nmc = ((cur[3] == 2) | (c_all[:, 3] == 2) | (cur[3] == c_all[:, 3])).astype(np.float32)
-    rgm = ((resolved_gender == 3) | (c_all[:, 2] == 3) | (c_all[:, 2] == resolved_gender)).astype(np.float32)
-    rnm = ((resolved_number == 2) | (c_all[:, 3] == 2) | (c_all[:, 3] == resolved_number)).astype(np.float32)
+    # Agreement (direct bool→float32, no intermediate variables)
+    features = np.empty((n, NUM_FEATURES), dtype=np.float32)
+    features[:, 21] = (o[2] == 3) | (c_all[:, 2] == 3) | (o[2] == c_all[:, 2])
+    features[:, 22] = (o[3] == 2) | (c_all[:, 3] == 2) | (o[3] == c_all[:, 3])
+    features[:, 23] = (cur[2] == 3) | (c_all[:, 2] == 3) | (cur[2] == c_all[:, 2])
+    features[:, 24] = (cur[3] == 2) | (c_all[:, 3] == 2) | (cur[3] == c_all[:, 3])
+    features[:, 25] = (resolved_gender == 3) | (c_all[:, 2] == 3) | (c_all[:, 2] == resolved_gender)
+    features[:, 26] = (resolved_number == 2) | (c_all[:, 3] == 2) | (c_all[:, 3] == resolved_number)
 
-    # Chain consistency (vectorized)
+    # Chain consistency
     if len(chain_deps) > 0:
-        dep_con = (c_all[:, 1:2] == chain_deps).mean(axis=1).astype(np.float32)
-        pos_con = (c_all[:, 0:1] == chain_pos).mean(axis=1).astype(np.float32)
+        features[:, 27] = (c_all[:, 1:2] == chain_deps).mean(axis=1)
+        features[:, 28] = (c_all[:, 0:1] == chain_pos).mean(axis=1)
     else:
-        dep_con = np.zeros(n, dtype=np.float32)
-        pos_con = np.zeros(n, dtype=np.float32)
+        features[:, 27] = 0.0
+        features[:, 28] = 0.0
+    features[:, 29] = (c_all[:, 0] == POS_IDS["PROPN"]) & (o[0] == POS_IDS["PRON"])
 
-    ipt = ((c_all[:, 0] == POS_IDS["PROPN"]) & (o[0] == POS_IDS["PRON"])).astype(np.float32)
-
-    # Verb/head association (vectorized)
+    # Verb/head association
     verb_id = POS_IDS["VERB"]
-    bhv = ((o[13] == verb_id) & (c_all[:, 13] == verb_id)).astype(np.float32)
-    sht = ((cand_gsis == current_gsi) & (c_all[:, 12] >= 0) & (cur[12] >= 0) & (c_all[:, 12] == cur[12])).astype(np.float32)
-    cva = ((c_all[:, 13] == verb_id) & ((c_all[:, 6] == 1) | (c_all[:, 7] == 1))).astype(np.float32)
-    ova = float(o[13] == verb_id and (o[6] == 1 or o[7] == 1))
+    features[:, 30] = (o[13] == verb_id) & (c_all[:, 13] == verb_id)
+    features[:, 31] = (cand_gsis == current_gsi) & (c_all[:, 12] >= 0) & (cur[12] >= 0) & (c_all[:, 12] == cur[12])
+    features[:, 32] = (c_all[:, 13] == verb_id) & ((c_all[:, 6] == 1) | (c_all[:, 7] == 1))
+    features[:, 33] = float(o[13] == verb_id and (o[6] == 1 or o[7] == 1))
 
-    # Graph signals — vectorized via pre-built arrays
+    # Graph signals
     cand_abs_doc = cand_abs - doc_start_abs
     valid_abs = (cand_abs_doc >= 0) & (cand_abs_doc < len(graph_cluster_ids))
     cand_cluster_ids = np.full(n, -1, dtype=np.int32)
@@ -339,67 +331,55 @@ def build_features_batch(
     graph_resolved = (cand_cluster_ids >= 0).astype(np.float32)
     graph_confidence = np.zeros(n, dtype=np.float32)
     graph_confidence[valid_abs] = graph_confidences[cand_abs_doc[valid_abs]]
-    graph_same_cluster = ((cand_cluster_ids >= 0) & (cand_cluster_ids == origin_cluster_id)).astype(np.float32)
+    features[:, 37] = graph_resolved
+    features[:, 38] = graph_confidence
+    features[:, 39] = (cand_cluster_ids >= 0) & (cand_cluster_ids == origin_cluster_id)
 
-    # PROPN salience — vectorized via pre-built per-token arrays
+    # PROPN salience
     propn_first_dist = np.zeros(n, dtype=np.float32)
     propn_freq = np.zeros(n, dtype=np.float32)
     propn_mask = c_all[:, 0] == POS_IDS["PROPN"]
     if propn_mask.any():
         pm_abs = cand_abs[propn_mask] - doc_start_abs
-        valid_pm = (pm_abs >= 0) & (pm_abs < len(propn_first_abs))
+        valid_pm = (pm_abs >= 0) & (pm_abs < doc_len)
         pm_abs_v = pm_abs[valid_pm]
         first_abs_vals = propn_type_first[pm_abs_v]
-        propn_first_dist_vals = np.abs(cur_abs - (first_abs_vals + doc_start_abs)).astype(np.float32)
-        propn_freq_vals = propn_type_freq[pm_abs_v].astype(np.float32)
         idx = np.where(propn_mask)[0][valid_pm]
-        propn_first_dist[idx] = propn_first_dist_vals
-        propn_freq[idx] = propn_freq_vals
+        propn_first_dist[idx] = np.abs(cur_abs - first_abs_vals)
+        propn_freq[idx] = propn_type_freq[pm_abs_v]
 
-    # Discourse context — vectorized
-    cand_token_pos_in_sent = cand_tis.astype(np.float32)
+    # Discourse context
     gsi_local = cand_gsis - start_gsi
     n_sents = len(sent_propn_counts)
     valid_gsi = (gsi_local >= 0) & (gsi_local < n_sents)
     cand_sent_propn_count = np.zeros(n, dtype=np.float32)
     if valid_gsi.any():
         cand_sent_propn_count[valid_gsi] = sent_propn_counts[gsi_local[valid_gsi]]
-    # Quote adjacency
-    n_qsents = len(sent_quote_mask)
-    cand_in_quotes = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        gsi_off = int(gsi_local[i])
-        if 0 <= gsi_off < n_qsents:
-            ti = int(cand_tis[i])
-            qmask = sent_quote_mask[gsi_off]
-            if len(qmask) > 0:
-                cand_in_quotes[i] = float(
-                    (ti > 0 and qmask[ti - 1]) or (ti + 1 < len(qmask) and qmask[ti + 1])
-                )
 
-    features = np.empty((n, NUM_FEATURES), dtype=np.float32)
+    # Quote adjacency — vectorized via flat doc_punct_mask
+    prev_doc = np.maximum(cand_abs_doc - 1, 0)
+    next_doc = np.minimum(cand_abs_doc + 1, doc_len - 1)
+    cand_in_quotes = (
+        (doc_punct_mask[prev_doc] & (cand_abs_doc > 0)) |
+        (doc_punct_mask[next_doc] & (cand_abs_doc < doc_len - 1))
+    ).astype(np.float32)
+
     features[:, 0] = o[0]; features[:, 1] = o[1]; features[:, 2] = o[2]; features[:, 3] = o[3]
     features[:, 4] = o[6]
     features[:, 5] = cur[0]; features[:, 6] = cur[1]; features[:, 7] = cur[2]; features[:, 8] = cur[3]
     features[:, 9] = c_all[:, 0]; features[:, 10] = c_all[:, 1]
     features[:, 11] = c_all[:, 2]; features[:, 12] = c_all[:, 3]
     features[:, 13] = c_all[:, 4]; features[:, 14] = c_all[:, 6]
-    features[:, 15] = (c_all[:, 0] == cur[0]).astype(np.float32)
+    features[:, 15] = c_all[:, 0] == cur[0]
     features[:, 16] = c_all[:, 9]
-    features[:, 17] = (cand_gsis == current_gsi).astype(np.float32)
-    features[:, 18] = np.abs(cand_abs - cur_abs).astype(np.float32)
-    features[:, 19] = np.abs(cand_gsis - current_gsi).astype(np.float32)
+    features[:, 17] = cand_gsis == current_gsi
+    features[:, 18] = np.abs(cand_abs - cur_abs)
+    features[:, 19] = np.abs(cand_gsis - current_gsi)
     features[:, 20] = hop_count
-    features[:, 21] = gmo; features[:, 22] = nmo
-    features[:, 23] = gmc; features[:, 24] = nmc
-    features[:, 25] = rgm; features[:, 26] = rnm
-    features[:, 27] = dep_con; features[:, 28] = pos_con; features[:, 29] = ipt
-    features[:, 30] = bhv; features[:, 31] = sht; features[:, 32] = cva; features[:, 33] = ova
     features[:, 34] = num_cands; features[:, 35] = num_gender_match; features[:, 36] = num_propn_cands
-    features[:, 37] = graph_resolved; features[:, 38] = graph_confidence; features[:, 39] = graph_same_cluster
     features[:, 40] = propn_first_dist; features[:, 41] = propn_freq
     features[:, 42] = cand_sent_propn_count
-    features[:, 43] = cand_token_pos_in_sent
+    features[:, 43] = cand_tis
     features[:, 44] = float(origin_doc_pos)
     features[:, 45] = chain_progress
     features[:, 46] = float(prior_same_pos)
@@ -533,18 +513,18 @@ def generate_doc_episodes(
                 chain_deps = np.array(chain_deps_list, dtype=np.float32)
                 chain_pos = np.array(chain_pos_list, dtype=np.float32)
                 batch_features = build_features_batch(
-                    cache, origin_gsi, st, current_gsi, current_ti,
+                    cache, origin_abs, cur_abs, current_gsi,
                     top_cand_gsis, top_cand_tis,
                     hop, resolved_gender, resolved_number,
                     chain_deps, chain_pos,
                     len(cand_gsis), num_gm, num_propn,
                     graph_cluster_ids, graph_confidences, origin_cluster_id,
                     doc_start_abs,
-                    doc_arrays["propn_type_first"],
+                    doc_arrays["doc_len"],
                     doc_arrays["propn_type_first"],
                     doc_arrays["propn_type_freq"],
                     doc_arrays["sent_propn_counts"],
-                    doc_arrays["sent_quote_masks"],
+                    doc_arrays["doc_punct_mask"],
                     cache.sent_offsets[start_gsi:end_gsi + 1],
                     origin_doc_pos, prior_same_pos, chain_progress,
                     start_gsi,
