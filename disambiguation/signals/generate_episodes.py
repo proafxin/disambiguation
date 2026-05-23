@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ EPISODES_DIR = CACHE_DIR / "episodes"
 GULLIVERS_DOC_IDX = 36676
 HELD_OUT_DOC_INDICES = {36676}
 
-CHUNK_SIZE = 10_000_000
+CHUNK_SIZE = 1_000_000
 
 
 def generate_doc_episodes_filtered(
@@ -195,33 +196,36 @@ def load_episodes_for_docs(
     return np.concatenate(X_parts), np.concatenate(y_parts)
 
 
-def generate_all() -> None:
-    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
-
+def _generate_window(window: int) -> None:
     with open(CACHE_DIR / "dataset_ranges.json") as f:
         ranges = json.load(f)
-
     cache = CachedData()
+    print(f"\n{'='*60}\nWINDOW = {window} tokens\n{'='*60}")
+    for name, r in ranges.items():
+        doc_indices = list(range(r["start_doc"], r["end_doc"]))
+        generate_dataset_episodes(cache, name, doc_indices, window,
+                                  exclude_doc_indices=HELD_OUT_DOC_INDICES)
+    r = ranges["litbank"]
+    litbank_docs = [d for d in range(r["start_doc"], r["end_doc"]) if d not in HELD_OUT_DOC_INDICES]
+    generate_dataset_episodes(cache, "litbank", litbank_docs, window, max_chain_length=10)
+    all_litbank = list(range(r["start_doc"], r["end_doc"]))
+    generate_dataset_episodes(cache, "litbank_hihop", all_litbank, window, min_chain_length=50)
+    generate_dataset_episodes(cache, "gullivers", [GULLIVERS_DOC_IDX], window)
+
+
+def generate_all() -> None:
+    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
     window_lengths = [100, 150, 200]
-
-    for window in window_lengths:
-        print(f"\n{'='*60}")
-        print(f"WINDOW = {window} tokens")
-        print(f"{'='*60}")
-
-        for name, r in ranges.items():
-            doc_indices = list(range(r["start_doc"], r["end_doc"]))
-            generate_dataset_episodes(cache, name, doc_indices, window,
-                                      exclude_doc_indices=HELD_OUT_DOC_INDICES)
-
-        r = ranges["litbank"]
-        litbank_docs = [d for d in range(r["start_doc"], r["end_doc"]) if d not in HELD_OUT_DOC_INDICES]
-        generate_dataset_episodes(cache, "litbank", litbank_docs, window, max_chain_length=10)
-
-        all_litbank = list(range(r["start_doc"], r["end_doc"]))
-        generate_dataset_episodes(cache, "litbank_hihop", all_litbank, window, min_chain_length=50)
-
-        generate_dataset_episodes(cache, "gullivers", [GULLIVERS_DOC_IDX], window)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_generate_window, w): w for w in window_lengths}
+        for fut in concurrent.futures.as_completed(futures):
+            w = futures[fut]
+            try:
+                fut.result()
+                print(f"  window={w} complete")
+            except Exception as exc:
+                print(f"  window={w} FAILED: {exc}")
+                raise
 
     print(f"\n{'='*60}")
     print("SUMMARY")
