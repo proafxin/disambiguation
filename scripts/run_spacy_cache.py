@@ -1,5 +1,6 @@
 import gc
 import json
+import queue
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -133,12 +134,38 @@ def merge_and_save(ds_name: str, split: str, out_docs: Path) -> None:
         cp.unlink()
 
 
-def flush_chunk(
-    db: spacy.tokens.DocBin, chunk_path: Path, ckpt_path: Path, n_done: int, n_written: int
+def writer_worker(
+    q: queue.Queue,
+    ds_name: str,
+    split: str,
+    ckpt_path: Path,
+    n_done_offset: int,
+    n_written_start: int,
 ) -> None:
-    db.to_disk(chunk_path)
-    with ckpt_path.open("w", encoding="utf-8") as f:
-        json.dump({"n_done": n_done, "n_written_chunks": n_written}, f)
+    doc_bin = spacy.tokens.DocBin(store_user_data=True)
+    n_written = n_written_start
+    n_processed = 0
+
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        doc, ex_idx, chunk_sent_lens = item
+        doc.user_data["sent_lens"] = chunk_sent_lens
+        doc.user_data["ex_idx"] = ex_idx
+        doc_bin.add(doc)
+        n_processed += 1
+
+        if n_processed % CHECKPOINT_INTERVAL == 0:
+            cp = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written}.spacy"
+            doc_bin.to_disk(cp)
+            with ckpt_path.open("w", encoding="utf-8") as f:
+                json.dump({"n_done": n_done_offset + n_processed, "n_written_chunks": n_written + 1}, f)
+            doc_bin = spacy.tokens.DocBin(store_user_data=True)
+            n_written += 1
+
+    cp = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written}.spacy"
+    doc_bin.to_disk(cp)
 
 
 def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
@@ -168,37 +195,24 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
 
     n_done, n_written_chunks = load_checkpoint(ds_name, split, ckpt_path)
 
+    q: queue.Queue = queue.Queue(maxsize=CHECKPOINT_INTERVAL + 500)
+    writer = threading.Thread(
+        target=writer_worker,
+        args=(q, ds_name, split, ckpt_path, n_done, n_written_chunks),
+        daemon=True,
+    )
+    writer.start()
+
     pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=8)
     remaining = chunk_meta[n_done:]
-    doc_bin = spacy.tokens.DocBin(store_user_data=True)
-    writer: threading.Thread | None = None
 
-    for i, (doc, (ex_idx, chunk_sent_lens)) in enumerate(
-        tqdm(zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}")
+    for doc, (ex_idx, chunk_sent_lens) in tqdm(
+        zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}"
     ):
-        doc.user_data["sent_lens"] = chunk_sent_lens
-        doc.user_data["ex_idx"] = ex_idx
-        doc_bin.add(doc)
+        q.put((doc, ex_idx, chunk_sent_lens))
 
-        if (i + 1) % CHECKPOINT_INTERVAL == 0:
-            if writer is not None:
-                writer.join()
-            cp = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written_chunks}.spacy"
-            writer = threading.Thread(
-                target=flush_chunk,
-                args=(doc_bin, cp, ckpt_path, n_done + i + 1, n_written_chunks + 1),
-                daemon=False,
-            )
-            writer.start()
-            doc_bin = spacy.tokens.DocBin(store_user_data=True)
-            n_written_chunks += 1
-            gc.collect()
-
-    if writer is not None:
-        writer.join()
-    chunk_path = CACHE_DIR / f"{ds_name}_{split}_chunk_{n_written_chunks}.spacy"
-    doc_bin.to_disk(chunk_path)
-    n_written_chunks += 1
+    q.put(None)
+    writer.join()
 
     merge_and_save(ds_name, split, out_docs)
 
@@ -210,7 +224,7 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
 
     print(f"  saved: {n_chunks} chunks, {n} examples")
 
-    del ds, ds_dict, chunk_meta, doc_chunk_counts, doc_bin
+    del ds, ds_dict, chunk_meta, doc_chunk_counts
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
