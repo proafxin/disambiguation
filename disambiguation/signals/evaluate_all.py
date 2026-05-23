@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import xgboost as xgb
-from sklearn.metrics import average_precision_score, precision_recall_fscore_support
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
 
 from disambiguation.signals.abstract_features import FEATURE_NAMES, NUM_FEATURES, POS_IDS
 from disambiguation.signals.generate_episodes import (
@@ -23,7 +23,7 @@ DATASETS = ["preco", "litbank", "corefud", "conll2012"]
 WINDOW_LENGTHS = [100, 150, 200]
 
 XGB_PARAMS = dict(
-    n_estimators=500, max_depth=10, learning_rate=0.1,
+    n_estimators=2000, max_depth=10, learning_rate=0.1,
     subsample=0.8, min_child_weight=10, max_bin=1024,
     device="cuda", tree_method="hist", random_state=42,
 )
@@ -113,7 +113,9 @@ def _evaluate(model: xgb.XGBClassifier, X: np.ndarray, y: np.ndarray) -> dict:
     y_prob = model.predict_proba(X)[:, 1]
     y_pred = model.predict(X)
     ap = float(average_precision_score(y, y_prob))
-    p, r, f1, _ = precision_recall_fscore_support(y, y_pred, average="binary")
+    p = float(precision_score(y, y_pred, average="binary", zero_division=0))
+    r = float(recall_score(y, y_pred, average="binary", zero_division=0))
+    f1 = float(f1_score(y, y_pred, average="binary", zero_division=0))
 
     pron_id = POS_IDS["PRON"]
     propn_id = POS_IDS["PROPN"]
@@ -129,8 +131,9 @@ def _evaluate(model: xgb.XGBClassifier, X: np.ndarray, y: np.ndarray) -> dict:
             sb = model.predict_proba(X[mask])[:, 1]
             hop_metrics[f"{on}->{cn}"] = {
                 "ap": float(average_precision_score(sy, sb)),
-                "precision": float(sy[sp == 1].sum() / max(sp.sum(), 1)),
-                "recall": float(sy[sp == 1].sum() / max(sy.sum(), 1)),
+                "precision": float(precision_score(sy, sp, average="binary", zero_division=0)),
+                "recall": float(recall_score(sy, sp, average="binary", zero_division=0)),
+                "f1": float(f1_score(sy, sp, average="binary", zero_division=0)),
                 "count": int(sy.sum()),
             }
 
@@ -143,7 +146,7 @@ def _evaluate(model: xgb.XGBClassifier, X: np.ndarray, y: np.ndarray) -> dict:
     return {
         "episodes": int(len(X)),
         "positives": int(y.sum()),
-        "overall": {"ap": ap, "precision": float(p), "recall": float(r), "f1": float(f1)},
+        "overall": {"ap": ap, "precision": p, "recall": r, "f1": f1},
         "by_hop_type": hop_metrics,
         "top_features": top_features,
     }
@@ -158,14 +161,17 @@ def _train_or_load(
     quick: bool = False,
 ) -> xgb.XGBClassifier:
     path = models_dir / f"{model_key}_w{window}.ubj"
+    n_neg = int((y_train == 0).sum())
+    n_pos = int((y_train == 1).sum())
+    spw = n_neg / max(n_pos, 1)
     params = XGB_PARAMS_QUICK if quick else XGB_PARAMS
     early_stopping = None if quick else 30
-    model = xgb.XGBClassifier(**params, early_stopping_rounds=early_stopping)
+    model = xgb.XGBClassifier(**params, scale_pos_weight=spw, early_stopping_rounds=early_stopping)
     if path.exists():
         model.load_model(str(path))
         print(f"    Loaded: {path.name}")
     else:
-        print(f"    Training on {len(X_train):,} episodes...")
+        print(f"    Training on {len(X_train):,} episodes (pos_rate={n_pos/max(n_pos+n_neg,1):.3f}, spw={spw:.1f})...")
         rng = np.random.default_rng(42)
         n_val = max(100 if quick else 1000, len(X_train) // 10)
         idx = rng.permutation(len(X_train))
