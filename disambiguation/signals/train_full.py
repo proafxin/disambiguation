@@ -26,6 +26,7 @@ DATASET_CONFIG = [
     ("preco", ["train"]),
     ("litbank", ["train", "validation", "test"]),
     ("corefud", ["train", "validation"]),
+    ("conll2012", ["train", "validation", "test"]),
 ]
 
 
@@ -36,7 +37,7 @@ def _sent_lens(ds_name: str, sample: dict) -> list[int]:
 
 
 def _clusters(ds_name: str, sample: dict) -> list[list[list[int]]]:
-    if ds_name == "preco":
+    if ds_name in ("preco", "conll2012"):
         return sample["mention_clusters"]
     if ds_name == "litbank":
         return [[[m[0], m[1], m[2] + 1] for m in chain] for chain in sample["coref_chains"]]

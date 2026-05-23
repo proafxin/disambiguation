@@ -15,7 +15,7 @@ EPISODES_DIR = CACHE_DIR / "episodes"
 GULLIVERS_DOC_IDX = 36676
 HELD_OUT_DOC_INDICES = {36676}
 
-CHUNK_SIZE = 1_000_000
+CHUNK_SIZE = 5_000_000
 
 
 def generate_doc_episodes_filtered(
@@ -201,15 +201,21 @@ def _generate_window(window: int) -> None:
         ranges = json.load(f)
     cache = CachedData()
     print(f"\n{'='*60}\nWINDOW = {window} tokens\n{'='*60}")
+
+    # Base episodes (all docs, Gulliver's held out)
     for name, r in ranges.items():
         doc_indices = list(range(r["start_doc"], r["end_doc"]))
         generate_dataset_episodes(cache, name, doc_indices, window,
                                   exclude_doc_indices=HELD_OUT_DOC_INDICES)
-    r = ranges["litbank"]
-    litbank_docs = [d for d in range(r["start_doc"], r["end_doc"]) if d not in HELD_OUT_DOC_INDICES]
-    generate_dataset_episodes(cache, "litbank", litbank_docs, window, max_chain_length=10)
-    all_litbank = list(range(r["start_doc"], r["end_doc"]))
-    generate_dataset_episodes(cache, "litbank_hihop", all_litbank, window, min_chain_length=50)
+
+    # Table 4: hop-filtered — ≤50 hops (train), >50 hops (test), all datasets
+    for name, r in ranges.items():
+        all_docs = list(range(r["start_doc"], r["end_doc"]))
+        train_docs = [d for d in all_docs if d not in HELD_OUT_DOC_INDICES]
+        generate_dataset_episodes(cache, name, train_docs, window, max_chain_length=50)
+        generate_dataset_episodes(cache, name, all_docs, window, min_chain_length=51)
+
+    # Gulliver's held-out (always separate)
     generate_dataset_episodes(cache, "gullivers", [GULLIVERS_DOC_IDX], window)
 
 
