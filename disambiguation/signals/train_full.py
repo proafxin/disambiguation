@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import xgboost as xgb
+from datasets import load_from_disk
 from sklearn.metrics import average_precision_score
 
 from disambiguation.signals.abstract_features import (
@@ -14,31 +15,125 @@ from disambiguation.signals.abstract_features import (
 from disambiguation.signals.resolution_graph import ResolutionGraph
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
+SPACY_TRF_DIR = CACHE_DIR / "spacy_trf"
+DATA_DIR = CACHE_DIR.parent / "data"
 MAX_HOPS = 512
 TOP_K = 20
 NEG_SAMPLES = 4
+N_TOKEN_FEATURES = 15
+
+DATASET_CONFIG = [
+    ("preco", ["train"]),
+    ("litbank", ["train", "validation", "test"]),
+    ("corefud", ["train", "validation"]),
+]
+
+
+def _sent_lens(ds_name: str, sample: dict) -> list[int]:
+    if ds_name == "corefud":
+        return [len(sent["tokens"]) for sent in sample["sentences"]]
+    return [len(s) for s in sample["sentences"]]
+
+
+def _clusters(ds_name: str, sample: dict) -> list[list[list[int]]]:
+    if ds_name == "preco":
+        return sample["mention_clusters"]
+    if ds_name == "litbank":
+        return [[[m[0], m[1], m[2] + 1] for m in chain] for chain in sample["coref_chains"]]
+    # corefud
+    sent_id_to_local: dict[str, int] = {}
+    for si, sent in enumerate(sample["sentences"]):
+        sent_id_to_local[sent["sent_id"]] = si
+    result = []
+    for entity in sample.get("coref_entities", []):
+        if len(entity) < 2:
+            continue
+        cluster = []
+        for mention in entity:
+            sid = mention["sent_id"]
+            if sid not in sent_id_to_local:
+                continue
+            si = sent_id_to_local[sid]
+            span = mention["span"]
+            if "-" in span:
+                parts = span.split("-")
+                st, en = int(parts[0]) - 1, int(parts[1])
+            else:
+                st = int(span) - 1
+                en = st + 1
+            cluster.append([si, st, en])
+        if len(cluster) >= 2:
+            result.append(cluster)
+    return result
 
 
 class CachedData:
     def __init__(self) -> None:
-        print("Loading cache...")
+        print("Loading cache from spacy_trf...")
         start = time.time()
 
-        ti = np.load(CACHE_DIR / "token_infos.npz")
-        self.token_data = ti["data"].astype(np.float32)
-        self.sent_offsets = ti["offsets"]
+        all_parts: list[np.ndarray] = []
+        sent_offsets_list: list[int] = []
+        doc_boundaries: list[tuple] = []
+        clusters_by_doc: list = []
+        dataset_ranges: dict = {}
 
-        with open(CACHE_DIR / "metadata.json") as f:
-            meta = json.load(f)
-        self.doc_boundaries = meta["doc_boundaries"]
+        global_sent_idx = 0
+        global_doc_idx = 0
+        cumulative_tokens = 0
 
-        with open(CACHE_DIR / "clusters.json") as f:
-            self.clusters = json.load(f)
+        for ds_name, splits in DATASET_CONFIG:
+            ds_dict = load_from_disk(str(DATA_DIR / ds_name))
+            dataset_ranges[ds_name] = {"start_doc": global_doc_idx}
+
+            for split_name in splits:
+                if split_name not in ds_dict:
+                    continue
+                split_ds = ds_dict[split_name]
+
+                tok_offsets = np.load(SPACY_TRF_DIR / f"{ds_name}_{split_name}_offsets.npy")
+                n_tokens = int(tok_offsets[-1])
+                tok_data = np.memmap(
+                    SPACY_TRF_DIR / f"{ds_name}_{split_name}_data.npy",
+                    dtype=np.float32, mode="r", shape=(n_tokens, N_TOKEN_FEATURES),
+                )
+                all_parts.append(np.array(tok_data))
+
+                for doc_i, sample in enumerate(split_ds):
+                    doc_tok_start = cumulative_tokens + int(tok_offsets[doc_i])
+                    sls = _sent_lens(ds_name, sample)
+
+                    start_gsi = global_sent_idx
+                    running = doc_tok_start
+                    for sl in sls:
+                        sent_offsets_list.append(running)
+                        running += sl
+                        global_sent_idx += 1
+                    end_gsi = global_sent_idx
+
+                    doc_boundaries.append((start_gsi, end_gsi, ds_name, doc_i))
+                    clusters_by_doc.append(_clusters(ds_name, sample))
+                    global_doc_idx += 1
+
+                cumulative_tokens += n_tokens
+                print(f"  {ds_name}/{split_name}: {len(split_ds)} docs loaded")
+
+            dataset_ranges[ds_name]["end_doc"] = global_doc_idx
+
+        sent_offsets_list.append(cumulative_tokens)
+
+        self.token_data = np.concatenate(all_parts, axis=0)
+        self.sent_offsets = np.array(sent_offsets_list, dtype=np.int64)
+        self.doc_boundaries = doc_boundaries
+        self.clusters = clusters_by_doc
+
+        with open(CACHE_DIR / "dataset_ranges.json", "w") as f:
+            json.dump(dataset_ranges, f, indent=2)
 
         elapsed = time.time() - start
-        ram = self.token_data.nbytes / (1024**3)
+        ram = self.token_data.nbytes / (1024 ** 3)
         print(f"  Loaded in {elapsed:.1f}s, {ram:.2f} GB RAM")
-        print(f"  {len(self.doc_boundaries)} docs, {len(self.sent_offsets)-1} sents")
+        print(f"  {len(doc_boundaries)} docs, {global_sent_idx} sents, {cumulative_tokens} tokens")
 
     def get_token_info(self, global_sent_idx: int, token_idx: int) -> np.ndarray:
         return self.token_data[int(self.sent_offsets[global_sent_idx]) + token_idx]
