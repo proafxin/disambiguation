@@ -138,17 +138,17 @@ class CachedData:
 
 
 
-def build_doc_arrays(cache: CachedData, start_gsi: int, end_gsi: int) -> dict:
-    doc_start_abs = int(cache.sent_offsets[start_gsi])
-    doc_end_abs = int(cache.sent_offsets[end_gsi])
+def build_doc_arrays(token_data: np.ndarray, sent_offsets: np.ndarray, start_gsi: int, end_gsi: int) -> dict:
+    doc_start_abs = int(sent_offsets[start_gsi])
+    doc_end_abs = int(sent_offsets[end_gsi])
     doc_len = doc_end_abs - doc_start_abs
 
-    pos_slice = cache.token_data[doc_start_abs:doc_end_abs, 0].astype(np.int32)
+    pos_slice = token_data[doc_start_abs:doc_end_abs, 0].astype(np.int32)
     PROPN_ID = POS_IDS["PROPN"]
     PUNCT_ID = POS_IDS.get("PUNCT", 13)
 
     # Per-sentence PROPN counts via reduceat (no Python loop over sentences)
-    sent_starts_rel = (cache.sent_offsets[start_gsi:end_gsi] - doc_start_abs).astype(np.int64)
+    sent_starts_rel = (sent_offsets[start_gsi:end_gsi] - doc_start_abs).astype(np.int64)
     propn_mask_int = (pos_slice == PROPN_ID).astype(np.int32)
     sent_propn_counts = np.add.reduceat(propn_mask_int, sent_starts_rel).astype(np.int32)
 
@@ -165,7 +165,7 @@ def build_doc_arrays(cache: CachedData, start_gsi: int, end_gsi: int) -> dict:
     propn_type_freq = np.zeros(doc_len, dtype=np.int32)
     propn_rel = np.where(pos_slice == PROPN_ID)[0]
     if len(propn_rel) > 0:
-        pd = cache.token_data[doc_start_abs + propn_rel, :4].astype(np.int32)
+        pd = token_data[doc_start_abs + propn_rel, :4].astype(np.int32)
         fp = pd[:, 0] * 3720 + pd[:, 1] * 12 + pd[:, 2] * 3 + pd[:, 3]  # 31*4*3=372, *10
         order = np.argsort(fp, stable=True)
         sorted_fp = fp[order]
@@ -188,7 +188,8 @@ def build_doc_arrays(cache: CachedData, start_gsi: int, end_gsi: int) -> dict:
 
 
 def _structural_candidates(
-    cache: CachedData,
+    token_data: np.ndarray,
+    sent_offsets: np.ndarray,
     cur_abs: int,
     gsi_lo: int,
     gsi_hi: int,
@@ -202,15 +203,15 @@ def _structural_candidates(
     resolved_number: int,
     graph_cluster_ids: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    range_start = int(cache.sent_offsets[gsi_lo])
-    range_end = int(cache.sent_offsets[gsi_hi])
+    range_start = int(sent_offsets[gsi_lo])
+    range_end = int(sent_offsets[gsi_hi])
     if range_end <= range_start:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
 
     abs_positions = np.arange(range_start, range_end, dtype=np.int64)
-    tokens_in_range = cache.token_data[range_start:range_end, 0]
-    gender_in_range = cache.token_data[range_start:range_end, 2]
-    number_in_range = cache.token_data[range_start:range_end, 3]
+    tokens_in_range = token_data[range_start:range_end, 0]
+    gender_in_range = token_data[range_start:range_end, 2]
+    number_in_range = token_data[range_start:range_end, 3]
 
     nominal_mask = (
         (tokens_in_range == POS_IDS["PROPN"])
@@ -245,19 +246,20 @@ def _structural_candidates(
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
 
     gsi_range = np.arange(gsi_lo, gsi_hi)
-    sent_ends = cache.sent_offsets[gsi_range + 1]
+    sent_ends = sent_offsets[gsi_range + 1]
     gsi_indices = np.searchsorted(sent_ends, valid_abs_arr, side="right")
     valid_filter = gsi_indices < len(gsi_range)
     valid_abs_arr = valid_abs_arr[valid_filter]
     gsi_indices = gsi_indices[valid_filter]
     cand_gsis = gsi_range[gsi_indices]
-    cand_tis = valid_abs_arr - cache.sent_offsets[cand_gsis]
+    cand_tis = valid_abs_arr - sent_offsets[cand_gsis]
 
     return cand_gsis, cand_tis, valid_abs_arr
 
 
 def build_features_batch(
-    cache: CachedData,
+    token_data: np.ndarray,
+    sent_offsets: np.ndarray,
     origin_abs: int,
     cur_abs: int,
     current_gsi: int,
@@ -287,11 +289,11 @@ def build_features_batch(
     start_gsi: int,
 ) -> np.ndarray:
     n = len(cand_gsis)
-    o = cache.token_data[origin_abs]
-    cur = cache.token_data[cur_abs]
+    o = token_data[origin_abs]
+    cur = token_data[cur_abs]
 
-    cand_abs = cache.sent_offsets[cand_gsis] + cand_tis
-    c_all = cache.token_data[cand_abs]
+    cand_abs = sent_offsets[cand_gsis] + cand_tis
+    c_all = token_data[cand_abs]
 
     # Agreement (direct bool→float32, no intermediate variables)
     features = np.empty((n, NUM_FEATURES), dtype=np.float32)
@@ -374,7 +376,7 @@ def build_features_batch(
     features[:, 34] = num_cands; features[:, 35] = num_gender_match; features[:, 36] = num_propn_cands
     features[:, 40] = propn_first_dist; features[:, 41] = propn_freq
     features[:, 42] = cand_sent_propn_count
-    sent_lens = cache.sent_offsets[cand_gsis + 1] - cache.sent_offsets[cand_gsis]
+    sent_lens = sent_offsets[cand_gsis + 1] - sent_offsets[cand_gsis]
     features[:, 43] = cand_tis / np.maximum(sent_lens, 1)
     features[:, 44] = float(origin_doc_pos)
     features[:, 45] = chain_progress
@@ -406,7 +408,7 @@ def generate_doc_episodes(
     ranks_list: list[int] = []  # embedding rank for benchmark analysis
 
     graph = ResolutionGraph()
-    doc_arrays = build_doc_arrays(cache, start_gsi, end_gsi)
+    doc_arrays = build_doc_arrays(cache.token_data, cache.sent_offsets, start_gsi, end_gsi)
     doc_start_abs = doc_arrays["doc_start_abs"]
     doc_len = doc_arrays["doc_len"]
 
@@ -478,7 +480,7 @@ def generate_doc_episodes(
                 origin_cluster_id = graph_cluster_ids[origin_abs - doc_start_abs] if origin_abs - doc_start_abs < doc_len else -1
 
                 cand_gsis, cand_tis, valid_abs_arr = _structural_candidates(
-                    cache, cur_abs, gsi_lo, gsi_hi, start_gsi, end_gsi,
+                    cache.token_data, cache.sent_offsets, cur_abs, gsi_lo, gsi_hi, start_gsi, end_gsi,
                     window_tokens, visited_abs, doc_start_abs, doc_len,
                     resolved_gender, resolved_number, graph_cluster_ids,
                 )
@@ -506,7 +508,7 @@ def generate_doc_episodes(
                 chain_deps = np.array(chain_deps_list, dtype=np.float32)
                 chain_pos = np.array(chain_pos_list, dtype=np.float32)
                 batch_features = build_features_batch(
-                    cache, origin_abs, cur_abs, current_gsi,
+                    cache.token_data, cache.sent_offsets, origin_abs, cur_abs, current_gsi,
                     top_cand_gsis, top_cand_tis,
                     hop, resolved_gender, resolved_number,
                     chain_deps, chain_pos,

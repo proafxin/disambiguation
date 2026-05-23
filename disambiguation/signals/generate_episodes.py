@@ -61,7 +61,7 @@ def generate_dataset_episodes(
         doc_map[doc_idx] = (rs, len(all_X))
         total_pos += sum(labels)
 
-        if (i + 1) % 200 == 0:
+        if (i + 1) % 1000 == 0 or (i + 1) == len(doc_indices):
             elapsed = time.time() - start
             rate = (i + 1) / max(elapsed, 1e-6)
             remaining = (len(doc_indices) - i - 1) / max(rate, 1e-6)
@@ -107,24 +107,23 @@ def generate_all() -> None:
         ranges = json.load(f)
 
     window_lengths = [100, 150, 200]
-    tasks: list[tuple[str, list[int], int]] = [
-        (name, list(range(r["start_doc"], r["end_doc"])), window)
-        for window in window_lengths
-        for name, r in ranges.items()
-    ]
-
-    n_workers = min(len(tasks), mp.cpu_count())
-    print(f"Generating {len(tasks)} tasks with {n_workers} workers...")
     ctx = mp.get_context("fork")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
-        futures = {executor.submit(_task_worker, t): t for t in tasks}
-        for fut in concurrent.futures.as_completed(futures):
-            t = futures[fut]
-            try:
-                print(f"  {fut.result()} complete")
-            except Exception as exc:
-                print(f"  {t[0]} w={t[2]} FAILED: {exc}")
-                raise
+
+    for name, r in ranges.items():
+        doc_indices = list(range(r["start_doc"], r["end_doc"]))
+        tasks: list[tuple[str, list[int], int]] = [
+            (name, doc_indices, window) for window in window_lengths
+        ]
+        print(f"\nDataset {name}: {len(doc_indices)} docs, {len(tasks)} windows in parallel...")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=len(window_lengths), mp_context=ctx) as executor:
+            futures = {executor.submit(_task_worker, t): t for t in tasks}
+            for fut in concurrent.futures.as_completed(futures):
+                t = futures[fut]
+                try:
+                    print(f"  {fut.result()} complete")
+                except Exception as exc:
+                    print(f"  {t[0]} w={t[2]} FAILED: {exc}")
+                    raise
 
     _fork_cache = None
 

@@ -10,7 +10,12 @@ from datasets import Dataset, load_from_disk
 from tqdm import tqdm
 
 from disambiguation.signals.abstract_features import (
-    DEP_IDS, ENT_TYPE_IDS, GENDER_IDS, NUMBER_IDS, POS_IDS, PRONTYPE_IDS,
+    DEP_IDS,
+    ENT_TYPE_IDS,
+    GENDER_IDS,
+    NUMBER_IDS,
+    POS_IDS,
+    PRONTYPE_IDS,
 )
 
 MAX_TOKENS = 4000
@@ -203,9 +208,9 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=8)
     remaining = chunk_meta[n_done:]
 
-    for i, (doc, (ex_idx, chunk_sent_lens)) in enumerate(tqdm(
-        zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}"
-    )):
+    for i, (doc, (ex_idx, chunk_sent_lens)) in enumerate(
+        tqdm(zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}")
+    ):
         ex_fill[ex_idx] = fill_doc_features(doc, chunk_sent_lens, data, ex_fill[ex_idx])
         if (i + 1) % CHECKPOINT_INTERVAL == 0:
             data.flush()
