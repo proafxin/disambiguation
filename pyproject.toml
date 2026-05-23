@@ -1,6 +1,6 @@
 [project]
 name = "disambiguation"
-version = "0.1.2"
+version = "0.1.3"
 description = "Disambiguation"
 readme = "README.md"
 authors = [{ name = "Masum Billal", email = "billalmasum93@gmail.com" }]
@@ -17,7 +17,7 @@ dependencies = [
     "protobuf>=7.35.0",
     "xgboost-cu13>=3.2.0",
     "en-core-web-trf>=3.8.0",
-    "cupy-cuda13x>=14.0.1",
+    "cupy-cuda13x>=14.1.0",
 ]
 
 [dependency-groups]
