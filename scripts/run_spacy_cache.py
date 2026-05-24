@@ -130,14 +130,12 @@ def merge_and_save(ds_name: str, split: str, out_docs: Path, doc_chunk_counts: l
     print(f"  merging {len(chunk_files)} chunks...")
     attrs = ["TAG", "POS", "MORPH", "LEMMA", "DEP", "HEAD", "ENT_TYPE", "ENT_IOB", "SENT_START"]
 
+    blank_nlp = spacy.blank("en")
     all_chunks = []
     all_chunk_meta = []
-    vocab = None
     for cp in chunk_files:
         chunk_bin = spacy.tokens.DocBin(attrs=attrs, store_user_data=True).from_disk(cp)
-        if vocab is None:
-            vocab = chunk_bin.vocab
-        for doc in chunk_bin.get_docs(vocab):
+        for doc in chunk_bin.get_docs(blank_nlp.vocab):
             all_chunks.append(doc)
             all_chunk_meta.append((doc.user_data["ex_idx"], doc.user_data["sent_lens"]))
 
