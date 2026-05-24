@@ -17,8 +17,8 @@ CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 DATA_DIR = CACHE_DIR.parent / "data"
 SPACY_TRF_DIR = DATA_DIR / "spacy_trf"
 MODELS_DIR = CACHE_DIR / "models"
-EMBEDDINGS_DIR = CACHE_DIR / "bge_embeddings"
-EMBEDDINGS_CACHE = EMBEDDINGS_DIR / "stage1_embeddings.pkl"
+EMBEDDINGS_CACHE = DATA_DIR / "stage1_embeddings.pkl"
+FEATURES_CACHE = DATA_DIR / "stage1_features.pkl"
 BGE_MODEL = "BAAI/bge-small-en-v1.5"
 
 DATASET_CONFIG = [
@@ -30,6 +30,12 @@ DATASET_CONFIG = [
 
 
 def build_stage1_data():
+    if FEATURES_CACHE.exists():
+        with FEATURES_CACHE.open("rb") as f:
+            train_data, val_data = pickle.load(f)
+        print(f"Loaded cached features: {len(train_data)} train, {len(val_data)} val")
+        return train_data, val_data
+
     embeddings = {}
     if EMBEDDINGS_CACHE.exists():
         with EMBEDDINGS_CACHE.open("rb") as f:
@@ -128,7 +134,7 @@ def build_stage1_data():
         ).astype(np.float32)
         for key, vec in zip(missing_keys, vecs, strict=True):
             embeddings[key] = vec
-        EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         with EMBEDDINGS_CACHE.open("wb") as f:
             pickle.dump(embeddings, f)
         print(f"Cached {len(embeddings)} embeddings to {EMBEDDINGS_CACHE.name}")
@@ -139,6 +145,10 @@ def build_stage1_data():
         sent_emb_reshaped = embeddings[key].reshape(12, 32)
         feature_matrix = np.vstack([token_attrs, sent_emb_reshaped])
         (train_data if is_train else val_data).append((feature_matrix, pair_labels))
+
+    with FEATURES_CACHE.open("wb") as f:
+        pickle.dump((train_data, val_data), f)
+    print(f"Cached features to {FEATURES_CACHE.name}")
 
     return train_data, val_data
 
