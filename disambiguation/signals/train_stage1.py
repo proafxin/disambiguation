@@ -75,18 +75,23 @@ def build_stage1_data():
                 sents = list(full_doc.sents)
 
                 mentions_by_sent = {}
+                cluster_counts_by_sent = {}
                 for cluster_id, cluster in enumerate(doc_clusters):
                     for m_sent_idx, m_start, m_end in cluster:
                         token_map = mentions_by_sent.setdefault(m_sent_idx, {})
                         for m_tok_idx in range(m_start, m_end):
                             token_map[m_tok_idx] = cluster_id
+                        counts = cluster_counts_by_sent.setdefault(m_sent_idx, {})
+                        counts[cluster_id] = counts.get(cluster_id, 0) + 1
 
                 for sent_idx, sent_len in enumerate(sls):
                     n_sents += 1
 
-                    mention_map = mentions_by_sent.get(sent_idx, {})
-                    if len(mention_map) < 2:
+                    counts = cluster_counts_by_sent.get(sent_idx, {})
+                    if not any(c >= 2 for c in counts.values()):
                         continue
+
+                    mention_map = mentions_by_sent.get(sent_idx, {})
 
                     sent = sents[sent_idx]
                     nominal_positions = []
