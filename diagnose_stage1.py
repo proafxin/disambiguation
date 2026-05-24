@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from disambiguation.signals.stage1_intrasentence import MiniTransformer
-from disambiguation.signals.train_stage1 import generate_stage1_training_data
+from disambiguation.signals.train_stage1 import build_stage1_data
 
 CACHE_DIR = Path(__file__).parent / "cache"
 MODELS_DIR = CACHE_DIR / "models"
@@ -24,15 +24,17 @@ def diagnose():
     pred_stats = []
     n_examples = 0
 
+    _, val_data = build_stage1_data()
+
     with torch.no_grad():
-        for feature_matrix, pair_labels in generate_stage1_training_data():
+        for feature_matrix, nom_idx, pair_labels in val_data:
             if n_examples >= 10:
                 break
 
             feature_t = torch.from_numpy(feature_matrix).float().unsqueeze(0).to(device)
-            labels_t = torch.from_numpy(pair_labels).float().to(device)
+            nom_t = torch.from_numpy(nom_idx).long().to(device)
 
-            pair_scores = model(feature_t).squeeze(0)
+            pair_scores = model(feature_t, nom_t).squeeze(0)
             pair_probs = torch.sigmoid(pair_scores)
 
             labels_flat = pair_labels.flatten()

@@ -3,7 +3,7 @@ import torch
 from pathlib import Path
 from sklearn.metrics import average_precision_score, precision_score, recall_score, f1_score
 from disambiguation.signals.stage1_intrasentence import MiniTransformer
-from disambiguation.signals.train_stage1 import generate_stage1_training_data
+from disambiguation.signals.train_stage1 import build_stage1_data
 
 CACHE_DIR = Path(__file__).parent / "cache"
 MODELS_DIR = CACHE_DIR / "models"
@@ -24,23 +24,26 @@ def evaluate_stage1():
     y_true = []
     y_prob = []
 
-    with torch.no_grad():
-        for feature_matrix, pair_labels in generate_stage1_training_data():
-            feature_t = torch.from_numpy(feature_matrix).float().unsqueeze(0).to(device)
-            labels_t = torch.from_numpy(pair_labels).float().to(device)
+    _, val_data = build_stage1_data()
 
-            pair_scores = model(feature_t).squeeze(0)
+    with torch.no_grad():
+        for feature_matrix, nom_idx, pair_labels in val_data:
+            feature_t = torch.from_numpy(feature_matrix).float().unsqueeze(0).to(device)
+            nom_t = torch.from_numpy(nom_idx).long().to(device)
+
+            pair_scores = model(feature_t, nom_t).squeeze(0)
             pair_probs = torch.sigmoid(pair_scores)
 
-            y_true.append(labels_t.cpu().numpy())
-            y_prob.append(pair_probs.cpu().numpy())
+            off = ~np.eye(pair_labels.shape[0], dtype=bool)
+            y_true.append(pair_labels[off])
+            y_prob.append(pair_probs.cpu().numpy()[off])
 
     if not y_true:
         print("No examples found!")
         return
 
-    y_true_flat = np.concatenate([y.flatten() for y in y_true])
-    y_prob_flat = np.concatenate([y.flatten() for y in y_prob])
+    y_true_flat = np.concatenate(y_true)
+    y_prob_flat = np.concatenate(y_prob)
     y_pred_flat = (y_prob_flat > 0.5).astype(int)
     y_true_binary = (y_true_flat > 0).astype(int)
 

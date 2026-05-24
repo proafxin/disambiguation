@@ -18,7 +18,7 @@ CACHE_DIR = Path("data/spacy_trf")
 DATA_DIR = Path("data")
 
 DATASETS = [
-    ("preco", ["train"]),
+    ("preco", ["train", "validation"]),
     ("litbank", ["train", "validation", "test"]),
     ("corefud", ["train", "validation"]),
     ("conll2012", ["train", "validation", "test"]),

@@ -1,4 +1,5 @@
 import pickle
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,7 +23,7 @@ FEATURES_CACHE = DATA_DIR / "stage1_features.pkl"
 BGE_MODEL = "BAAI/bge-small-en-v1.5"
 
 DATASET_CONFIG = [
-    ("preco", ["train"]),
+    ("preco", ["train", "validation"]),
     ("litbank", ["train", "validation", "test"]),
     ("corefud", ["train", "validation"]),
     ("conll2012", ["train", "validation", "test"]),
@@ -106,19 +107,21 @@ def build_stage1_data():
                     n_filtered += 1
 
                     token_attrs = extract_raw_attributes(sent, [sent_len])
-                    pair_labels = np.zeros((sent_len, sent_len), dtype=np.float32)
-                    for i in nominal_positions:
-                        for j in nominal_positions:
-                            ci = mention_map.get(i)
-                            cj = mention_map.get(j)
-                            if ci is not None and cj is not None and ci == cj:
-                                pair_labels[i, j] = 1.0
+                    n_nom = len(nominal_positions)
+                    pair_labels = np.zeros((n_nom, n_nom), dtype=np.float32)
+                    for a, ta in enumerate(nominal_positions):
+                        for b, tb in enumerate(nominal_positions):
+                            ca = mention_map.get(ta)
+                            cb = mention_map.get(tb)
+                            if ca is not None and cb is not None and ca == cb:
+                                pair_labels[a, b] = 1.0
 
+                    nom_idx = np.array(nominal_positions, dtype=np.int64)
                     key = (ds_name, split_name, doc_id, sent_idx)
                     if key not in embeddings:
                         missing_keys.append(key)
                         missing_texts.append(sent.text)
-                    rows.append((is_train, key, token_attrs, pair_labels))
+                    rows.append((is_train, key, token_attrs, nom_idx, pair_labels))
 
             n_sents_total += n_sents
             n_filtered_total += n_filtered
@@ -146,16 +149,94 @@ def build_stage1_data():
 
     train_data = []
     val_data = []
-    for is_train, key, token_attrs, pair_labels in rows:
+    for is_train, key, token_attrs, nom_idx, pair_labels in rows:
         sent_emb_reshaped = embeddings[key].reshape(12, 32)
         feature_matrix = np.vstack([token_attrs, sent_emb_reshaped])
-        (train_data if is_train else val_data).append((feature_matrix, pair_labels))
+        (train_data if is_train else val_data).append((feature_matrix, nom_idx, pair_labels))
 
     with FEATURES_CACHE.open("wb") as f:
         pickle.dump((train_data, val_data), f)
     print(f"Cached features to {FEATURES_CACHE.name}")
 
     return train_data, val_data
+
+
+def make_batches(data, max_pairs=2_000_000, max_rows=2048):
+    order = sorted(range(len(data)), key=lambda i: data[i][0].shape[0])
+    batches = []
+    cur = []
+    cur_nmax = 0
+    for i in order:
+        n_nom = len(data[i][1])
+        nmax = max(cur_nmax, n_nom)
+        if cur and ((len(cur) + 1) * nmax * nmax > max_pairs or len(cur) + 1 > max_rows):
+            batches.append([data[j] for j in cur])
+            cur = []
+            cur_nmax = 0
+        cur.append(i)
+        cur_nmax = max(cur_nmax, n_nom)
+    if cur:
+        batches.append([data[j] for j in cur])
+    return batches
+
+
+def collate_batch(batch, device):
+    n = len(batch)
+    l_max = max(fm.shape[0] - 12 for fm, _, _ in batch)
+    n_max = max(len(ni) for _, ni, _ in batch)
+    seq = l_max + 12
+
+    feats = np.zeros((n, seq, 32), dtype=np.float32)
+    pad_mask = np.ones((n, seq), dtype=bool)
+    nom_idx = np.zeros((n, n_max), dtype=np.int64)
+    nom_mask = np.zeros((n, n_max), dtype=bool)
+    labels = np.zeros((n, n_max, n_max), dtype=np.float32)
+
+    for b, (fm, ni, lab) in enumerate(batch):
+        li = fm.shape[0] - 12
+        feats[b, :li] = fm[:li]
+        feats[b, l_max:seq] = fm[li:li + 12]
+        pad_mask[b, :li] = False
+        pad_mask[b, l_max:seq] = False
+        k = len(ni)
+        nom_idx[b, :k] = ni
+        nom_mask[b, :k] = True
+        labels[b, :k, :k] = lab
+
+    return (
+        torch.from_numpy(feats).to(device),
+        torch.from_numpy(nom_idx).to(device),
+        torch.from_numpy(pad_mask).to(device),
+        torch.from_numpy(nom_mask).to(device),
+        torch.from_numpy(labels).to(device),
+    )
+
+
+def run_epoch(model, batches, loss_fn, optimizer, device):
+    train = optimizer is not None
+    total_loss_sum = 0.0
+    total_pairs = 0
+    for batch in tqdm(batches, desc="train" if train else "val"):
+        feats, nom_idx, pad_mask, nom_mask, labels = collate_batch(batch, device)
+        valid = nom_mask.unsqueeze(2) & nom_mask.unsqueeze(1)
+        eye = torch.eye(valid.shape[1], device=device, dtype=torch.bool)
+        pair_mask = (valid & ~eye).float()
+
+        if train:
+            optimizer.zero_grad()
+        logits = model(feats, nom_idx, attn_pad_mask=pad_mask)
+        masked = loss_fn(logits, labels) * pair_mask
+        loss = masked.sum() / pair_mask.sum()
+
+        if train:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+            optimizer.step()
+
+        total_loss_sum += masked.sum().item()
+        total_pairs += pair_mask.sum().item()
+
+    return total_loss_sum / max(total_pairs, 1)
 
 
 def train_stage1(
@@ -178,7 +259,11 @@ def train_stage1(
     print(f"Model size: {model_bytes / 1024:.1f} KB")
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+
+    train_batches = make_batches(train_data)
+    val_batches = make_batches(val_data)
+    print(f"Train batches: {len(train_batches)}, Val batches: {len(val_batches)}")
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     best_val_loss = float('inf')
@@ -187,51 +272,16 @@ def train_stage1(
 
     for epoch in range(max_epochs):
         print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
+        random.shuffle(train_batches)
+
         model.train()
-        total_loss = 0.0
-        n_rows = 0
-
-        for feature_matrix, pair_labels in train_data:
-            feature_t = torch.from_numpy(feature_matrix).float().unsqueeze(0).to(device)
-            labels_t = torch.from_numpy(pair_labels).float().to(device)
-
-            optimizer.zero_grad()
-            pair_scores = model(feature_t).squeeze(0)
-            loss = loss_fn(pair_scores, labels_t)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-            optimizer.step()
-
-            total_loss += loss.item()
-            n_rows += 1
-
-        if n_rows == 0:
-            print("No training data!")
-            break
-
-        avg_loss = total_loss / n_rows
-        print(f"Loss: {avg_loss:.6f} ({n_rows} rows)")
+        avg_loss = run_epoch(model, train_batches, loss_fn, optimizer, device)
+        print(f"Loss: {avg_loss:.6f}")
 
         model.eval()
-        val_loss = 0.0
-        n_val = 0
-
         with torch.no_grad():
-            for feature_matrix, pair_labels in val_data:
-                feature_t = torch.from_numpy(feature_matrix).float().unsqueeze(0).to(device)
-                labels_t = torch.from_numpy(pair_labels).float().to(device)
-
-                pair_scores = model(feature_t).squeeze(0)
-                loss = loss_fn(pair_scores, labels_t)
-                val_loss += loss.item()
-                n_val += 1
-
-        if n_val == 0:
-            print("No validation data!")
-            break
-
-        avg_val_loss = val_loss / n_val
-        print(f"Val loss: {avg_val_loss:.6f} ({n_val} rows)")
+            avg_val_loss = run_epoch(model, val_batches, loss_fn, None, device)
+        print(f"Val loss: {avg_val_loss:.6f}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
