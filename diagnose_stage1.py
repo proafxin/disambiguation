@@ -29,17 +29,10 @@ def diagnose():
             if n_examples >= 10:
                 break
 
-            if pair_labels.shape[0] < 2:
-                continue
-
             feature_t = torch.from_numpy(feature_matrix).float().unsqueeze(0).to(device)
             labels_t = torch.from_numpy(pair_labels).float().to(device)
 
             pair_scores = model(feature_t).squeeze(0)
-
-            if pair_scores.shape != labels_t.shape:
-                continue
-
             pair_probs = torch.sigmoid(pair_scores)
 
             labels_flat = pair_labels.flatten()
