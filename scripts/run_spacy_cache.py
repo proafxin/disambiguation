@@ -1,6 +1,7 @@
 import gc
 import json
 import queue
+import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -121,17 +122,47 @@ def load_checkpoint(ds_name: str, split: str, ckpt_path: Path) -> tuple[int, int
     return 0, 0
 
 
-def merge_and_save(ds_name: str, split: str, out_docs: Path) -> None:
+def merge_and_save(ds_name: str, split: str, out_docs: Path, doc_chunk_counts: list) -> None:
     chunk_files = sorted(
         CACHE_DIR.glob(f"{ds_name}_{split}_chunk_*.spacy"),
         key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
     )
     print(f"  merging {len(chunk_files)} chunks...")
     attrs = ["TAG", "POS", "MORPH", "LEMMA", "DEP", "HEAD", "ENT_TYPE", "ENT_IOB", "SENT_START"]
+
+    all_chunks = []
+    all_chunk_meta = []
+    vocab = None
+    for cp in chunk_files:
+        chunk_bin = spacy.tokens.DocBin(attrs=attrs, store_user_data=True).from_disk(cp)
+        if vocab is None:
+            vocab = chunk_bin.vocab
+        for doc in chunk_bin.get_docs(vocab):
+            all_chunks.append(doc)
+            all_chunk_meta.append((doc.user_data["ex_idx"], doc.user_data["sent_lens"]))
+
     final_bin = spacy.tokens.DocBin(attrs=attrs, store_user_data=True)
-    for i, cp in enumerate(chunk_files):
-        final_bin.merge(spacy.tokens.DocBin(attrs=attrs, store_user_data=True).from_disk(cp))
-        print(f"  merged {i + 1}/{len(chunk_files)}")
+    chunk_idx = 0
+    for doc_id, n_chunks in enumerate(doc_chunk_counts):
+        chunks = all_chunks[chunk_idx:chunk_idx + n_chunks]
+        chunk_meta = all_chunk_meta[chunk_idx:chunk_idx + n_chunks]
+
+        if n_chunks == 1:
+            full_doc = chunks[0]
+        else:
+            full_doc = spacy.tokens.Doc.from_docs(chunks)
+
+        combined_sent_lens = []
+        for _, sent_lens in chunk_meta:
+            combined_sent_lens.extend(sent_lens)
+
+        ex_idx = chunk_meta[0][0]
+        full_doc.user_data["sent_lens"] = combined_sent_lens
+        full_doc.user_data["ex_idx"] = ex_idx
+
+        final_bin.add(full_doc)
+        chunk_idx += n_chunks
+
     print(f"  writing {out_docs.name}...")
     final_bin.to_disk(out_docs)
     for cp in chunk_files:
@@ -225,10 +256,10 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     q.put(None)
     writer.join()
 
-    merge_and_save(ds_name, split, out_docs)
+    merge_and_save(ds_name, split, out_docs, doc_chunk_counts)
 
     with out_meta.open("w", encoding="utf-8") as f:
-        json.dump({"n_examples": n, "n_chunks": n_chunks, "doc_chunk_counts": doc_chunk_counts}, f)
+        json.dump({"n_examples": n}, f)
 
     if ckpt_path.exists():
         ckpt_path.unlink()
@@ -241,6 +272,45 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
         torch.cuda.empty_cache()
 
 
+def merge_existing_chunks(ds_name: str, split: str) -> None:
+    out_docs = CACHE_DIR / f"{ds_name}_{split}.spacy"
+    out_meta = CACHE_DIR / f"{ds_name}_{split}_meta.json"
+
+    if out_docs.exists():
+        print(f"skip {ds_name}/{split} — merged output already exists")
+        return
+
+    chunk_files = sorted(
+        CACHE_DIR.glob(f"{ds_name}_{split}_chunk_*.spacy"),
+        key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
+    )
+    if not chunk_files:
+        print(f"skip {ds_name}/{split} — no chunk files found")
+        return
+
+    old_meta_path = CACHE_DIR / f"{ds_name}_{split}_meta.json"
+    if old_meta_path.exists():
+        with old_meta_path.open() as f:
+            meta = json.load(f)
+        doc_chunk_counts = meta.get("doc_chunk_counts")
+        n_examples = meta.get("n_examples")
+    else:
+        print(f"skip {ds_name}/{split} — no metadata found")
+        return
+
+    if not doc_chunk_counts:
+        print(f"skip {ds_name}/{split} — no doc_chunk_counts in metadata")
+        return
+
+    print(f"\n{ds_name}/{split}: merging {len(chunk_files)} chunks (no spacy)")
+    merge_and_save(ds_name, split, out_docs, doc_chunk_counts)
+
+    with out_meta.open("w") as f:
+        json.dump({"n_examples": n_examples}, f)
+
+    print(f"  done")
+
+
 def main() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     nlp = load_nlp()
@@ -251,4 +321,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "merge-only":
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        for ds_name, splits in DATASETS:
+            for split in splits:
+                merge_existing_chunks(ds_name, split)
+        print("\ndone (merge only)")
+    else:
+        main()

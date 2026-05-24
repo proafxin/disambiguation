@@ -10,7 +10,7 @@ from sklearn.metrics import average_precision_score, f1_score, precision_score, 
 
 from disambiguation.signals.abstract_features import FEATURE_NAMES, NUM_FEATURES, POS_IDS
 from disambiguation.signals.generate_episodes import (
-    EPISODES_DIR, GULLIVERS_DOC_IDX, episode_dir, manifest_path,
+    GULLIVERS_DOC_IDX, episode_dir, manifest_path,
 )
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"

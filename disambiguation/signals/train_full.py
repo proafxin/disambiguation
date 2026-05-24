@@ -19,7 +19,8 @@ MAX_HOPS = 512
 MAX_DEPTH = 20
 TOP_K = 20
 NEG_SAMPLES = 4
-N_TOKEN_FEATURES = 16
+N_TOKEN_FEATURES = 16  # Legacy
+N_RAW_ATTRIBUTES = 29  # All spaCy attributes per token
 
 DATASET_CONFIG = [
     ("preco", ["train"]),
