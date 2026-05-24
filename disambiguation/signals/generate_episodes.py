@@ -126,7 +126,8 @@ def generate_all() -> None:
 
     cache = CachedData()
 
-    with open(CACHE_DIR / "dataset_ranges.json") as f:
+    data_dir = CACHE_DIR.parent / "data"
+    with (data_dir / "dataset_ranges.json").open(encoding="utf-8") as f:
         ranges = json.load(f)
 
     window_lengths = [100, 150, 200]

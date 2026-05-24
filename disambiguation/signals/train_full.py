@@ -3,15 +3,20 @@ import time
 from pathlib import Path
 
 import numpy as np
+import spacy
+import spacy.tokens
 from datasets import load_from_disk
 
-from disambiguation.signals.abstract_features import POS_IDS, NUM_FEATURES
+from disambiguation.signals.abstract_features import (
+    DEP_IDS, ENT_TYPE_IDS, GENDER_IDS, NUMBER_IDS, POS_IDS, PRONTYPE_IDS, NUM_FEATURES,
+)
 from disambiguation.signals.resolution_graph import ResolutionGraph
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 DATA_DIR = CACHE_DIR.parent / "data"
 SPACY_TRF_DIR = DATA_DIR / "spacy_trf"
 MAX_HOPS = 512
+MAX_DEPTH = 20
 TOP_K = 20
 NEG_SAMPLES = 4
 N_TOKEN_FEATURES = 16
@@ -22,6 +27,49 @@ DATASET_CONFIG = [
     ("corefud", ["train", "validation"]),
     ("conll2012", ["train", "validation", "test"]),
 ]
+
+
+def _compute_depth(token: spacy.tokens.Token) -> int:
+    depth = 0
+    cur = token
+    while cur.head != cur and depth < MAX_DEPTH:
+        cur = cur.head
+        depth += 1
+    return depth
+
+
+def _extract_chunk_features(doc: spacy.tokens.Doc, sent_lens: list[int]) -> np.ndarray:
+    n_tokens = sum(sent_lens)
+    buf = np.empty((n_tokens, N_TOKEN_FEATURES), dtype=np.float32)
+    pos = 0
+    abs_p = 0
+    for sl in sent_lens:
+        sent_start = abs_p
+        for i in range(abs_p, abs_p + sl):
+            tok = doc[i]
+            morph = tok.morph.to_dict()
+            dep = tok.dep_
+            ti = i - sent_start
+            head_rel = tok.head.i - sent_start if tok.head != tok else -1
+            buf[pos, 0] = POS_IDS.get(tok.pos_, len(POS_IDS))
+            buf[pos, 1] = DEP_IDS.get(dep, len(DEP_IDS))
+            buf[pos, 2] = GENDER_IDS.get(morph.get("Gender", "unknown"), 3)
+            buf[pos, 3] = NUMBER_IDS.get(morph.get("Number", "unknown"), 2)
+            buf[pos, 4] = int(morph.get("Person", "0"))
+            buf[pos, 5] = PRONTYPE_IDS.get(morph.get("PronType", "unknown"), 5)
+            buf[pos, 6] = int(dep in {"nsubj", "nsubj:pass", "nsubj:outer", "csubj"})
+            buf[pos, 7] = int(dep in {"obj", "iobj"})
+            buf[pos, 8] = int(dep == "nmod:poss")
+            buf[pos, 9] = _compute_depth(tok)
+            buf[pos, 10] = tok.n_lefts + tok.n_rights
+            buf[pos, 11] = ti / max(sl - 1, 1)
+            buf[pos, 12] = head_rel
+            buf[pos, 13] = POS_IDS.get(tok.head.pos_, len(POS_IDS))
+            buf[pos, 14] = DEP_IDS.get(tok.head.dep_, len(DEP_IDS))
+            buf[pos, 15] = ENT_TYPE_IDS.get(tok.ent_type_, len(ENT_TYPE_IDS))
+            pos += 1
+        abs_p += sl
+    return buf
 
 
 def _sent_lens(ds_name: str, sample: dict) -> list[int]:
@@ -76,6 +124,7 @@ class CachedData:
         global_sent_idx = 0
         global_doc_idx = 0
         cumulative_tokens = 0
+        vocab = spacy.blank("en").vocab
 
         for ds_name, splits in DATASET_CONFIG:
             ds_dict = load_from_disk(str(DATA_DIR / ds_name))
@@ -86,31 +135,34 @@ class CachedData:
                     continue
                 split_ds = ds_dict[split_name]
 
-                tok_offsets = np.load(SPACY_TRF_DIR / f"{ds_name}_{split_name}_offsets.npy")
-                n_tokens = int(tok_offsets[-1])
-                tok_data = np.memmap(
-                    SPACY_TRF_DIR / f"{ds_name}_{split_name}_data.npy",
-                    dtype=np.float32, mode="r", shape=(n_tokens, N_TOKEN_FEATURES),
-                )
-                all_parts.append(np.array(tok_data))
+                with (SPACY_TRF_DIR / f"{ds_name}_{split_name}_meta.json").open(encoding="utf-8") as f:
+                    meta = json.load(f)
+                doc_chunk_counts = meta["doc_chunk_counts"]
 
-                for doc_i, sample in enumerate(split_ds):
-                    doc_tok_start = cumulative_tokens + int(tok_offsets[doc_i])
+                doc_bin = spacy.tokens.DocBin().from_disk(SPACY_TRF_DIR / f"{ds_name}_{split_name}.spacy")
+                chunk_iter = iter(doc_bin.get_docs(vocab))
+
+                for doc_i, (sample, n_chunks) in enumerate(zip(split_ds, doc_chunk_counts)):
                     sls = _sent_lens(ds_name, sample)
+                    doc_parts: list[np.ndarray] = []
+                    for _ in range(n_chunks):
+                        chunk = next(chunk_iter)
+                        doc_parts.append(_extract_chunk_features(chunk, chunk.user_data["sent_lens"]))
 
                     start_gsi = global_sent_idx
-                    running = doc_tok_start
+                    running = cumulative_tokens
                     for sl in sls:
                         sent_offsets_list.append(running)
                         running += sl
                         global_sent_idx += 1
-                    end_gsi = global_sent_idx
 
-                    doc_boundaries.append((start_gsi, end_gsi, ds_name, doc_i))
+                    doc_token_data = np.concatenate(doc_parts) if len(doc_parts) > 1 else doc_parts[0]
+                    all_parts.append(doc_token_data)
+                    cumulative_tokens += len(doc_token_data)
+                    doc_boundaries.append((start_gsi, global_sent_idx, ds_name, doc_i))
                     clusters_by_doc.append(_clusters(ds_name, sample))
                     global_doc_idx += 1
 
-                cumulative_tokens += n_tokens
                 print(f"  {ds_name}/{split_name}: {len(split_ds)} docs loaded")
 
             dataset_ranges[ds_name]["end_doc"] = global_doc_idx
@@ -122,7 +174,7 @@ class CachedData:
         self.doc_boundaries = doc_boundaries
         self.clusters = clusters_by_doc
 
-        with open(CACHE_DIR / "dataset_ranges.json", "w") as f:
+        with (DATA_DIR / "dataset_ranges.json").open("w", encoding="utf-8") as f:
             json.dump(dataset_ranges, f, indent=2)
 
         elapsed = time.time() - start
