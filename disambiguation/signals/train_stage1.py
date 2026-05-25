@@ -344,10 +344,11 @@ def run_eval(model, val_data, word2id, matrix, device) -> None:
 
 def train_stage1(
     learning_rate: float = 1e-3,
-    max_epochs: int = 15,
+    max_epochs: int = 30,
     patience: int = 6,
     n_folds: int = 4,
     fold: int = 0,
+    resume: bool = True,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
     print("\nBuilding Stage 1 data...")
@@ -373,7 +374,23 @@ def train_stage1(
     tb = SummaryWriter(log_dir=str(CACHE_DIR / "tensorboard" / f"stage1_{datetime.datetime.now():%Y%m%d_%H%M%S}"))
     best_val, patience_ctr, best_epoch = float("inf"), 0, 0
 
-    for epoch in range(max_epochs):
+    start_epoch = 0
+    ckpt_path = MODELS_DIR / CKPT_NAME
+    if resume and ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        best_val = ckpt.get("best_val_loss", best_val)
+        start_epoch = ckpt.get("epoch", -1) + 1
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        else:
+            for _ in range(start_epoch):  # older ckpt: re-advance LR schedule to resume point
+                scheduler.step()
+        print(f"Resumed from epoch {start_epoch} (best_val_loss {best_val:.6f})")
+
+    for epoch in range(start_epoch, max_epochs):
         print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
         random.shuffle(train_batches)
         model.train()
@@ -389,7 +406,11 @@ def train_stage1(
 
         if val_loss < best_val - 1e-4:
             best_val, patience_ctr, best_epoch = val_loss, 0, epoch
-            torch.save({"epoch": epoch, "model": model.state_dict(), "best_val_loss": best_val}, MODELS_DIR / CKPT_NAME)
+            torch.save({
+                "epoch": epoch, "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                "best_val_loss": best_val,
+            }, MODELS_DIR / CKPT_NAME)
             print("✓ Best model saved")
         else:
             patience_ctr += 1
