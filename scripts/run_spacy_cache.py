@@ -23,28 +23,13 @@ DATA_DIR = Path("data")
 NOMINAL_POS = {"PRON", "NOUN", "PROPN"}
 
 
-def _to_numpy(arr: object) -> np.ndarray:
-    if isinstance(arr, cupy.ndarray):
-        return cupy.asnumpy(arr)
-    return np.asarray(arr)
-
-
 def _compute_cosines(
-    doc: spacy.tokens.Doc, d: np.ndarray, lengths: np.ndarray, chunk_sent_lens: list[int], base_sent_idx: int
+    tok: np.ndarray, is_nominal: np.ndarray, chunk_sent_lens: list[int], base_sent_idx: int
 ) -> dict[int, np.ndarray]:
-    starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
-    mask = lengths > 0
-    valid_starts = starts[mask]
-    valid_lengths = lengths[mask]
-    pooled = np.add.reduceat(d, valid_starts, axis=0) / valid_lengths[:, None]
-    tok = np.zeros((len(lengths), d.shape[1]), dtype=np.float32)
-    tok[mask] = pooled
-    tok /= np.maximum(np.linalg.norm(tok, axis=1, keepdims=True), 1e-8)
-
     out: dict[int, np.ndarray] = {}
     off = 0
     for k, sl in enumerate(chunk_sent_lens):
-        noms = [off + j for j in range(sl) if doc[off + j].pos_ in NOMINAL_POS]
+        noms = np.where(is_nominal[off:off + sl])[0] + off
         if len(noms) >= 2:
             v = tok[noms]
             out[base_sent_idx + k] = (v @ v.T).astype(np.float16)
@@ -297,10 +282,31 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     )):
         chunk_idx = n_done + ci
         lhs = doc._.trf_data.last_hidden_layer_state
-        d = _to_numpy(lhs.dataXd).astype(np.float32)
-        lengths = _to_numpy(lhs.lengths).astype(np.int64)
+        raw = lhs.dataXd
+        lengths = (cupy.asnumpy(lhs.lengths) if isinstance(lhs.lengths, cupy.ndarray) else np.asarray(lhs.lengths)).astype(np.int64)
+        pos_arr = doc.to_array("POS")
+        nom_ids = {doc.vocab.strings[p] for p in NOMINAL_POS}
+        is_nominal = np.isin(pos_arr, list(nom_ids))
+        wp_starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+        nom_wp_mask = np.zeros(int(raw.shape[0]), dtype=bool)
+        for ti in np.where(is_nominal)[0]:
+            s, ln = int(wp_starts[ti]), int(lengths[ti])
+            if ln > 0:
+                nom_wp_mask[s:s + ln] = True
+        if isinstance(raw, cupy.ndarray):
+            nom_rows = cupy.asnumpy(raw[cupy.asarray(nom_wp_mask)]).astype(np.float32)
+        else:
+            nom_rows = np.asarray(raw)[nom_wp_mask].astype(np.float32)
+        nom_lengths = lengths[is_nominal]
+        nom_wp_starts = np.concatenate([[0], np.cumsum(nom_lengths)[:-1]]) if len(nom_lengths) else np.array([], dtype=np.int64)
+        tok = np.zeros((len(lengths), nom_rows.shape[1]), dtype=np.float32)
+        for ii, ti in enumerate(np.where(is_nominal)[0]):
+            ln = int(nom_lengths[ii])
+            if ln > 0:
+                tok[ti] = nom_rows[int(nom_wp_starts[ii]):int(nom_wp_starts[ii]) + ln].mean(axis=0)
+        tok /= np.maximum(np.linalg.norm(tok, axis=1, keepdims=True), 1e-8)
         doc._.trf_data = None
-        for sent_idx, cos in _compute_cosines(doc, d, lengths, chunk_sent_lens, chunk_sent_offsets[chunk_idx]).items():
+        for sent_idx, cos in _compute_cosines(tok, is_nominal, chunk_sent_lens, chunk_sent_offsets[chunk_idx]).items():
             cosine_cache[(ex_idx, sent_idx)] = cos
         doc.tensor = doc.tensor[:0]
         q.put((doc, ex_idx, chunk_sent_lens))
