@@ -118,6 +118,7 @@ class DepGraphTransformer(nn.Module):
         )
         # Null antecedent bias (learned scalar per mention)
         self.null_score = nn.Linear(d_model, 1)
+        nn.init.constant_(self.null_score.bias, -1.0)
 
     def _build_batch_attn_bias(
         self,
@@ -239,6 +240,7 @@ def load_stage1(device: str = "cpu") -> tuple["DepGraphTransformer", spacy.Langu
 def _decode_clusters(
     nominal_positions: list[int],
     scores: np.ndarray,  # (M, M+1)
+    null_margin: float = 0.0,
 ) -> list[list[int]]:
     M = len(nominal_positions)
     parent = list(range(M))
@@ -250,9 +252,9 @@ def _decode_clusters(
         return x
 
     for i in range(M):
-        # mask out j >= i (future + self), only j < i and null (col M) are valid
         masked = scores[i].copy()
         masked[i:M] = float("-inf")
+        masked[M] -= null_margin
         ante = int(np.argmax(masked))
         if ante < M:
             parent[find(i)] = find(ante)
@@ -284,9 +286,6 @@ def resolve_stage1(
         pad_mask = torch.zeros(1, sent_len, dtype=torch.bool, device=device)
         nom_t = torch.tensor(nominal_positions, dtype=torch.long, device=device).unsqueeze(0)
         nom_mask = torch.ones(1, len(nominal_positions), dtype=torch.bool, device=device)
-        edge_t = torch.from_numpy(edges).to(device)
-        etype_t = torch.from_numpy(etypes).to(device)
-
         with torch.no_grad():
             attn_bias = model._build_batch_attn_bias(
                 [(edges, etypes)], [sent_len], sent_len, device

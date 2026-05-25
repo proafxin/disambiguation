@@ -36,8 +36,8 @@ def build_stage1_data() -> list:
             data = data[0] + data[1]
             with FEATURES_CACHE.open("wb") as f:
                 pickle.dump(data, f)
-        if data and len(data[0]) == 6:
-            print("Cache missing dataset tags — rebuilding...")
+        if data and len(data[0]) != 8:
+            print("Cache format outdated — rebuilding...")
             FEATURES_CACHE.unlink()
             return build_stage1_data()
         print(f"Loaded cached features: {len(data)} rows")
@@ -116,7 +116,9 @@ def build_stage1_data() -> list:
                             gold_ante[i, M] = 1.0
 
                     nom_idx = np.array(nominal_positions, dtype=np.int64)
-                    rows.append((ds_name, cat, cont, edges, etypes, nom_idx, gold_ante))
+                    # key = (ds_name, split_name, doc_id, sent_idx) for spaCy doc lookup
+                    key = (ds_name, split_name, doc_id, sent_idx)
+                    rows.append((key, cat, cont, edges, etypes, nom_idx, gold_ante))
 
             n_sents_total += n_sents
             n_filtered_total += n_filtered
@@ -125,7 +127,7 @@ def build_stage1_data() -> list:
 
     print(f"\nTotal Stage 1 data: {n_filtered_total}/{n_sents_total} ({n_filtered_total*100.0/max(n_sents_total, 1):.1f}%)")
 
-    data = [(ds_name, cat, cont, edges, etypes, ni, ga) for ds_name, cat, cont, edges, etypes, ni, ga in rows]
+    data = [(key, cat, cont, edges, etypes, ni, ga) for key, cat, cont, edges, etypes, ni, ga in rows]
 
     with FEATURES_CACHE.open("wb") as f:
         pickle.dump(data, f)
@@ -137,8 +139,8 @@ def build_stage1_data() -> list:
 def kfold_split(data: list, n_folds: int, fold: int) -> tuple[list, list]:
     rng = np.random.default_rng(42)
     by_ds: dict[str, list[int]] = {}
-    for i, (ds_name, *_) in enumerate(data):
-        by_ds.setdefault(ds_name, []).append(i)
+    for i, (key, *_) in enumerate(data):
+        by_ds.setdefault(key[0], []).append(i)  # key[0] = ds_name
 
     train_idx, val_idx = [], []
     for indices in by_ds.values():
@@ -149,7 +151,8 @@ def kfold_split(data: list, n_folds: int, fold: int) -> tuple[list, list]:
         for j, idx in enumerate(perm):
             (val_idx if val_start <= j < val_end else train_idx).append(indices[idx])
 
-    return [data[i][1:] for i in train_idx], [data[i][1:] for i in val_idx]
+    # training strips key, val keeps key for evaluation lookup
+    return [data[i][1:] for i in train_idx], [data[i] for i in val_idx]
 
 
 def make_batches(data: list, max_tokens: int = 32768, max_rows: int = 512) -> list[list]:
@@ -254,6 +257,7 @@ def train_stage1(
 
     train_data, val_data = kfold_split(data, n_folds, fold)
     print(f"Fold {fold}/{n_folds}: {len(train_data)} train, {len(val_data)} val")
+    val_data_stripped = [row[1:] for row in val_data]
 
     print(f"\nTraining Stage 1 on {device}")
     model = DepGraphTransformer(d_model=256, n_heads=8, n_layers=4).to(device)
@@ -268,7 +272,7 @@ def train_stage1(
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
 
     train_batches = make_batches(train_data)
-    val_batches = make_batches(val_data)
+    val_batches = make_batches(val_data_stripped)
     print(f"Train batches: {len(train_batches)}, Val batches: {len(val_batches)}")
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)

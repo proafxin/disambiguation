@@ -1,14 +1,33 @@
 import numpy as np
+import spacy
+import spacy.tokens
 import torch
 from pathlib import Path
+from scipy.optimize import linear_sum_assignment
+from tqdm import tqdm
+from datasets import load_from_disk
+
 from disambiguation.signals.stage1_intrasentence import DepGraphTransformer
-from disambiguation.signals.train_stage1 import build_stage1_data
+from disambiguation.signals.train_stage1 import build_stage1_data, kfold_split, DATASET_CONFIG, SPACY_TRF_DIR, DATA_DIR
+from disambiguation.signals.train_full import _clusters, _sent_lens
 
 CACHE_DIR = Path(__file__).parent / "cache"
 MODELS_DIR = CACHE_DIR / "models"
 
+Span = tuple[int, int]
+Cluster = frozenset[Span]
 
-def _clusters_from_argmax(scores: np.ndarray, M: int) -> list[list[int]]:
+
+def _mention_span(sent: spacy.tokens.Span, tok_idx: int) -> Span:
+    tok = sent[tok_idx]
+    for chunk in sent.noun_chunks:
+        if chunk.root.i == tok.i:
+            return (chunk.start - sent.start, chunk.end - sent.start)
+    return (tok_idx, tok_idx + 1)
+
+
+def _pred_clusters(nom_idx: np.ndarray, scores: np.ndarray, sent: spacy.tokens.Span, null_margin: float) -> list[Cluster]:
+    M = len(nom_idx)
     parent = list(range(M))
 
     def find(x: int) -> int:
@@ -20,6 +39,7 @@ def _clusters_from_argmax(scores: np.ndarray, M: int) -> list[list[int]]:
     for i in range(M):
         masked = scores[i].copy()
         masked[i:M] = float("-inf")
+        masked[M] -= null_margin
         ante = int(np.argmax(masked))
         if ante < M:
             parent[find(i)] = find(ante)
@@ -27,36 +47,130 @@ def _clusters_from_argmax(scores: np.ndarray, M: int) -> list[list[int]]:
     groups: dict[int, list[int]] = {}
     for i in range(M):
         groups.setdefault(find(i), []).append(i)
-    return [g for g in groups.values() if len(g) >= 2]
+    return [frozenset(_mention_span(sent, int(nom_idx[i])) for i in members) for members in groups.values() if len(members) >= 2]
 
 
-def _gold_clusters_from_ante(gold_ante: np.ndarray, M: int) -> list[list[int]]:
-    parent = list(range(M))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(M):
-        for j in range(i):
-            if gold_ante[i, j] > 0:
-                parent[find(i)] = find(j)
-
-    groups: dict[int, list[int]] = {}
-    for i in range(M):
-        groups.setdefault(find(i), []).append(i)
-    return [g for g in groups.values() if len(g) >= 2]
+def _gold_clusters(doc_clusters: list, sent_idx: int, sent_len: int) -> list[Cluster]:
+    by_cluster: dict[int, set[Span]] = {}
+    for cid, cluster in enumerate(doc_clusters):
+        for m_sent, m_start, m_end in cluster:
+            if m_sent == sent_idx and m_start < sent_len:
+                by_cluster.setdefault(cid, set()).add((m_start, min(m_end, sent_len)))
+    return [frozenset(spans) for spans in by_cluster.values() if len(spans) >= 2]
 
 
-def _pairwise_sets(clusters: list[list[int]]) -> set[tuple[int, int]]:
-    pairs: set[tuple[int, int]] = set()
-    for cluster in clusters:
-        for i in range(len(cluster)):
-            for j in range(i + 1, len(cluster)):
-                pairs.add((cluster[i], cluster[j]))
-    return pairs
+def _muc(pred: list[Cluster], gold: list[Cluster]) -> tuple[int, int, int, int]:
+    def _score(a: list[Cluster], b: list[Cluster]) -> tuple[int, int]:
+        num = den = 0
+        for c in a:
+            if len(c) < 2:
+                continue
+            den += len(c) - 1
+            num += len(c) - sum(1 for bc in b if c & bc)
+        return num, den
+    pn, pd = _score(pred, gold)
+    rn, rd = _score(gold, pred)
+    return pn, pd, rn, rd
+
+
+def _b3(pred: list[Cluster], gold: list[Cluster]) -> tuple[float, float, int]:
+    pred_map: dict[Span, Cluster] = {m: c for c in pred for m in c}
+    gold_map: dict[Span, Cluster] = {m: c for c in gold for m in c}
+    mentions = set(pred_map) | set(gold_map)
+    if not mentions:
+        return 0.0, 0.0, 0
+    p = sum(len(pred_map.get(m, frozenset({m})) & gold_map.get(m, frozenset({m}))) / len(pred_map.get(m, frozenset({m}))) for m in mentions)
+    r = sum(len(pred_map.get(m, frozenset({m})) & gold_map.get(m, frozenset({m}))) / len(gold_map.get(m, frozenset({m}))) for m in mentions)
+    return p, r, len(mentions)
+
+
+def _ceafe(pred: list[Cluster], gold: list[Cluster]) -> tuple[float, float]:
+    if not pred or not gold:
+        return 0.0, 0.0
+    cost = np.array([[2 * len(p & g) / (len(p) + len(g)) for g in gold] for p in pred])
+    ri, ci = linear_sum_assignment(-cost)
+    score = cost[ri, ci].sum()
+    return score / len(pred), score / len(gold)
+
+
+def _f1(p: float, r: float) -> float:
+    return 2 * p * r / (p + r) if p + r > 0 else 0.0
+
+
+def _run_eval(model: DepGraphTransformer, device: str, val_data: list, null_margin: float) -> dict[str, float]:
+    # build lookup: (ds_name, split_name, doc_id) -> list of (sent_idx, row)
+    by_doc: dict[tuple, list[tuple[int, tuple]]] = {}
+    for row in val_data:
+        key, cat, cont, edges, etypes, nom_idx, gold_ante = row
+        ds_name, split_name, doc_id, sent_idx = key
+        by_doc.setdefault((ds_name, split_name, doc_id), []).append((sent_idx, (cat, cont, edges, etypes, nom_idx, gold_ante)))
+
+    vocab = spacy.blank("en").vocab
+    muc_pn = muc_pd = muc_rn = muc_rd = 0
+    b3_p = b3_r = 0.0
+    b3_n = 0
+    ceafe_p = ceafe_r = 0.0
+    n_sents = 0
+
+    for ds_name, splits in DATASET_CONFIG:
+        ds_dict = load_from_disk(str(DATA_DIR / ds_name))
+        for split_name in splits:
+            if split_name not in ds_dict:
+                continue
+            split_ds = ds_dict[split_name]
+            doc_bin = spacy.tokens.DocBin().from_disk(SPACY_TRF_DIR / f"{ds_name}_{split_name}.spacy")
+            doc_iter = iter(doc_bin.get_docs(vocab))
+
+            for doc_id, (sample, full_doc) in enumerate(tqdm(
+                zip(split_ds, doc_iter, strict=True),
+                desc=f"{ds_name}/{split_name}",
+                total=len(split_ds),
+            )):
+                doc_key = (ds_name, split_name, doc_id)
+                if doc_key not in by_doc:
+                    continue
+
+                doc_clusters = _clusters(ds_name, sample)
+                sls = _sent_lens(ds_name, sample)
+                sents = list(full_doc.sents)
+                sent_rows = {si: row for si, row in by_doc[doc_key]}
+
+                for sent_idx, sent_len in enumerate(sls):
+                    if sent_idx not in sent_rows:
+                        continue
+                    cat, cont, edges, etypes, nom_idx, _ = sent_rows[sent_idx]
+                    sent = sents[sent_idx]
+                    M = len(nom_idx)
+
+                    with torch.no_grad():
+                        attn_bias = model._build_batch_attn_bias([(edges, etypes)], [cat.shape[0]], cat.shape[0], device)
+                        scores = model(
+                            torch.from_numpy(cat).unsqueeze(0).to(device),
+                            torch.from_numpy(cont).unsqueeze(0).to(device),
+                            torch.zeros(1, cat.shape[0], dtype=torch.bool, device=device),
+                            torch.from_numpy(nom_idx).unsqueeze(0).to(device),
+                            torch.ones(1, M, dtype=torch.bool, device=device),
+                            attn_bias,
+                        )
+                    scores_np = scores.squeeze(0).cpu().numpy()
+
+                    pred = _pred_clusters(nom_idx, scores_np, sent, null_margin)
+                    gold = _gold_clusters(doc_clusters, sent_idx, sent_len)
+
+                    pn, pd, rn, rd = _muc(pred, gold)
+                    muc_pn += pn; muc_pd += pd; muc_rn += rn; muc_rd += rd
+
+                    bp, br, bn = _b3(pred, gold)
+                    b3_p += bp; b3_r += br; b3_n += bn
+
+                    cp, cr = _ceafe(pred, gold)
+                    ceafe_p += cp; ceafe_r += cr
+                    n_sents += 1
+
+    muc_f = _f1(muc_pn / max(muc_pd, 1), muc_rn / max(muc_rd, 1))
+    b3_f = _f1(b3_p / max(b3_n, 1), b3_r / max(b3_n, 1))
+    ceafe_f = _f1(ceafe_p / max(n_sents, 1), ceafe_r / max(n_sents, 1))
+    return {"MUC": muc_f, "B3": b3_f, "CEAFe": ceafe_f, "CoNLL": (muc_f + b3_f + ceafe_f) / 3, "n_sents": n_sents}
 
 
 def evaluate_stage1() -> None:
@@ -68,60 +182,18 @@ def evaluate_stage1() -> None:
     if not model_path.exists():
         print(f"Model not found at {model_path}")
         return
-
     ckpt = torch.load(model_path, map_location=device)
-    model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) else ckpt)
+    model.load_state_dict(ckpt.get("model", ckpt))
     model.eval()
 
-    _, val_data = build_stage1_data()
+    data = build_stage1_data()
+    _, val_data = kfold_split(data, n_folds=5, fold=0)
+    print(f"Val rows: {len(val_data)}")
 
-    tp = fp = fn = 0
-    mention_correct = mention_total = 0
-
-    with torch.no_grad():
-        for cat, cont, edges, etypes, nom_idx, gold_ante in val_data:
-            M = len(nom_idx)
-            cat_t = torch.from_numpy(cat).unsqueeze(0).to(device)
-            cont_t = torch.from_numpy(cont).unsqueeze(0).to(device)
-            pad_mask = torch.zeros(1, cat.shape[0], dtype=torch.bool, device=device)
-            nom_t = torch.from_numpy(nom_idx).unsqueeze(0).to(device)
-            nom_mask = torch.ones(1, M, dtype=torch.bool, device=device)
-            attn_bias = model._build_batch_attn_bias(
-                [(edges, etypes)], [cat.shape[0]], cat.shape[0], device
-            )
-            scores = model(cat_t, cont_t, pad_mask, nom_t, nom_mask, attn_bias)
-            scores_np = scores.squeeze(0).cpu().numpy()
-
-            pred_clusters = _clusters_from_argmax(scores_np, M)
-            gold_clusters = _gold_clusters_from_ante(gold_ante, M)
-
-            pred_pairs = _pairwise_sets(pred_clusters)
-            gold_pairs = _pairwise_sets(gold_clusters)
-
-            tp += len(pred_pairs & gold_pairs)
-            fp += len(pred_pairs - gold_pairs)
-            fn += len(gold_pairs - pred_pairs)
-
-            # Mention-level antecedent accuracy (excluding null)
-            for i in range(M):
-                gold_ants = [j for j in range(i) if gold_ante[i, j] > 0]
-                if gold_ants:
-                    masked = scores_np[i].copy()
-                    masked[i:M] = float("-inf")
-                    pred_ante = int(np.argmax(masked))
-                    mention_correct += int(pred_ante in gold_ants)
-                    mention_total += 1
-
-    p = tp / max(tp + fp, 1)
-    r = tp / max(tp + fn, 1)
-    f1 = 2 * p * r / max(p + r, 1e-9)
-    mention_acc = mention_correct / max(mention_total, 1)
-
-    print(f"\n=== Stage 1 Evaluation (Mention Ranking) ===")
-    print(f"  Pairwise Precision: {p:.4f}")
-    print(f"  Pairwise Recall:    {r:.4f}")
-    print(f"  Pairwise F1:        {f1:.4f}")
-    print(f"  Mention Ante Acc:   {mention_acc:.4f}  ({mention_correct}/{mention_total})")
+    print("\n=== Null margin sweep ===")
+    for null_margin in [0.0, 0.5, 1.0, 1.5, 2.0]:
+        m = _run_eval(model, device, val_data, null_margin)
+        print(f"  null_margin={null_margin:.1f}  MUC={m['MUC']:.4f}  B3={m['B3']:.4f}  CEAFe={m['CEAFe']:.4f}  CoNLL={m['CoNLL']:.4f}  ({m['n_sents']} sents)")
 
 
 if __name__ == "__main__":
