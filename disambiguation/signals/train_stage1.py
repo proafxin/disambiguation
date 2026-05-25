@@ -1,3 +1,4 @@
+import json
 import pickle
 import random
 import torch
@@ -7,8 +8,10 @@ import spacy
 import spacy.tokens
 from pathlib import Path
 from tqdm import tqdm
+from scipy.optimize import linear_sum_assignment
 from datasets import load_from_disk
 
+from disambiguation.signals.abstract_features import N_CAT, N_CONT_FULL, N_PAIR_SYNT
 from disambiguation.signals.stage1_intrasentence import (
     DepGraphTransformer, build_sentence_graph, mention_ranking_loss,
 )
@@ -36,8 +39,14 @@ def build_stage1_data() -> list:
             data = data[0] + data[1]
             with FEATURES_CACHE.open("wb") as f:
                 pickle.dump(data, f)
-        if data and len(data[0]) != 8:
+        if data and len(data[0]) != 10:
             print("Cache format outdated — rebuilding...")
+            FEATURES_CACHE.unlink()
+            return build_stage1_data()
+        # Validate inner array shapes match current feature spec.
+        _, cat, cont, _, _, _, _, pair_synt, _, _ = data[0]
+        if cat.shape[1] != N_CAT or cont.shape[1] != N_CONT_FULL or pair_synt.shape[2] != N_PAIR_SYNT:
+            print("Feature dimensions changed — rebuilding cache...")
             FEATURES_CACHE.unlink()
             return build_stage1_data()
         print(f"Loaded cached features: {len(data)} rows")
@@ -101,7 +110,7 @@ def build_stage1_data() -> list:
 
                     mention_map = mentions_by_sent.get(sent_idx, {})
                     sent = sents[sent_idx]
-                    cat, cont, edges, etypes, nominal_positions, nom_lex = build_sentence_graph(sent, sent_len)
+                    cat, cont, edges, etypes, nominal_positions, nom_lex, pair_synt = build_sentence_graph(sent, sent_len)
 
                     if len(nominal_positions) < 2:
                         continue
@@ -125,9 +134,15 @@ def build_stage1_data() -> list:
                             gold_ante[i, M] = 1.0
 
                     nom_idx = np.array(nominal_positions, dtype=np.int64)
-                    # key = (ds_name, split_name, doc_id, sent_idx) for spaCy doc lookup
+                    # Full gold clusters (all gold-mention heads, any POS) for this
+                    # sentence, so evaluation needs no spaCy doc re-read.
+                    gold_groups: dict[int, set[int]] = {}
+                    for hl, cid in mention_map.items():
+                        gold_groups.setdefault(cid, set()).add(hl)
+                    gold_clusters = [frozenset(m) for m in gold_groups.values() if len(m) >= 2]
+                    # key = (ds_name, split_name, doc_id, sent_idx); retained for kfold grouping
                     key = (ds_name, split_name, doc_id, sent_idx)
-                    rows.append((key, cat, cont, edges, etypes, nom_idx, nom_lex, gold_ante))
+                    rows.append((key, cat, cont, edges, etypes, nom_idx, nom_lex, pair_synt, gold_ante, gold_clusters))
 
             n_sents_total += n_sents
             n_filtered_total += n_filtered
@@ -160,8 +175,8 @@ def kfold_split(data: list, n_folds: int, fold: int) -> tuple[list, list]:
         for j, idx in enumerate(perm):
             (val_idx if val_start <= j < val_end else train_idx).append(indices[idx])
 
-    # training strips key, val keeps key for evaluation lookup
-    return [data[i][1:] for i in train_idx], [data[i] for i in val_idx]
+    # training strips key + gold_clusters; val keeps the full row for evaluation
+    return [data[i][1:-1] for i in train_idx], [data[i] for i in val_idx]
 
 
 def make_batches(data: list, max_tokens: int = 32768, max_rows: int = 512) -> list[list]:
@@ -188,17 +203,18 @@ def collate_batch(batch: list, device: torch.device | str, model: "DepGraphTrans
     l_max = max(item[0].shape[0] for item in batch)
     n_max = max(len(item[4]) for item in batch)
 
-    cat_buf = np.zeros((B, l_max, 6), dtype=np.int64)
-    cont_buf = np.zeros((B, l_max, 12), dtype=np.float32)
+    cat_buf = np.zeros((B, l_max, N_CAT), dtype=np.int64)
+    cont_buf = np.zeros((B, l_max, N_CONT_FULL), dtype=np.float32)
     pad_mask = np.ones((B, l_max), dtype=bool)
     nom_idx_buf = np.zeros((B, n_max), dtype=np.int64)
     nom_mask_buf = np.zeros((B, n_max), dtype=bool)
     nom_lex_buf = np.full((B, n_max, 2), -1, dtype=np.int64)
+    synt_buf = np.zeros((B, n_max, n_max, N_PAIR_SYNT), dtype=np.float32)
     gold_buf = np.zeros((B, n_max, n_max + 1), dtype=np.float32)
     edge_list = []
     lengths = []
 
-    for b, (cat, cont, edges, etypes, ni, nl, ga) in enumerate(batch):
+    for b, (cat, cont, edges, etypes, ni, nl, ps, ga) in enumerate(batch):
         L = cat.shape[0]
         cat_buf[b, :L] = cat
         cont_buf[b, :L] = cont
@@ -207,6 +223,7 @@ def collate_batch(batch: list, device: torch.device | str, model: "DepGraphTrans
         nom_idx_buf[b, :k] = ni
         nom_mask_buf[b, :k] = True
         nom_lex_buf[b, :k] = nl
+        synt_buf[b, :k, :k] = ps
         gold_buf[b, :k, :k] = ga[:, :k]
         gold_buf[b, :k, n_max] = ga[:, -1]
         edge_list.append((edges, etypes))
@@ -218,10 +235,11 @@ def collate_batch(batch: list, device: torch.device | str, model: "DepGraphTrans
     nom_t = torch.from_numpy(nom_idx_buf).to(device)
     nom_mask_t = torch.from_numpy(nom_mask_buf).to(device)
     nom_lex_t = torch.from_numpy(nom_lex_buf).to(device)
+    synt_t = torch.from_numpy(synt_buf).to(device)
     gold_t = torch.from_numpy(gold_buf).to(device)
     attn_bias = model._build_batch_attn_bias(edge_list, lengths, l_max, device)
 
-    return cat_t, cont_t, pad_t, nom_t, nom_mask_t, nom_lex_t, gold_t, attn_bias
+    return cat_t, cont_t, pad_t, nom_t, nom_mask_t, nom_lex_t, synt_t, gold_t, attn_bias
 
 
 def run_epoch(
@@ -235,13 +253,13 @@ def run_epoch(
     n_batches = 0
 
     for batch in tqdm(batches, desc="train" if train else "val"):
-        cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, gold_ante, attn_bias = collate_batch(batch, device, model)
+        cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, pair_synt, gold_ante, attn_bias = collate_batch(batch, device, model)
 
         if train:
             optimizer.zero_grad()
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-            scores = model(cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, attn_bias)
+            scores = model(cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, pair_synt, attn_bias)
             loss = mention_ranking_loss(scores, gold_ante, nom_mask)
 
         if train:
@@ -255,9 +273,153 @@ def run_epoch(
     return total_loss / max(n_batches, 1)
 
 
+# Mentions are head-token indices (sentence-relative), matching the training unit
+# (gold spans mapped to span.root). Clusters are sets of those indices.
+Cluster = frozenset[int]
+
+
+def _uf_find(parent: list[int], x: int) -> int:
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    return x
+
+
+def _pred_clusters(nom_idx: np.ndarray, scores: np.ndarray, null_margin: float) -> list[Cluster]:
+    M = len(nom_idx)
+    parent = list(range(M))
+    for i in range(M):
+        masked = scores[i].copy()
+        masked[i:M] = float("-inf")
+        masked[M] -= null_margin
+        ante = int(np.argmax(masked))
+        if ante < M:
+            parent[_uf_find(parent, i)] = _uf_find(parent, ante)
+    groups: dict[int, list[int]] = {}
+    for i in range(M):
+        groups.setdefault(_uf_find(parent, i), []).append(int(nom_idx[i]))
+    return [frozenset(members) for members in groups.values() if len(members) >= 2]
+
+
+def _muc(pred: list[Cluster], gold: list[Cluster]) -> tuple[int, int, int, int]:
+    def _score(a: list[Cluster], b: list[Cluster]) -> tuple[int, int]:
+        b_mentions = set().union(*b) if b else set()
+        num = den = 0
+        for c in a:
+            if len(c) < 2:
+                continue
+            den += len(c) - 1
+            # partitions = response clusters intersecting c + c-mentions absent
+            # from the response (each counts as its own singleton partition)
+            partitions = sum(1 for bc in b if c & bc) + len(c - b_mentions)
+            num += len(c) - partitions
+        return num, den
+    pn, pd = _score(pred, gold)
+    rn, rd = _score(gold, pred)
+    return pn, pd, rn, rd
+
+
+def _b3(pred: list[Cluster], gold: list[Cluster]) -> tuple[float, float, int]:
+    pred_map: dict[int, Cluster] = {m: c for c in pred for m in c}
+    gold_map: dict[int, Cluster] = {m: c for c in gold for m in c}
+    mentions = set(pred_map) | set(gold_map)
+    if not mentions:
+        return 0.0, 0.0, 0
+    p = sum(len(pred_map.get(m, frozenset({m})) & gold_map.get(m, frozenset({m}))) / len(pred_map.get(m, frozenset({m}))) for m in mentions)
+    r = sum(len(pred_map.get(m, frozenset({m})) & gold_map.get(m, frozenset({m}))) / len(gold_map.get(m, frozenset({m}))) for m in mentions)
+    return p, r, len(mentions)
+
+
+def _ceafe(pred: list[Cluster], gold: list[Cluster]) -> tuple[float, float]:
+    if not pred or not gold:
+        return 0.0, 0.0
+    cost = np.array([[2 * len(p & g) / (len(p) + len(g)) for g in gold] for p in pred])
+    ri, ci = linear_sum_assignment(-cost)
+    score = cost[ri, ci].sum()
+    return score / len(pred), score / len(gold)
+
+
+def _f1(p: float, r: float) -> float:
+    return 2 * p * r / (p + r) if p + r > 0 else 0.0
+
+
+def _collect_predictions(model: DepGraphTransformer, device: str, val_data: list) -> list[tuple[np.ndarray, np.ndarray, list[Cluster]]]:
+    # Run the model once per val sentence; gold clusters are cached, so no doc re-read.
+    collected: list[tuple[np.ndarray, np.ndarray, list[Cluster]]] = []
+    for row in tqdm(val_data, desc="eval"):
+        key, cat, cont, edges, etypes, nom_idx, nom_lex, pair_synt, gold_ante, gold_clusters = row
+        M = len(nom_idx)
+        with torch.inference_mode():
+            attn_bias = model._build_batch_attn_bias([(edges, etypes)], [cat.shape[0]], cat.shape[0], device)
+            scores = model(
+                torch.from_numpy(cat).unsqueeze(0).to(device),
+                torch.from_numpy(cont).unsqueeze(0).to(device),
+                torch.zeros(1, cat.shape[0], dtype=torch.bool, device=device),
+                torch.from_numpy(nom_idx).unsqueeze(0).to(device),
+                torch.ones(1, M, dtype=torch.bool, device=device),
+                torch.from_numpy(nom_lex).unsqueeze(0).to(device),
+                torch.from_numpy(pair_synt).unsqueeze(0).to(device),
+                attn_bias,
+            )
+        scores_np = scores.squeeze(0).cpu().numpy()
+        collected.append((nom_idx, scores_np, gold_clusters))
+    return collected
+
+
+def _score_predictions(collected: list[tuple[np.ndarray, np.ndarray, list[Cluster]]], null_margin: float, linking_only: bool = False) -> dict[str, float]:
+    muc_pn = muc_pd = muc_rn = muc_rd = 0
+    b3_p = b3_r = 0.0
+    b3_n = 0
+    ceafe_p = ceafe_r = 0.0
+    n_sents = 0
+
+    for nom_idx, scores_np, gold in collected:
+        if linking_only:
+            noms = {int(x) for x in nom_idx}
+            gold = [c & noms for c in gold]
+            gold = [c for c in gold if len(c) >= 2]
+        pred = _pred_clusters(nom_idx, scores_np, null_margin)
+
+        pn, pd, rn, rd = _muc(pred, gold)
+        muc_pn += pn; muc_pd += pd; muc_rn += rn; muc_rd += rd
+
+        bp, br, bn = _b3(pred, gold)
+        b3_p += bp; b3_r += br; b3_n += bn
+
+        cp, cr = _ceafe(pred, gold)
+        ceafe_p += cp; ceafe_r += cr
+        n_sents += 1
+
+    muc_f = _f1(muc_pn / max(muc_pd, 1), muc_rn / max(muc_rd, 1))
+    b3_f = _f1(b3_p / max(b3_n, 1), b3_r / max(b3_n, 1))
+    ceafe_f = _f1(ceafe_p / max(n_sents, 1), ceafe_r / max(n_sents, 1))
+    return {"MUC": muc_f, "B3": b3_f, "CEAFe": ceafe_f, "CoNLL": (muc_f + b3_f + ceafe_f) / 3, "n_sents": n_sents}
+
+
+def run_stage1_eval(model: DepGraphTransformer, device: str, val_data: list) -> None:
+    # end_to_end: gold = all gold-mention heads (includes non-nominal heads the model
+    #   cannot reach — the honest metric with the POS recall ceiling baked in).
+    # linking_only: gold restricted to nominals the model actually scores — isolates
+    #   clustering quality from candidate-set recall.
+    collected = _collect_predictions(model, device, val_data)
+    margins = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+    results: dict[str, list] = {}
+    for label, linking_only in [("end_to_end", False), ("linking_only", True)]:
+        print(f"\n=== {label} null margin sweep ===")
+        rows = []
+        for null_margin in margins:
+            m = _score_predictions(collected, null_margin, linking_only)
+            m["null_margin"] = null_margin
+            rows.append(m)
+            print(f"  null_margin={null_margin:.1f}  MUC={m['MUC']:.4f}  B3={m['B3']:.4f}  CEAFe={m['CEAFe']:.4f}  CoNLL={m['CoNLL']:.4f}  ({m['n_sents']} sents)")
+        results[label] = rows
+    with (MODELS_DIR / "stage1_eval_metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+
 def train_stage1(
     learning_rate: float = 1e-3,
-    max_epochs: int = 50,
+    max_epochs: int = 20,
     patience: int = 6,
     n_folds: int = 4,
     fold: int = 0,
@@ -269,7 +431,7 @@ def train_stage1(
 
     train_data, val_data = kfold_split(data, n_folds, fold)
     print(f"Fold {fold}/{n_folds}: {len(train_data)} train, {len(val_data)} val")
-    val_data_stripped = [row[1:] for row in val_data]
+    val_data_stripped = [row[1:-1] for row in val_data]
 
     print(f"\nTraining Stage 1 on {device}")
     model = DepGraphTransformer(d_model=256, n_heads=8, n_layers=4).to(device)
@@ -288,6 +450,8 @@ def train_stage1(
     print(f"Train batches: {len(train_batches)}, Val batches: {len(val_batches)}")
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = MODELS_DIR / "stage1_train_log.json"
+    history: list[dict] = []
     best_val_loss = float("inf")
     patience_counter = 0
     best_epoch = 0
@@ -314,11 +478,15 @@ def train_stage1(
         print(f"Loss: {avg_loss:.6f}")
 
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             avg_val_loss = run_epoch(model, val_batches, None, device)
         print(f"Val loss: {avg_val_loss:.6f}")
 
         scheduler.step()
+
+        history.append({"epoch": epoch + 1, "train_loss": avg_loss, "val_loss": avg_val_loss})
+        with log_path.open("w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
 
         if avg_val_loss < best_val_loss - min_delta:
             best_val_loss = avg_val_loss
@@ -341,6 +509,12 @@ def train_stage1(
                 break
 
     print("\n✓ Training complete")
+
+    if ckpt_path.exists():
+        best = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(best["model"] if isinstance(best, dict) and "model" in best else best)
+    model.eval()
+    run_stage1_eval(model, device, val_data)
 
 
 if __name__ == "__main__":

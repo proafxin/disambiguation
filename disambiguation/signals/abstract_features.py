@@ -43,3 +43,85 @@ FEATURE_NAMES = [
     "cur_is_subj", "cand_is_subj_graph_resolved", "cand_is_subj_no_graph",
     "o_ent_type", "cur_ent_type", "c_ent_type",
 ]
+
+# ---------------------------------------------------------------------------
+# Full per-token spaCy attribute spec for the Stage 1 graph model.
+# Every categorical attribute spaCy emits is exposed as its own embedding.
+# Each map holds real values only; an absent/unseen value falls back to
+# len(map), so the embedding cardinality is len(map) + 1.
+# ---------------------------------------------------------------------------
+
+TAG_IDS = {tag: i for i, tag in enumerate([
+    "$", "''", ",", "-LRB-", "-RRB-", ".", ":", "ADD", "CC", "CD", "DT", "EX",
+    "FW", "HYPH", "IN", "JJ", "JJR", "JJS", "LS", "MD", "NFP", "NN", "NNP",
+    "NNPS", "NNS", "PDT", "POS", "PRP", "PRP$", "RB", "RBR", "RBS", "RP", "SYM",
+    "TO", "UH", "VB", "VBD", "VBG", "VBN", "VBP", "VBZ", "WDT", "WP", "WP$",
+    "WRB", "XX", "_SP", "``",
+])}
+
+ENT_IOB_IDS = {"O": 0, "B": 1, "I": 2}
+
+# spaCy morphologizer feature value sets (English), one map per feature.
+MORPH_IDS = {
+    "Gender": {"Masc": 0, "Fem": 1, "Neut": 2},
+    "Number": {"Sing": 0, "Plur": 1},
+    "Person": {"1": 0, "2": 1, "3": 2},
+    "PronType": {"Prs": 0, "Art": 1, "Dem": 2, "Rel": 3, "Ind": 4},
+    "Case": {"Nom": 0, "Acc": 1},
+    "Definite": {"Def": 0, "Ind": 1},
+    "Degree": {"Pos": 0, "Cmp": 1, "Sup": 2},
+    "VerbForm": {"Fin": 0, "Inf": 1, "Part": 2, "Ger": 3},
+    "Tense": {"Past": 0, "Pres": 1},
+    "Mood": {"Ind": 0},
+    "Aspect": {"Perf": 0, "Prog": 1},
+    "NumType": {"Card": 0, "Ord": 1, "Mult": 2},
+    "Poss": {"Yes": 0},
+    "Reflex": {"Yes": 0},
+    "Polarity": {"Neg": 0},
+    "VerbType": {"Mod": 0},
+    "ConjType": {"Cmp": 0},
+    "Foreign": {"Yes": 0},
+    "PunctType": {"Brck": 0, "Comm": 1, "Dash": 2, "Peri": 3, "Quot": 4},
+    "PunctSide": {"Ini": 0, "Fin": 1},
+}
+
+# Orthographic shape strings covering ~99% of corpus tokens (derived from full corpus scan).
+SHAPE_IDS = {s: i for i, s in enumerate([
+    "xxxx", "xxx", "xx", ".", "Xxxxx", ",", "x", "Xxx", "Xxxx", " ",
+    "Xx", "X", "'x", "``", "''", "x'x", "dd", "?", ":", "xxxx-xxxx",
+    "dddd", "'xx", "--", "!", "d", "-", "XX", ")", "(", "XXX",
+    "ddd", "'", "XXXX", ";", "/.", "$", "Xx.", '"', "xxx-xxxx", "%",
+])}
+
+# Ordered categorical columns: (name, value->id map).
+# Token-level attrs first (pos/tag/dep/ent_type/ent_iob/shape), then every morph feature.
+CAT_SPEC: list[tuple[str, dict]] = [
+    ("pos", POS_IDS),
+    ("tag", TAG_IDS),
+    ("dep", DEP_IDS),
+    ("ent_type", ENT_TYPE_IDS),
+    ("ent_iob", ENT_IOB_IDS),
+    ("shape", SHAPE_IDS),
+] + [(name, MORPH_IDS[name]) for name in MORPH_IDS]
+
+CAT_CARDINALITIES = [len(m) + 1 for _, m in CAT_SPEC]
+N_CAT = len(CAT_SPEC)
+
+# Column indices used for in-model pairwise agreement features.
+CAT_INDEX = {name: i for i, (name, _) in enumerate(CAT_SPEC)}
+IDX_GENDER = CAT_INDEX["Gender"]
+IDX_NUMBER = CAT_INDEX["Number"]
+IDX_PERSON = CAT_INDEX["Person"]
+IDX_ENT_TYPE = CAT_INDEX["ent_type"]
+
+# Continuous/boolean per-token columns (orthographic + tree shape).
+# Columns: is_alpha, is_digit, is_title, is_upper, is_lower, is_stop,
+#          like_num, depth/20, n_lefts/L, n_rights/L,
+#          sent_pos (ti/(L-1)), is_sent_start, is_bracket, is_quote
+N_CONT_FULL = 14
+
+# Pairwise syntactic-relation features (precomputed per nominal pair).
+# Columns: same_clause, dominates, path_len_norm, arc_appos, arc_conj,
+#          arc_poss, arc_relcl, same_head
+# (signed linear order lives in the pair head as `gap`, so it is not repeated here)
+N_PAIR_SYNT = 8
