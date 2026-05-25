@@ -1,63 +1,128 @@
 import numpy as np
 import torch
 from pathlib import Path
-from sklearn.metrics import average_precision_score, precision_score, recall_score, f1_score
-from disambiguation.signals.stage1_intrasentence import MiniTransformer
+from disambiguation.signals.stage1_intrasentence import DepGraphTransformer
 from disambiguation.signals.train_stage1 import build_stage1_data
 
 CACHE_DIR = Path(__file__).parent / "cache"
 MODELS_DIR = CACHE_DIR / "models"
 
-def evaluate_stage1():
+
+def _clusters_from_argmax(scores: np.ndarray, M: int) -> list[list[int]]:
+    parent = list(range(M))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(M):
+        masked = scores[i].copy()
+        masked[i:M] = float("-inf")
+        ante = int(np.argmax(masked))
+        if ante < M:
+            parent[find(i)] = find(ante)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(M):
+        groups.setdefault(find(i), []).append(i)
+    return [g for g in groups.values() if len(g) >= 2]
+
+
+def _gold_clusters_from_ante(gold_ante: np.ndarray, M: int) -> list[list[int]]:
+    parent = list(range(M))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(M):
+        for j in range(i):
+            if gold_ante[i, j] > 0:
+                parent[find(i)] = find(j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(M):
+        groups.setdefault(find(i), []).append(i)
+    return [g for g in groups.values() if len(g) >= 2]
+
+
+def _pairwise_sets(clusters: list[list[int]]) -> set[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    for cluster in clusters:
+        for i in range(len(cluster)):
+            for j in range(i + 1, len(cluster)):
+                pairs.add((cluster[i], cluster[j]))
+    return pairs
+
+
+def evaluate_stage1() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Evaluating on {device}")
 
-    model = MiniTransformer(n_heads=4, n_layers=1).to(device)
-    model_path = MODELS_DIR / "stage1_mini_transformer.pt"
+    model = DepGraphTransformer(d_model=256, n_heads=8, n_layers=4).to(device)
+    model_path = MODELS_DIR / "stage1_graph_transformer.pt"
     if not model_path.exists():
         print(f"Model not found at {model_path}")
         return
 
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    ckpt = torch.load(model_path, map_location=device)
+    model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) else ckpt)
     model.eval()
-
-    y_true = []
-    y_prob = []
 
     _, val_data = build_stage1_data()
 
+    tp = fp = fn = 0
+    mention_correct = mention_total = 0
+
     with torch.no_grad():
-        for feature_matrix, nom_idx, pair_labels in val_data:
-            feature_t = torch.from_numpy(feature_matrix).float().unsqueeze(0).to(device)
-            nom_t = torch.from_numpy(nom_idx).long().to(device)
+        for cat, cont, edges, etypes, nom_idx, gold_ante in val_data:
+            M = len(nom_idx)
+            cat_t = torch.from_numpy(cat).unsqueeze(0).to(device)
+            cont_t = torch.from_numpy(cont).unsqueeze(0).to(device)
+            pad_mask = torch.zeros(1, cat.shape[0], dtype=torch.bool, device=device)
+            nom_t = torch.from_numpy(nom_idx).unsqueeze(0).to(device)
+            nom_mask = torch.ones(1, M, dtype=torch.bool, device=device)
+            attn_bias = model._build_batch_attn_bias(
+                [(edges, etypes)], [cat.shape[0]], cat.shape[0], device
+            )
+            scores = model(cat_t, cont_t, pad_mask, nom_t, nom_mask, attn_bias)
+            scores_np = scores.squeeze(0).cpu().numpy()
 
-            pair_scores = model(feature_t, nom_t).squeeze(0)
-            pair_probs = torch.sigmoid(pair_scores)
+            pred_clusters = _clusters_from_argmax(scores_np, M)
+            gold_clusters = _gold_clusters_from_ante(gold_ante, M)
 
-            off = ~np.eye(pair_labels.shape[0], dtype=bool)
-            y_true.append(pair_labels[off])
-            y_prob.append(pair_probs.cpu().numpy()[off])
+            pred_pairs = _pairwise_sets(pred_clusters)
+            gold_pairs = _pairwise_sets(gold_clusters)
 
-    if not y_true:
-        print("No examples found!")
-        return
+            tp += len(pred_pairs & gold_pairs)
+            fp += len(pred_pairs - gold_pairs)
+            fn += len(gold_pairs - pred_pairs)
 
-    y_true_flat = np.concatenate(y_true)
-    y_prob_flat = np.concatenate(y_prob)
-    y_pred_flat = (y_prob_flat > 0.5).astype(int)
-    y_true_binary = (y_true_flat > 0).astype(int)
+            # Mention-level antecedent accuracy (excluding null)
+            for i in range(M):
+                gold_ants = [j for j in range(i) if gold_ante[i, j] > 0]
+                if gold_ants:
+                    masked = scores_np[i].copy()
+                    masked[i:M] = float("-inf")
+                    pred_ante = int(np.argmax(masked))
+                    mention_correct += int(pred_ante in gold_ants)
+                    mention_total += 1
 
-    ap = average_precision_score(y_true_binary, y_prob_flat)
-    p = precision_score(y_true_binary, y_pred_flat, zero_division=0)
-    r = recall_score(y_true_binary, y_pred_flat, zero_division=0)
-    f1 = f1_score(y_true_binary, y_pred_flat, zero_division=0)
+    p = tp / max(tp + fp, 1)
+    r = tp / max(tp + fn, 1)
+    f1 = 2 * p * r / max(p + r, 1e-9)
+    mention_acc = mention_correct / max(mention_total, 1)
 
-    print(f"\n=== Stage 1 Evaluation ===")
-    print(f"  AP:        {ap:.4f}")
-    print(f"  Precision: {p:.4f}")
-    print(f"  Recall:    {r:.4f}")
-    print(f"  F1:        {f1:.4f}")
-    print(f"  Pairs: {len(y_true_flat):,} (pos: {int(y_true_binary.sum()):,})")
+    print(f"\n=== Stage 1 Evaluation (Mention Ranking) ===")
+    print(f"  Pairwise Precision: {p:.4f}")
+    print(f"  Pairwise Recall:    {r:.4f}")
+    print(f"  Pairwise F1:        {f1:.4f}")
+    print(f"  Mention Ante Acc:   {mention_acc:.4f}  ({mention_correct}/{mention_total})")
+
 
 if __name__ == "__main__":
     evaluate_stage1()
