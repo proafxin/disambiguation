@@ -1,3 +1,4 @@
+import datetime
 import json
 import pickle
 import random
@@ -9,6 +10,7 @@ import spacy.tokens
 from pathlib import Path
 from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
+from torch.utils.tensorboard import SummaryWriter
 from datasets import load_from_disk
 
 from disambiguation.signals.abstract_features import N_CAT, N_CONT_FULL, N_PAIR_SYNT
@@ -451,6 +453,8 @@ def train_stage1(
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = MODELS_DIR / "stage1_train_log.json"
+    tb_dir = CACHE_DIR / "tensorboard" / f"stage1_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+    writer = SummaryWriter(log_dir=str(tb_dir))
     history: list[dict] = []
     best_val_loss = float("inf")
     patience_counter = 0
@@ -487,6 +491,8 @@ def train_stage1(
         history.append({"epoch": epoch + 1, "train_loss": avg_loss, "val_loss": avg_val_loss})
         with log_path.open("w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
+        writer.add_scalar("loss/train", avg_loss, epoch + 1)
+        writer.add_scalar("loss/val", avg_val_loss, epoch + 1)
 
         if avg_val_loss < best_val_loss - min_delta:
             best_val_loss = avg_val_loss
@@ -509,6 +515,7 @@ def train_stage1(
                 break
 
     print("\n✓ Training complete")
+    writer.close()
 
     if ckpt_path.exists():
         best = torch.load(ckpt_path, map_location=device)

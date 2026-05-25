@@ -18,6 +18,7 @@ dependencies = [
     "xgboost-cu13>=3.2.0",
     "en-core-web-trf>=3.8.0",
     "cupy-cuda13x>=14.1.0",
+    "tensorboard>=2.20.0",
 ]
 
 [dependency-groups]
