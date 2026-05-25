@@ -38,7 +38,7 @@ def find_strided_spans(model: object) -> object | None:
 def load_nlp() -> spacy.Language:
     gpu = spacy.prefer_gpu()
     print(f"  GPU: {gpu}")
-    nlp = spacy.load("en_core_web_trf", disable=["senter", "lemmatizer"])
+    nlp = spacy.load("en_core_web_trf", disable=["senter"])
     trf = nlp.get_pipe("transformer")
     ws = find_strided_spans(trf.model)
     if ws:

@@ -9,24 +9,17 @@ from datasets import load_from_disk
 
 from disambiguation.signals.stage1_intrasentence import DepGraphTransformer
 from disambiguation.signals.train_stage1 import build_stage1_data, kfold_split, DATASET_CONFIG, SPACY_TRF_DIR, DATA_DIR
-from disambiguation.signals.train_full import _clusters, _sent_lens
+from disambiguation.signals.train_full import _clusters
 
 CACHE_DIR = Path(__file__).parent / "cache"
 MODELS_DIR = CACHE_DIR / "models"
 
-Span = tuple[int, int]
-Cluster = frozenset[Span]
+# Mentions are head-token indices (sentence-relative), matching the training unit
+# (gold spans mapped to span.root). Clusters are sets of those indices.
+Cluster = frozenset[int]
 
 
-def _mention_span(sent: spacy.tokens.Span, tok_idx: int) -> Span:
-    tok = sent[tok_idx]
-    for chunk in sent.noun_chunks:
-        if chunk.root.i == tok.i:
-            return (chunk.start - sent.start, chunk.end - sent.start)
-    return (tok_idx, tok_idx + 1)
-
-
-def _pred_clusters(nom_idx: np.ndarray, scores: np.ndarray, sent: spacy.tokens.Span, null_margin: float) -> list[Cluster]:
+def _pred_clusters(nom_idx: np.ndarray, scores: np.ndarray, null_margin: float) -> list[Cluster]:
     M = len(nom_idx)
     parent = list(range(M))
 
@@ -46,17 +39,20 @@ def _pred_clusters(nom_idx: np.ndarray, scores: np.ndarray, sent: spacy.tokens.S
 
     groups: dict[int, list[int]] = {}
     for i in range(M):
-        groups.setdefault(find(i), []).append(i)
-    return [frozenset(_mention_span(sent, int(nom_idx[i])) for i in members) for members in groups.values() if len(members) >= 2]
+        groups.setdefault(find(i), []).append(int(nom_idx[i]))
+    return [frozenset(members) for members in groups.values() if len(members) >= 2]
 
 
-def _gold_clusters(doc_clusters: list, sent_idx: int, sent_len: int) -> list[Cluster]:
-    by_cluster: dict[int, set[Span]] = {}
+def _gold_clusters(doc_clusters: list, sent_idx: int, sent: spacy.tokens.Span) -> list[Cluster]:
+    by_cluster: dict[int, set[int]] = {}
     for cid, cluster in enumerate(doc_clusters):
         for m_sent, m_start, m_end in cluster:
-            if m_sent == sent_idx and m_start < sent_len:
-                by_cluster.setdefault(cid, set()).add((m_start, min(m_end, sent_len)))
-    return [frozenset(spans) for spans in by_cluster.values() if len(spans) >= 2]
+            if m_sent != sent_idx or m_start >= len(sent):
+                continue
+            span = sent[m_start:min(m_end, len(sent))]
+            head_local = span.root.i - sent.start
+            by_cluster.setdefault(cid, set()).add(head_local)
+    return [frozenset(members) for members in by_cluster.values() if len(members) >= 2]
 
 
 def _muc(pred: list[Cluster], gold: list[Cluster]) -> tuple[int, int, int, int]:
@@ -97,24 +93,25 @@ def _f1(p: float, r: float) -> float:
     return 2 * p * r / (p + r) if p + r > 0 else 0.0
 
 
-def _run_eval(model: DepGraphTransformer, device: str, val_data: list, null_margin: float) -> dict[str, float]:
-    # build lookup: (ds_name, split_name, doc_id) -> list of (sent_idx, row)
+def _collect_predictions(model: DepGraphTransformer, device: str, val_data: list) -> list[tuple[np.ndarray, np.ndarray, list[Cluster]]]:
+    # Run the model once per val sentence; gold clusters don't depend on null_margin.
     by_doc: dict[tuple, list[tuple[int, tuple]]] = {}
     for row in val_data:
-        key, cat, cont, edges, etypes, nom_idx, gold_ante = row
+        key, cat, cont, edges, etypes, nom_idx, nom_lex, gold_ante = row
         ds_name, split_name, doc_id, sent_idx = key
-        by_doc.setdefault((ds_name, split_name, doc_id), []).append((sent_idx, (cat, cont, edges, etypes, nom_idx, gold_ante)))
+        by_doc.setdefault((ds_name, split_name, doc_id), []).append((sent_idx, (cat, cont, edges, etypes, nom_idx, nom_lex)))
+    needed_splits = {(key[0], key[1]) for key, *_ in val_data}
 
     vocab = spacy.blank("en").vocab
-    muc_pn = muc_pd = muc_rn = muc_rd = 0
-    b3_p = b3_r = 0.0
-    b3_n = 0
-    ceafe_p = ceafe_r = 0.0
-    n_sents = 0
+    collected: list[tuple[np.ndarray, np.ndarray, list[Cluster]]] = []
 
     for ds_name, splits in DATASET_CONFIG:
-        ds_dict = load_from_disk(str(DATA_DIR / ds_name))
+        ds_dict = None
         for split_name in splits:
+            if (ds_name, split_name) not in needed_splits:
+                continue
+            if ds_dict is None:
+                ds_dict = load_from_disk(str(DATA_DIR / ds_name))
             if split_name not in ds_dict:
                 continue
             split_ds = ds_dict[split_name]
@@ -131,14 +128,9 @@ def _run_eval(model: DepGraphTransformer, device: str, val_data: list, null_marg
                     continue
 
                 doc_clusters = _clusters(ds_name, sample)
-                sls = _sent_lens(ds_name, sample)
                 sents = list(full_doc.sents)
-                sent_rows = {si: row for si, row in by_doc[doc_key]}
 
-                for sent_idx, sent_len in enumerate(sls):
-                    if sent_idx not in sent_rows:
-                        continue
-                    cat, cont, edges, etypes, nom_idx, _ = sent_rows[sent_idx]
+                for sent_idx, (cat, cont, edges, etypes, nom_idx, nom_lex) in by_doc[doc_key]:
                     sent = sents[sent_idx]
                     M = len(nom_idx)
 
@@ -150,22 +142,35 @@ def _run_eval(model: DepGraphTransformer, device: str, val_data: list, null_marg
                             torch.zeros(1, cat.shape[0], dtype=torch.bool, device=device),
                             torch.from_numpy(nom_idx).unsqueeze(0).to(device),
                             torch.ones(1, M, dtype=torch.bool, device=device),
+                            torch.from_numpy(nom_lex).unsqueeze(0).to(device),
                             attn_bias,
                         )
                     scores_np = scores.squeeze(0).cpu().numpy()
+                    gold = _gold_clusters(doc_clusters, sent_idx, sent)
+                    collected.append((nom_idx, scores_np, gold))
 
-                    pred = _pred_clusters(nom_idx, scores_np, sent, null_margin)
-                    gold = _gold_clusters(doc_clusters, sent_idx, sent_len)
+    return collected
 
-                    pn, pd, rn, rd = _muc(pred, gold)
-                    muc_pn += pn; muc_pd += pd; muc_rn += rn; muc_rd += rd
 
-                    bp, br, bn = _b3(pred, gold)
-                    b3_p += bp; b3_r += br; b3_n += bn
+def _score_predictions(collected: list[tuple[np.ndarray, np.ndarray, list[Cluster]]], null_margin: float) -> dict[str, float]:
+    muc_pn = muc_pd = muc_rn = muc_rd = 0
+    b3_p = b3_r = 0.0
+    b3_n = 0
+    ceafe_p = ceafe_r = 0.0
+    n_sents = 0
 
-                    cp, cr = _ceafe(pred, gold)
-                    ceafe_p += cp; ceafe_r += cr
-                    n_sents += 1
+    for nom_idx, scores_np, gold in collected:
+        pred = _pred_clusters(nom_idx, scores_np, null_margin)
+
+        pn, pd, rn, rd = _muc(pred, gold)
+        muc_pn += pn; muc_pd += pd; muc_rn += rn; muc_rd += rd
+
+        bp, br, bn = _b3(pred, gold)
+        b3_p += bp; b3_r += br; b3_n += bn
+
+        cp, cr = _ceafe(pred, gold)
+        ceafe_p += cp; ceafe_r += cr
+        n_sents += 1
 
     muc_f = _f1(muc_pn / max(muc_pd, 1), muc_rn / max(muc_rd, 1))
     b3_f = _f1(b3_p / max(b3_n, 1), b3_r / max(b3_n, 1))
@@ -187,12 +192,14 @@ def evaluate_stage1() -> None:
     model.eval()
 
     data = build_stage1_data()
-    _, val_data = kfold_split(data, n_folds=5, fold=0)
+    _, val_data = kfold_split(data, n_folds=4, fold=0)
     print(f"Val rows: {len(val_data)}")
+
+    collected = _collect_predictions(model, device, val_data)
 
     print("\n=== Null margin sweep ===")
     for null_margin in [0.0, 0.5, 1.0, 1.5, 2.0]:
-        m = _run_eval(model, device, val_data, null_margin)
+        m = _score_predictions(collected, null_margin)
         print(f"  null_margin={null_margin:.1f}  MUC={m['MUC']:.4f}  B3={m['B3']:.4f}  CEAFe={m['CEAFe']:.4f}  CoNLL={m['CoNLL']:.4f}  ({m['n_sents']} sents)")
 
 

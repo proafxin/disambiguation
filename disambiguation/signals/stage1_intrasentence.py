@@ -28,7 +28,7 @@ N_CONT = 12  # person, case/mood/tense/verbform/aspect/voice/animacy/numtype fla
 def build_sentence_graph(
     sent: spacy.tokens.Span | spacy.tokens.Doc,
     sent_len: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int], np.ndarray]:
     cat = np.zeros((sent_len, 6), dtype=np.int64)   # [pos, dep, gender, number, prontype, ent_type]
     cont = np.zeros((sent_len, N_CONT), dtype=np.float32)
     edge_src = []
@@ -75,9 +75,19 @@ def build_sentence_graph(
 
     nominal_positions = [ti for ti in range(sent_len) if sent[ti].pos_ in NOMINAL_POS]
 
+    # Per-nominal local lexical ids (dense within sentence): [lemma_id, surface_id].
+    # Used by the pair head for same_lemma / same_surface match features.
+    lemma_ids: dict[int, int] = {}
+    surf_ids: dict[int, int] = {}
+    nom_lex = np.empty((len(nominal_positions), 2), dtype=np.int64)
+    for k, ti in enumerate(nominal_positions):
+        tok = sent[ti]
+        nom_lex[k, 0] = lemma_ids.setdefault(tok.lemma, len(lemma_ids))
+        nom_lex[k, 1] = surf_ids.setdefault(tok.lower, len(surf_ids))
+
     edges = np.array([edge_src, edge_dst], dtype=np.int64) if edge_src else np.zeros((2, 0), dtype=np.int64)
     etypes = np.array(edge_type, dtype=np.int64) if edge_type else np.zeros(0, dtype=np.int64)
-    return cat, cont, edges, etypes, nominal_positions
+    return cat, cont, edges, etypes, nominal_positions, nom_lex
 
 
 class DepGraphTransformer(nn.Module):
@@ -110,15 +120,16 @@ class DepGraphTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        # Mention-ranking head: score(mention_i, antecedent_j) → scalar
+        # Mention-ranking head: score(mention_i, antecedent_j) → scalar.
+        # Pair input = [repr_i, repr_j, signed_dist, abs_dist, same_lemma, same_surface]
+        self.n_pair_feats = 4
         self.rank_head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
+            nn.Linear(d_model * 2 + self.n_pair_feats, d_model),
             nn.ReLU(),
             nn.Linear(d_model, 1),
         )
         # Null antecedent bias (learned scalar per mention)
         self.null_score = nn.Linear(d_model, 1)
-        nn.init.constant_(self.null_score.bias, -1.0)
 
     def _build_batch_attn_bias(
         self,
@@ -176,9 +187,11 @@ class DepGraphTransformer(nn.Module):
         pad_mask: torch.Tensor,
         nominal_idx: torch.Tensor,   # (B, M) int64, padded with 0
         nom_mask: torch.Tensor,      # (B, M) bool, True=valid
+        nom_lex: torch.Tensor,       # (B, M, 2) int64, [lemma_id, surface_id], padded with -1
         attn_bias: torch.Tensor | None = None,  # (B*H, L, L)
     ) -> torch.Tensor:
         B, M = nominal_idx.shape
+        L = cat.shape[1]
         out = self.encode(cat, cont, pad_mask, attn_bias)
 
         gather_idx = nominal_idx.unsqueeze(-1).expand(-1, -1, self.d_model)
@@ -188,7 +201,18 @@ class DepGraphTransformer(nn.Module):
         # Returns (B, M, M+1): scores[b, i, j] = score of antecedent j for mention i; j=M is null
         x_i = x_nom.unsqueeze(2).expand(-1, -1, M, -1)   # (B, M, M, d)
         x_j = x_nom.unsqueeze(1).expand(-1, M, -1, -1)   # (B, M, M, d)
-        pair_scores = self.rank_head(torch.cat([x_i, x_j], dim=-1)).squeeze(-1)  # (B, M, M)
+
+        # Pairwise features: recency (signed/abs token gap) + lexical match (lemma/surface)
+        pos = nominal_idx.float()
+        gap = (pos.unsqueeze(2) - pos.unsqueeze(1)) / max(L - 1, 1)  # (B, M, M), i - j
+        lemma = nom_lex[..., 0]
+        surf = nom_lex[..., 1]
+        same_lemma = (lemma.unsqueeze(2) == lemma.unsqueeze(1)).to(gap.dtype)
+        same_surface = (surf.unsqueeze(2) == surf.unsqueeze(1)).to(gap.dtype)
+        pair_feats = torch.stack([gap, gap.abs(), same_lemma, same_surface], dim=-1)  # (B, M, M, 4)
+
+        pair_repr = torch.cat([x_i, x_j, pair_feats], dim=-1)
+        pair_scores = self.rank_head(pair_repr).squeeze(-1)  # (B, M, M)
         null_scores = self.null_score(x_nom)  # (B, M, 1)
         return torch.cat([pair_scores, null_scores], dim=-1)  # (B, M, M+1)
 
@@ -199,8 +223,9 @@ def mention_ranking_loss(
     nom_mask: torch.Tensor,   # (B, M) bool
 ) -> torch.Tensor:
     B, M, _ = scores.shape
-    # Causal mask: mention i can only attend to j < i or null (col M)
-    causal = torch.ones(M, M + 1, dtype=torch.bool, device=scores.device).tril()
+    # Causal mask: mention i can only attend to j < i or null (col M).
+    # tril(-1) excludes the diagonal so a mention is never its own antecedent.
+    causal = torch.ones(M, M + 1, dtype=torch.bool, device=scores.device).tril(-1)
     causal[:, M] = True  # null always allowed
     causal_mask = causal.unsqueeze(0)  # (1, M, M+1)
 
@@ -233,7 +258,7 @@ def load_stage1(device: str = "cpu") -> tuple["DepGraphTransformer", spacy.Langu
     model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) else ckpt)
     model.eval()
     spacy.prefer_gpu()
-    nlp = spacy.load("en_core_web_trf", disable=["senter", "lemmatizer"])
+    nlp = spacy.load("en_core_web_trf", disable=["senter"])
     return model, nlp
 
 
@@ -266,37 +291,36 @@ def _decode_clusters(
 
 
 def resolve_stage1(
-    text: str,
+    sent: str | spacy.tokens.Span | spacy.tokens.Doc,
     model: "DepGraphTransformer",
     nlp: spacy.Language,
     device: str = "cpu",
-) -> list[list[list[tuple[int, str]]]]:
-    doc = nlp(text)
-    results = []
+    null_margin: float = 0.0,
+) -> list[list[tuple[int, str]]]:
+    # Stage 1 is intra-sentence: the caller supplies the sentence unit (matching
+    # training, which uses dataset-provided boundaries). A raw string is parsed
+    # and treated as a single sentence — no internal segmentation.
+    if isinstance(sent, str):
+        sent = nlp(sent)
 
-    for sent in doc.sents:
-        sent_len = len(sent)
-        cat, cont, edges, etypes, nominal_positions = build_sentence_graph(sent, sent_len)
-        if len(nominal_positions) < 2:
-            results.append([])
-            continue
+    sent_len = len(sent)
+    cat, cont, edges, etypes, nominal_positions, nom_lex = build_sentence_graph(sent, sent_len)
+    if len(nominal_positions) < 2:
+        return []
 
-        cat_t = torch.from_numpy(cat).unsqueeze(0).to(device)
-        cont_t = torch.from_numpy(cont).unsqueeze(0).to(device)
-        pad_mask = torch.zeros(1, sent_len, dtype=torch.bool, device=device)
-        nom_t = torch.tensor(nominal_positions, dtype=torch.long, device=device).unsqueeze(0)
-        nom_mask = torch.ones(1, len(nominal_positions), dtype=torch.bool, device=device)
-        with torch.no_grad():
-            attn_bias = model._build_batch_attn_bias(
-                [(edges, etypes)], [sent_len], sent_len, device
-            )
-            scores = model(cat_t, cont_t, pad_mask, nom_t, nom_mask, attn_bias)
-            scores = scores.squeeze(0).cpu().numpy()
+    cat_t = torch.from_numpy(cat).unsqueeze(0).to(device)
+    cont_t = torch.from_numpy(cont).unsqueeze(0).to(device)
+    pad_mask = torch.zeros(1, sent_len, dtype=torch.bool, device=device)
+    nom_t = torch.tensor(nominal_positions, dtype=torch.long, device=device).unsqueeze(0)
+    nom_mask = torch.ones(1, len(nominal_positions), dtype=torch.bool, device=device)
+    nom_lex_t = torch.from_numpy(nom_lex).unsqueeze(0).to(device)
+    with torch.no_grad():
+        attn_bias = model._build_batch_attn_bias([(edges, etypes)], [sent_len], sent_len, device)
+        scores = model(cat_t, cont_t, pad_mask, nom_t, nom_mask, nom_lex_t, attn_bias)
+        scores = scores.squeeze(0).cpu().numpy()
 
-        clusters = _decode_clusters(nominal_positions, scores)
-        results.append([[(idx, sent[idx].text) for idx in cluster] for cluster in clusters])
-
-    return results
+    clusters = _decode_clusters(nominal_positions, scores, null_margin)
+    return [[(idx, sent[idx].text) for idx in cluster] for cluster in clusters]
 
 
 if __name__ == "__main__":
@@ -306,8 +330,5 @@ if __name__ == "__main__":
     )
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     m, n = load_stage1(dev)
-    for sent_idx, clusters in enumerate(resolve_stage1(raw, m, n, device=dev)):
-        if clusters:
-            print(f"sentence {sent_idx}:")
-            for cluster in clusters:
-                print(f"  {[w for _, w in cluster]}")
+    for cluster in resolve_stage1(raw, m, n, device=dev):
+        print(f"  {[w for _, w in cluster]}")

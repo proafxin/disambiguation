@@ -74,13 +74,22 @@ def build_stage1_data() -> list:
                 sls = _sent_lens(ds_name, sample)
                 sents = list(full_doc.sents)
 
+                # Map each gold mention span to its syntactic head token only (span.root),
+                # so one mention contributes exactly one nominal — avoids labeling the
+                # internal tokens of a multi-token mention (e.g. "New York") as coreferent.
                 mentions_by_sent: dict[int, dict[int, int]] = {}
                 cluster_counts_by_sent: dict[int, dict[int, int]] = {}
                 for cluster_id, cluster in enumerate(doc_clusters):
                     for m_sent_idx, m_start, m_end in cluster:
+                        if m_sent_idx >= len(sents):
+                            continue
+                        sent_span = sents[m_sent_idx]
+                        if m_start >= len(sent_span):
+                            continue
+                        span = sent_span[m_start:min(m_end, len(sent_span))]
+                        head_local = span.root.i - sent_span.start
                         token_map = mentions_by_sent.setdefault(m_sent_idx, {})
-                        for m_tok_idx in range(m_start, m_end):
-                            token_map[m_tok_idx] = cluster_id
+                        token_map[head_local] = cluster_id
                         counts = cluster_counts_by_sent.setdefault(m_sent_idx, {})
                         counts[cluster_id] = counts.get(cluster_id, 0) + 1
 
@@ -92,7 +101,7 @@ def build_stage1_data() -> list:
 
                     mention_map = mentions_by_sent.get(sent_idx, {})
                     sent = sents[sent_idx]
-                    cat, cont, edges, etypes, nominal_positions = build_sentence_graph(sent, sent_len)
+                    cat, cont, edges, etypes, nominal_positions, nom_lex = build_sentence_graph(sent, sent_len)
 
                     if len(nominal_positions) < 2:
                         continue
@@ -118,7 +127,7 @@ def build_stage1_data() -> list:
                     nom_idx = np.array(nominal_positions, dtype=np.int64)
                     # key = (ds_name, split_name, doc_id, sent_idx) for spaCy doc lookup
                     key = (ds_name, split_name, doc_id, sent_idx)
-                    rows.append((key, cat, cont, edges, etypes, nom_idx, gold_ante))
+                    rows.append((key, cat, cont, edges, etypes, nom_idx, nom_lex, gold_ante))
 
             n_sents_total += n_sents
             n_filtered_total += n_filtered
@@ -127,7 +136,7 @@ def build_stage1_data() -> list:
 
     print(f"\nTotal Stage 1 data: {n_filtered_total}/{n_sents_total} ({n_filtered_total*100.0/max(n_sents_total, 1):.1f}%)")
 
-    data = [(key, cat, cont, edges, etypes, ni, ga) for key, cat, cont, edges, etypes, ni, ga in rows]
+    data = rows
 
     with FEATURES_CACHE.open("wb") as f:
         pickle.dump(data, f)
@@ -184,11 +193,12 @@ def collate_batch(batch: list, device: torch.device | str, model: "DepGraphTrans
     pad_mask = np.ones((B, l_max), dtype=bool)
     nom_idx_buf = np.zeros((B, n_max), dtype=np.int64)
     nom_mask_buf = np.zeros((B, n_max), dtype=bool)
+    nom_lex_buf = np.full((B, n_max, 2), -1, dtype=np.int64)
     gold_buf = np.zeros((B, n_max, n_max + 1), dtype=np.float32)
     edge_list = []
     lengths = []
 
-    for b, (cat, cont, edges, etypes, ni, ga) in enumerate(batch):
+    for b, (cat, cont, edges, etypes, ni, nl, ga) in enumerate(batch):
         L = cat.shape[0]
         cat_buf[b, :L] = cat
         cont_buf[b, :L] = cont
@@ -196,6 +206,7 @@ def collate_batch(batch: list, device: torch.device | str, model: "DepGraphTrans
         k = len(ni)
         nom_idx_buf[b, :k] = ni
         nom_mask_buf[b, :k] = True
+        nom_lex_buf[b, :k] = nl
         gold_buf[b, :k, :k] = ga[:, :k]
         gold_buf[b, :k, n_max] = ga[:, -1]
         edge_list.append((edges, etypes))
@@ -206,10 +217,11 @@ def collate_batch(batch: list, device: torch.device | str, model: "DepGraphTrans
     pad_t = torch.from_numpy(pad_mask).to(device)
     nom_t = torch.from_numpy(nom_idx_buf).to(device)
     nom_mask_t = torch.from_numpy(nom_mask_buf).to(device)
+    nom_lex_t = torch.from_numpy(nom_lex_buf).to(device)
     gold_t = torch.from_numpy(gold_buf).to(device)
     attn_bias = model._build_batch_attn_bias(edge_list, lengths, l_max, device)
 
-    return cat_t, cont_t, pad_t, nom_t, nom_mask_t, gold_t, attn_bias
+    return cat_t, cont_t, pad_t, nom_t, nom_mask_t, nom_lex_t, gold_t, attn_bias
 
 
 def run_epoch(
@@ -223,13 +235,13 @@ def run_epoch(
     n_batches = 0
 
     for batch in tqdm(batches, desc="train" if train else "val"):
-        cat, cont, pad_mask, nom_idx, nom_mask, gold_ante, attn_bias = collate_batch(batch, device, model)
+        cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, gold_ante, attn_bias = collate_batch(batch, device, model)
 
         if train:
             optimizer.zero_grad()
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-            scores = model(cat, cont, pad_mask, nom_idx, nom_mask, attn_bias)
+            scores = model(cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, attn_bias)
             loss = mention_ranking_loss(scores, gold_ante, nom_mask)
 
         if train:
@@ -247,7 +259,7 @@ def train_stage1(
     learning_rate: float = 1e-3,
     max_epochs: int = 50,
     patience: int = 6,
-    n_folds: int = 5,
+    n_folds: int = 4,
     fold: int = 0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
@@ -269,7 +281,7 @@ def train_stage1(
     print(f"Model size: {model_bytes / 1024:.1f} KB")
 
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
 
     train_batches = make_batches(train_data)
     val_batches = make_batches(val_data_stripped)
