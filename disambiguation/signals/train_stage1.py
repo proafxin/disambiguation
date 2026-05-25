@@ -373,24 +373,18 @@ def train_stage1(
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     tb = SummaryWriter(log_dir=str(CACHE_DIR / "tensorboard" / f"stage1_{datetime.datetime.now():%Y%m%d_%H%M%S}"))
     best_val, patience_ctr, best_epoch = float("inf"), 0, 0
-
-    start_epoch = 0
+    disk_best = float("inf")
     ckpt_path = MODELS_DIR / CKPT_NAME
     if resume and ckpt_path.exists():
+        # Warm-start from saved weights, then train a fresh full cycle from epoch 0 (fresh
+        # optimizer + LR schedule). The on-disk best is overwritten only on a new all-time low,
+        # so a warm restart can never regress the saved model.
         ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        best_val = ckpt.get("best_val_loss", best_val)
-        start_epoch = ckpt.get("epoch", -1) + 1
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler"])
-        else:
-            for _ in range(start_epoch):  # older ckpt: re-advance LR schedule to resume point
-                scheduler.step()
-        print(f"Resumed from epoch {start_epoch} (best_val_loss {best_val:.6f})")
+        model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+        disk_best = ckpt.get("best_val_loss", float("inf"))
+        print(f"Warm-started from saved model (best_val_loss {disk_best:.6f}); training fresh from epoch 0")
 
-    for epoch in range(start_epoch, max_epochs):
+    for epoch in range(max_epochs):
         print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
         random.shuffle(train_batches)
         model.train()
@@ -406,17 +400,17 @@ def train_stage1(
 
         if val_loss < best_val - 1e-4:
             best_val, patience_ctr, best_epoch = val_loss, 0, epoch
-            torch.save({
-                "epoch": epoch, "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-                "best_val_loss": best_val,
-            }, MODELS_DIR / CKPT_NAME)
-            print("✓ Best model saved")
+            if val_loss < disk_best - 1e-4:
+                disk_best = val_loss
+                torch.save({"epoch": epoch, "model": model.state_dict(), "best_val_loss": disk_best}, ckpt_path)
+                print(f"✓ Best model saved (all-time best {disk_best:.6f})")
+            else:
+                print(f"Improved this run to {val_loss:.6f} (all-time best {disk_best:.6f}; not overwriting)")
         else:
             patience_ctr += 1
             print(f"No improvement. Patience: {patience_ctr}/{patience}")
             if patience_ctr >= patience:
-                print(f"\n⊘ Early stopping. Best epoch {best_epoch + 1}, val_loss {best_val:.6f}")
+                print(f"\n⊘ Early stopping. Best this run epoch {best_epoch + 1}, val_loss {best_val:.6f}")
                 break
 
     print("\n✓ Training complete")
