@@ -73,6 +73,12 @@ def build_stage1_data() -> list:
             doc_iter = iter(doc_bin.get_docs(vocab))
             is_train = split_name == "train"
 
+            cosine_path = SPACY_TRF_DIR / f"{ds_name}_{split_name}_cosine.pkl"
+            cosine_cache: dict = {}
+            if cosine_path.exists():
+                with cosine_path.open("rb") as f:
+                    cosine_cache = pickle.load(f)
+
             n_sents = 0
             n_filtered = 0
 
@@ -119,6 +125,11 @@ def build_stage1_data() -> list:
 
                     n_filtered += 1
                     M = len(nominal_positions)
+
+                    # Join the precomputed contextual cosine into pair_synt[:, :, 8].
+                    cm = cosine_cache.get((doc_id, sent_idx))
+                    if cm is not None and cm.shape[0] == M:
+                        pair_synt[:, :, 8] = cm.astype(np.float32)
 
                     # gold_ante[i, j] = 1 if nominal j is a valid antecedent for nominal i (same cluster, j < i)
                     # gold_ante[i, M] = 1 (null) if nominal i has no antecedent among j < i

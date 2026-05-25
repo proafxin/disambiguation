@@ -120,8 +120,10 @@ IDX_ENT_TYPE = CAT_INDEX["ent_type"]
 #          sent_pos (ti/(L-1)), is_sent_start, is_bracket, is_quote
 N_CONT_FULL = 14
 
-# Pairwise syntactic-relation features (precomputed per nominal pair).
+# Pairwise relation features (precomputed per nominal pair).
 # Columns: same_clause, dominates, path_len_norm, arc_appos, arc_conj,
-#          arc_poss, arc_relcl, same_head
+#          arc_poss, arc_relcl, same_head, vec_cosine
 # (signed linear order lives in the pair head as `gap`, so it is not repeated here)
-N_PAIR_SYNT = 8
+# vec_cosine [col 8] = cosine of the two head tokens' RoBERTa contextual vectors,
+#   precomputed by run_spacy_cache and joined in build_stage1_data.
+N_PAIR_SYNT = 9

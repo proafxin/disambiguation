@@ -1,21 +1,55 @@
 import gc
 import json
+import pickle
 import queue
 import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import spacy
 import spacy.tokens
 import torch
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
 
+import cupy
+
 MAX_TOKENS = 4000
 CHECKPOINT_INTERVAL = 2000
 CACHE_DIR = Path("data/spacy_trf")
 DATA_DIR = Path("data")
+NOMINAL_POS = {"PRON", "NOUN", "PROPN"}
+
+
+def _to_numpy(arr: object) -> np.ndarray:
+    if isinstance(arr, cupy.ndarray):
+        return cupy.asnumpy(arr)
+    return np.asarray(arr)
+
+
+def _compute_cosines(
+    doc: spacy.tokens.Doc, d: np.ndarray, lengths: np.ndarray, chunk_sent_lens: list[int], base_sent_idx: int
+) -> dict[int, np.ndarray]:
+    starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+    mask = lengths > 0
+    valid_starts = starts[mask]
+    valid_lengths = lengths[mask]
+    pooled = np.add.reduceat(d, valid_starts, axis=0) / valid_lengths[:, None]
+    tok = np.zeros((len(lengths), d.shape[1]), dtype=np.float32)
+    tok[mask] = pooled
+    tok /= np.maximum(np.linalg.norm(tok, axis=1, keepdims=True), 1e-8)
+
+    out: dict[int, np.ndarray] = {}
+    off = 0
+    for k, sl in enumerate(chunk_sent_lens):
+        noms = [off + j for j in range(sl) if doc[off + j].pos_ in NOMINAL_POS]
+        if len(noms) >= 2:
+            v = tok[noms]
+            out[base_sent_idx + k] = (v @ v.T).astype(np.float16)
+        off += sl
+    return out
 
 DATASETS = [
     ("preco", ["train", "validation"]),
@@ -210,9 +244,10 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     out_docs = CACHE_DIR / f"{ds_name}_{split}.spacy"
     out_meta = CACHE_DIR / f"{ds_name}_{split}_meta.json"
     ckpt_path = CACHE_DIR / f"{ds_name}_{split}_checkpoint.json"
+    cosine_path = CACHE_DIR / f"{ds_name}_{split}_cosine.pkl"
 
-    if out_docs.exists() and out_meta.exists():
-        print(f"skip {ds_name}/{split} — cache exists")
+    if out_docs.exists() and out_meta.exists() and cosine_path.exists():
+        print(f"skip {ds_name}/{split} — cache + cosine exist")
         return
     if not (DATA_DIR / ds_name).exists():
         print(f"skip {ds_name}/{split} — data dir not found")
@@ -231,9 +266,22 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     n_chunks = len(chunk_meta)
     print(f"  {n_chunks} chunks")
 
+    # Per-chunk sentence offset within its example (resume-safe sentence indexing).
+    chunk_sent_offsets: list[int] = []
+    prev_ex = None
+    running = 0
+    for c_ex_idx, c_sent_lens in chunk_meta:
+        if c_ex_idx != prev_ex:
+            running = 0
+            prev_ex = c_ex_idx
+        chunk_sent_offsets.append(running)
+        running += len(c_sent_lens)
+
     n_done, n_written_chunks = load_checkpoint(ds_name, split, ckpt_path)
 
-    q: queue.Queue = queue.Queue(maxsize=CHECKPOINT_INTERVAL + 500)
+    cosine_cache: dict[tuple[int, int], np.ndarray] = {}
+
+    q: queue.Queue = queue.Queue()
     writer = threading.Thread(
         target=writer_worker,
         args=(q, ds_name, split, ckpt_path, n_done, n_written_chunks),
@@ -241,18 +289,28 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     )
     writer.start()
 
-    pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=8)
+    pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=128)
     remaining = chunk_meta[n_done:]
 
-    for doc, (ex_idx, chunk_sent_lens) in tqdm(
+    for ci, (doc, (ex_idx, chunk_sent_lens)) in enumerate(tqdm(
         zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}"
-    ):
-        doc.tensor = doc.tensor[:0]
+    )):
+        chunk_idx = n_done + ci
+        lhs = doc._.trf_data.last_hidden_layer_state
+        d = _to_numpy(lhs.dataXd).astype(np.float32)
+        lengths = _to_numpy(lhs.lengths).astype(np.int64)
         doc._.trf_data = None
+        for sent_idx, cos in _compute_cosines(doc, d, lengths, chunk_sent_lens, chunk_sent_offsets[chunk_idx]).items():
+            cosine_cache[(ex_idx, sent_idx)] = cos
+        doc.tensor = doc.tensor[:0]
         q.put((doc, ex_idx, chunk_sent_lens))
 
     q.put(None)
     writer.join()
+
+    with cosine_path.open("wb") as f:
+        pickle.dump(cosine_cache, f)
+    print(f"  cosine: {len(cosine_cache)} sentences")
 
     merge_and_save(ds_name, split, out_docs, doc_chunk_counts)
 
