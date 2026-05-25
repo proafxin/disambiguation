@@ -2,28 +2,31 @@ import datetime
 import json
 import pickle
 import random
-import torch
-import torch.optim as optim
+
 import numpy as np
 import spacy
 import spacy.tokens
+import torch
+import torch.optim as optim
+from datasets import load_from_disk
 from pathlib import Path
-from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
 from torch.utils.tensorboard import SummaryWriter
-from datasets import load_from_disk
+from tqdm import tqdm
 
-from disambiguation.signals.abstract_features import N_CAT, N_CONT_FULL, N_PAIR_SYNT
+from disambiguation.signals.abstract_features import POS_IDS
 from disambiguation.signals.stage1_intrasentence import (
-    DepGraphTransformer, build_sentence_graph, mention_ranking_loss,
+    NominalCorefScorer, pair_bce_loss, decode_clusters,
+    NOMINAL_POS, MAX_LEN, BGE_DIM, MODELS_DIR, CKPT_NAME,
 )
 from disambiguation.signals.train_full import _clusters, _sent_lens
 
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 DATA_DIR = CACHE_DIR.parent / "data"
 SPACY_TRF_DIR = DATA_DIR / "spacy_trf"
-MODELS_DIR = CACHE_DIR / "models"
-FEATURES_CACHE = DATA_DIR / "stage1_graph_features.pkl"
+FEATURES_CACHE = DATA_DIR / "stage1_coref_features.pkl"
+BGE_CACHE = DATA_DIR / "bge_vocab.pkl"
+LEX_MASK = 0x7FFFFFFFFFFFFFFF
 
 DATASET_CONFIG = [
     ("preco", ["train", "validation"]),
@@ -32,70 +35,43 @@ DATASET_CONFIG = [
     ("conll2012", ["train", "validation", "test"]),
 ]
 
+Row = tuple  # (key, words, nom_idx, gold_cid, pos_ids, nom_lex)
+
 
 def build_stage1_data() -> list:
     if FEATURES_CACHE.exists():
         with FEATURES_CACHE.open("rb") as f:
             data = pickle.load(f)
-        if isinstance(data, tuple):
-            data = data[0] + data[1]
-            with FEATURES_CACHE.open("wb") as f:
-                pickle.dump(data, f)
-        if data and len(data[0]) != 10:
-            print("Cache format outdated — rebuilding...")
-            FEATURES_CACHE.unlink()
-            return build_stage1_data()
-        # Validate inner array shapes match current feature spec.
-        _, cat, cont, _, _, _, _, pair_synt, _, _ = data[0]
-        if cat.shape[1] != N_CAT or cont.shape[1] != N_CONT_FULL or pair_synt.shape[2] != N_PAIR_SYNT:
-            print("Feature dimensions changed — rebuilding cache...")
-            FEATURES_CACHE.unlink()
-            return build_stage1_data()
         print(f"Loaded cached features: {len(data)} rows")
         return data
 
     vocab = spacy.blank("en").vocab
-    rows = []
+    rows: list = []
     n_sents_total = 0
-    n_filtered_total = 0
+    n_kept_total = 0
 
     for ds_name, splits in DATASET_CONFIG:
         ds_dict = load_from_disk(str(DATA_DIR / ds_name))
-
         for split_name in splits:
             if split_name not in ds_dict:
                 continue
-
             split_ds = ds_dict[split_name]
-            doc_bin = spacy.tokens.DocBin().from_disk(
-                SPACY_TRF_DIR / f"{ds_name}_{split_name}.spacy"
-            )
+            doc_bin = spacy.tokens.DocBin().from_disk(SPACY_TRF_DIR / f"{ds_name}_{split_name}.spacy")
             doc_iter = iter(doc_bin.get_docs(vocab))
-            is_train = split_name == "train"
-
-            cosine_path = SPACY_TRF_DIR / f"{ds_name}_{split_name}_cosine.pkl"
-            cosine_cache: dict = {}
-            if cosine_path.exists():
-                with cosine_path.open("rb") as f:
-                    cosine_cache = pickle.load(f)
-
             n_sents = 0
-            n_filtered = 0
+            n_kept = 0
 
             for doc_id, (sample, full_doc) in enumerate(tqdm(
-                zip(split_ds, doc_iter, strict=True),
-                desc=f"{ds_name}/{split_name}",
-                total=len(split_ds),
+                zip(split_ds, doc_iter, strict=True), desc=f"{ds_name}/{split_name}", total=len(split_ds),
             )):
                 doc_clusters = _clusters(ds_name, sample)
                 sls = _sent_lens(ds_name, sample)
                 sents = list(full_doc.sents)
 
-                # Map each gold mention span to its syntactic head token only (span.root),
-                # so one mention contributes exactly one nominal — avoids labeling the
-                # internal tokens of a multi-token mention (e.g. "New York") as coreferent.
+                # Map each gold mention span to its syntactic head token (span.root),
+                # so one mention = one nominal head. cluster_id is document-level.
                 mentions_by_sent: dict[int, dict[int, int]] = {}
-                cluster_counts_by_sent: dict[int, dict[int, int]] = {}
+                counts_by_sent: dict[int, dict[int, int]] = {}
                 for cluster_id, cluster in enumerate(doc_clusters):
                     for m_sent_idx, m_start, m_end in cluster:
                         if m_sent_idx >= len(sents):
@@ -103,436 +79,331 @@ def build_stage1_data() -> list:
                         sent_span = sents[m_sent_idx]
                         if m_start >= len(sent_span):
                             continue
-                        span = sent_span[m_start:min(m_end, len(sent_span))]
-                        head_local = span.root.i - sent_span.start
-                        token_map = mentions_by_sent.setdefault(m_sent_idx, {})
-                        token_map[head_local] = cluster_id
-                        counts = cluster_counts_by_sent.setdefault(m_sent_idx, {})
-                        counts[cluster_id] = counts.get(cluster_id, 0) + 1
+                        head_local = sent_span[m_start:min(m_end, len(sent_span))].root.i - sent_span.start
+                        mentions_by_sent.setdefault(m_sent_idx, {})[head_local] = cluster_id
+                        c = counts_by_sent.setdefault(m_sent_idx, {})
+                        c[cluster_id] = c.get(cluster_id, 0) + 1
 
-                for sent_idx, sent_len in enumerate(sls):
+                for sent_idx, _ in enumerate(sls):
                     n_sents += 1
-                    counts = cluster_counts_by_sent.get(sent_idx, {})
-                    if not any(c >= 2 for c in counts.values()):
+                    counts = counts_by_sent.get(sent_idx, {})
+                    if not any(v >= 2 for v in counts.values()):
                         continue
-
-                    mention_map = mentions_by_sent.get(sent_idx, {})
+                    if sent_idx >= len(sents):
+                        continue
                     sent = sents[sent_idx]
-                    cat, cont, edges, etypes, nominal_positions, nom_lex, pair_synt = build_sentence_graph(sent, sent_len)
-
+                    L = min(len(sent), MAX_LEN)
+                    nominal_positions = [ti for ti in range(L) if sent[ti].pos_ in NOMINAL_POS]
                     if len(nominal_positions) < 2:
                         continue
 
-                    n_filtered += 1
-                    M = len(nominal_positions)
-
-                    # Join the precomputed contextual cosine into pair_synt[:, :, 8].
-                    cm = cosine_cache.get((doc_id, sent_idx))
-                    if cm is not None and cm.shape[0] == M:
-                        pair_synt[:, :, 8] = cm.astype(np.float32)
-
-                    # gold_ante[i, j] = 1 if nominal j is a valid antecedent for nominal i (same cluster, j < i)
-                    # gold_ante[i, M] = 1 (null) if nominal i has no antecedent among j < i
-                    gold_ante = np.zeros((M, M + 1), dtype=np.float32)
-                    for i, ti in enumerate(nominal_positions):
-                        ci = mention_map.get(ti)
-                        has_ante = False
-                        for j in range(i):
-                            tj = nominal_positions[j]
-                            cj = mention_map.get(tj)
-                            if ci is not None and cj is not None and ci == cj:
-                                gold_ante[i, j] = 1.0
-                                has_ante = True
-                        if not has_ante:
-                            gold_ante[i, M] = 1.0
-
+                    mention_map = mentions_by_sent.get(sent_idx, {})
+                    words = [sent[ti].text for ti in range(L)]
                     nom_idx = np.array(nominal_positions, dtype=np.int64)
-                    # Full gold clusters (all gold-mention heads, any POS) for this
-                    # sentence, so evaluation needs no spaCy doc re-read.
-                    gold_groups: dict[int, set[int]] = {}
-                    for hl, cid in mention_map.items():
-                        gold_groups.setdefault(cid, set()).add(hl)
-                    gold_clusters = [frozenset(m) for m in gold_groups.values() if len(m) >= 2]
-                    # key = (ds_name, split_name, doc_id, sent_idx); retained for kfold grouping
+                    gold_cid = np.array([mention_map.get(ti, -1) for ti in nominal_positions], dtype=np.int64)
+                    _, cnts = np.unique(gold_cid[gold_cid >= 0], return_counts=True)
+                    if cnts.size == 0 or cnts.max() < 2:  # need >=2 nominal heads sharing a cluster
+                        continue
+                    pos_ids = np.array([POS_IDS.get(sent[ti].pos_, len(POS_IDS)) for ti in nominal_positions], dtype=np.int64)
+                    nom_lex = np.array(
+                        [[sent[ti].lemma & LEX_MASK, sent[ti].lower & LEX_MASK] for ti in nominal_positions],
+                        dtype=np.int64,
+                    )
                     key = (ds_name, split_name, doc_id, sent_idx)
-                    rows.append((key, cat, cont, edges, etypes, nom_idx, nom_lex, pair_synt, gold_ante, gold_clusters))
+                    rows.append((key, words, nom_idx, gold_cid, pos_ids, nom_lex))
+                    n_kept += 1
 
             n_sents_total += n_sents
-            n_filtered_total += n_filtered
-            rate = n_filtered * 100.0 / max(n_sents, 1)
-            print(f"  {ds_name}/{split_name}: {n_filtered}/{n_sents} ({rate:.1f}%)")
+            n_kept_total += n_kept
+            print(f"  {ds_name}/{split_name}: {n_kept}/{n_sents} sentences kept")
 
-    print(f"\nTotal Stage 1 data: {n_filtered_total}/{n_sents_total} ({n_filtered_total*100.0/max(n_sents_total, 1):.1f}%)")
-
-    data = rows
-
+    print(f"\nTotal: {n_kept_total}/{n_sents_total} sentences")
     with FEATURES_CACHE.open("wb") as f:
-        pickle.dump(data, f)
+        pickle.dump(rows, f)
     print(f"Cached features to {FEATURES_CACHE.name}")
+    return rows
 
-    return data
+
+def build_bge_cache(data: list) -> tuple[dict, np.ndarray]:
+    if BGE_CACHE.exists():
+        with BGE_CACHE.open("rb") as f:
+            word2id, matrix = pickle.load(f)
+        print(f"Loaded BGE cache: {len(word2id)} words")
+        return word2id, matrix
+
+    from sentence_transformers import SentenceTransformer
+
+    vocab = sorted({w for _, words, *_ in data for w in words})
+    print(f"Encoding {len(vocab)} unique words with BGE...")
+    bge = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    embs = bge.encode(vocab, normalize_embeddings=True, batch_size=512, show_progress_bar=True)
+    matrix = np.asarray(embs, dtype=np.float32)
+    word2id = {w: i for i, w in enumerate(vocab)}
+    with BGE_CACHE.open("wb") as f:
+        pickle.dump((word2id, matrix.astype(np.float16)), f)
+    print(f"Cached BGE vocab to {BGE_CACHE.name}")
+    return word2id, matrix
 
 
 def kfold_split(data: list, n_folds: int, fold: int) -> tuple[list, list]:
     rng = np.random.default_rng(42)
     by_ds: dict[str, list[int]] = {}
     for i, (key, *_) in enumerate(data):
-        by_ds.setdefault(key[0], []).append(i)  # key[0] = ds_name
-
+        by_ds.setdefault(key[0], []).append(i)
     train_idx, val_idx = [], []
     for indices in by_ds.values():
         perm = rng.permutation(len(indices))
         fold_size = len(perm) // n_folds
-        val_start = fold * fold_size
-        val_end = val_start + fold_size
+        lo, hi = fold * fold_size, fold * fold_size + fold_size
         for j, idx in enumerate(perm):
-            (val_idx if val_start <= j < val_end else train_idx).append(indices[idx])
-
-    # training strips key + gold_clusters; val keeps the full row for evaluation
-    return [data[i][1:-1] for i in train_idx], [data[i] for i in val_idx]
+            (val_idx if lo <= j < hi else train_idx).append(indices[idx])
+    return [data[i] for i in train_idx], [data[i] for i in val_idx]
 
 
-def make_batches(data: list, max_tokens: int = 32768, max_rows: int = 512) -> list[list]:
-    order = sorted(range(len(data)), key=lambda i: data[i][0].shape[0])
-    batches = []
-    cur: list[int] = []
-    cur_tmax = 0
+def make_batches(data: list, max_pairs: int = 20000, max_rows: int = 128) -> list[list]:
+    # Memory is driven by the (B, M, M, ...) pairwise tensor, so budget by M^2 (nominals), not tokens.
+    order = sorted(range(len(data)), key=lambda i: len(data[i][2]))
+    batches, cur, m_max = [], [], 0
     for i in order:
-        tlen = data[i][0].shape[0]
-        tmax = max(cur_tmax, tlen)
-        if cur and ((len(cur) + 1) * tmax > max_tokens or len(cur) + 1 > max_rows):
+        m = len(data[i][2])
+        nm = max(m_max, m)
+        if cur and ((len(cur) + 1) * nm * nm > max_pairs or len(cur) + 1 > max_rows):
             batches.append([data[j] for j in cur])
-            cur = []
-            cur_tmax = 0
+            cur, m_max = [], 0
         cur.append(i)
-        cur_tmax = max(cur_tmax, tlen)
+        m_max = max(m_max, m)
     if cur:
         batches.append([data[j] for j in cur])
     return batches
 
 
-def collate_batch(batch: list, device: torch.device | str, model: "DepGraphTransformer") -> tuple:
+def collate_batch(batch: list, word2id: dict, matrix: np.ndarray, device: str) -> tuple:
     B = len(batch)
-    l_max = max(item[0].shape[0] for item in batch)
-    n_max = max(len(item[4]) for item in batch)
+    L_max = max(len(r[1]) for r in batch)
+    M_max = max(len(r[2]) for r in batch)
+    bge_buf = np.zeros((B, L_max, BGE_DIM), dtype=np.float32)
+    pad = np.ones((B, L_max), dtype=bool)
+    nom_buf = np.zeros((B, M_max), dtype=np.int64)
+    nom_mask = np.zeros((B, M_max), dtype=bool)
+    gold = np.zeros((B, M_max, M_max), dtype=np.float32)
 
-    cat_buf = np.zeros((B, l_max, N_CAT), dtype=np.int64)
-    cont_buf = np.zeros((B, l_max, N_CONT_FULL), dtype=np.float32)
-    pad_mask = np.ones((B, l_max), dtype=bool)
-    nom_idx_buf = np.zeros((B, n_max), dtype=np.int64)
-    nom_mask_buf = np.zeros((B, n_max), dtype=bool)
-    nom_lex_buf = np.full((B, n_max, 2), -1, dtype=np.int64)
-    synt_buf = np.zeros((B, n_max, n_max, N_PAIR_SYNT), dtype=np.float32)
-    gold_buf = np.zeros((B, n_max, n_max + 1), dtype=np.float32)
-    edge_list = []
-    lengths = []
+    for b, (_, words, nom_idx, gold_cid, _, _) in enumerate(batch):
+        L = len(words)
+        ids = np.fromiter((word2id[w] for w in words), dtype=np.int64, count=L)
+        bge_buf[b, :L] = matrix[ids]
+        pad[b, :L] = False
+        k = len(nom_idx)
+        nom_buf[b, :k] = nom_idx
+        nom_mask[b, :k] = True
+        same = (gold_cid[:, None] == gold_cid[None, :]) & (gold_cid[:, None] >= 0)
+        gold[b, :k, :k] = same.astype(np.float32)
 
-    for b, (cat, cont, edges, etypes, ni, nl, ps, ga) in enumerate(batch):
-        L = cat.shape[0]
-        cat_buf[b, :L] = cat
-        cont_buf[b, :L] = cont
-        pad_mask[b, :L] = False
-        k = len(ni)
-        nom_idx_buf[b, :k] = ni
-        nom_mask_buf[b, :k] = True
-        nom_lex_buf[b, :k] = nl
-        synt_buf[b, :k, :k] = ps
-        gold_buf[b, :k, :k] = ga[:, :k]
-        gold_buf[b, :k, n_max] = ga[:, -1]
-        edge_list.append((edges, etypes))
-        lengths.append(L)
-
-    cat_t = torch.from_numpy(cat_buf).to(device)
-    cont_t = torch.from_numpy(cont_buf).to(device)
-    pad_t = torch.from_numpy(pad_mask).to(device)
-    nom_t = torch.from_numpy(nom_idx_buf).to(device)
-    nom_mask_t = torch.from_numpy(nom_mask_buf).to(device)
-    nom_lex_t = torch.from_numpy(nom_lex_buf).to(device)
-    synt_t = torch.from_numpy(synt_buf).to(device)
-    gold_t = torch.from_numpy(gold_buf).to(device)
-    attn_bias = model._build_batch_attn_bias(edge_list, lengths, l_max, device)
-
-    return cat_t, cont_t, pad_t, nom_t, nom_mask_t, nom_lex_t, synt_t, gold_t, attn_bias
+    return (
+        torch.from_numpy(bge_buf).to(device),
+        torch.from_numpy(pad).to(device),
+        torch.from_numpy(nom_buf).to(device),
+        torch.from_numpy(nom_mask).to(device),
+        torch.from_numpy(gold).to(device),
+    )
 
 
-def run_epoch(
-    model: DepGraphTransformer,
-    batches: list,
-    optimizer: torch.optim.Optimizer | None,
-    device: torch.device | str,
-) -> float:
+def run_epoch(model, batches, word2id, matrix, optimizer, device) -> float:
     train = optimizer is not None
-    total_loss = 0.0
-    n_batches = 0
-
+    total, n = 0.0, 0
     for batch in tqdm(batches, desc="train" if train else "val"):
-        cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, pair_synt, gold_ante, attn_bias = collate_batch(batch, device, model)
-
+        bge, pad, nom_idx, nom_mask, gold = collate_batch(batch, word2id, matrix, device)
         if train:
             optimizer.zero_grad()
-
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-            scores = model(cat, cont, pad_mask, nom_idx, nom_mask, nom_lex, pair_synt, attn_bias)
-            loss = mention_ranking_loss(scores, gold_ante, nom_mask)
-
+            logits = model(bge, pad, nom_idx, nom_mask)
+            loss = pair_bce_loss(logits, gold, nom_mask)
         if train:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-
-        total_loss += loss.item()
-        n_batches += 1
-
-    return total_loss / max(n_batches, 1)
+        total += loss.item()
+        n += 1
+    return total / max(n, 1)
 
 
-# Mentions are head-token indices (sentence-relative), matching the training unit
-# (gold spans mapped to span.root). Clusters are sets of those indices.
-Cluster = frozenset[int]
+Cluster = frozenset
 
 
-def _uf_find(parent: list[int], x: int) -> int:
-    while parent[x] != x:
-        parent[x] = parent[parent[x]]
-        x = parent[x]
-    return x
-
-
-def _pred_clusters(nom_idx: np.ndarray, scores: np.ndarray, null_margin: float) -> list[Cluster]:
-    M = len(nom_idx)
-    parent = list(range(M))
-    for i in range(M):
-        masked = scores[i].copy()
-        masked[i:M] = float("-inf")
-        masked[M] -= null_margin
-        ante = int(np.argmax(masked))
-        if ante < M:
-            parent[_uf_find(parent, i)] = _uf_find(parent, ante)
+def _gold_clusters(nom_idx: np.ndarray, gold_cid: np.ndarray) -> list:
     groups: dict[int, list[int]] = {}
-    for i in range(M):
-        groups.setdefault(_uf_find(parent, i), []).append(int(nom_idx[i]))
-    return [frozenset(members) for members in groups.values() if len(members) >= 2]
+    for k, cid in enumerate(gold_cid):
+        if cid >= 0:
+            groups.setdefault(int(cid), []).append(int(nom_idx[k]))
+    return [frozenset(m) for m in groups.values() if len(m) >= 2]
 
 
-def _muc(pred: list[Cluster], gold: list[Cluster]) -> tuple[int, int, int, int]:
-    def _score(a: list[Cluster], b: list[Cluster]) -> tuple[int, int]:
-        b_mentions = set().union(*b) if b else set()
+def _links(clusters: list) -> set:
+    pairs = set()
+    for c in clusters:
+        members = sorted(c)
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                pairs.add((members[i], members[j]))
+    return pairs
+
+
+def _muc(pred: list, gold: list) -> tuple:
+    def score(a, b):
+        bm = set().union(*b) if b else set()
         num = den = 0
         for c in a:
             if len(c) < 2:
                 continue
             den += len(c) - 1
-            # partitions = response clusters intersecting c + c-mentions absent
-            # from the response (each counts as its own singleton partition)
-            partitions = sum(1 for bc in b if c & bc) + len(c - b_mentions)
-            num += len(c) - partitions
+            num += len(c) - (sum(1 for bc in b if c & bc) + len(c - bm))
         return num, den
-    pn, pd = _score(pred, gold)
-    rn, rd = _score(gold, pred)
+    pn, pd = score(pred, gold)
+    rn, rd = score(gold, pred)
     return pn, pd, rn, rd
 
 
-def _b3(pred: list[Cluster], gold: list[Cluster]) -> tuple[float, float, int]:
-    pred_map: dict[int, Cluster] = {m: c for c in pred for m in c}
-    gold_map: dict[int, Cluster] = {m: c for c in gold for m in c}
-    mentions = set(pred_map) | set(gold_map)
+def _b3(pred: list, gold: list) -> tuple:
+    pm = {m: c for c in pred for m in c}
+    gm = {m: c for c in gold for m in c}
+    mentions = set(pm) | set(gm)
     if not mentions:
         return 0.0, 0.0, 0
-    p = sum(len(pred_map.get(m, frozenset({m})) & gold_map.get(m, frozenset({m}))) / len(pred_map.get(m, frozenset({m}))) for m in mentions)
-    r = sum(len(pred_map.get(m, frozenset({m})) & gold_map.get(m, frozenset({m}))) / len(gold_map.get(m, frozenset({m}))) for m in mentions)
+    p = sum(len(pm.get(m, frozenset({m})) & gm.get(m, frozenset({m}))) / len(pm.get(m, frozenset({m}))) for m in mentions)
+    r = sum(len(pm.get(m, frozenset({m})) & gm.get(m, frozenset({m}))) / len(gm.get(m, frozenset({m}))) for m in mentions)
     return p, r, len(mentions)
 
 
-def _ceafe(pred: list[Cluster], gold: list[Cluster]) -> tuple[float, float]:
+def _ceafe(pred: list, gold: list) -> tuple:
     if not pred or not gold:
         return 0.0, 0.0
     cost = np.array([[2 * len(p & g) / (len(p) + len(g)) for g in gold] for p in pred])
     ri, ci = linear_sum_assignment(-cost)
-    score = cost[ri, ci].sum()
-    return score / len(pred), score / len(gold)
+    s = cost[ri, ci].sum()
+    return s / len(pred), s / len(gold)
 
 
 def _f1(p: float, r: float) -> float:
     return 2 * p * r / (p + r) if p + r > 0 else 0.0
 
 
-def _collect_predictions(model: DepGraphTransformer, device: str, val_data: list) -> list[tuple[np.ndarray, np.ndarray, list[Cluster]]]:
-    # Run the model once per val sentence; gold clusters are cached, so no doc re-read.
-    collected: list[tuple[np.ndarray, np.ndarray, list[Cluster]]] = []
+def _collect_predictions(model, val_data, word2id, matrix, device) -> list:
+    collected = []
     for row in tqdm(val_data, desc="eval"):
-        key, cat, cont, edges, etypes, nom_idx, nom_lex, pair_synt, gold_ante, gold_clusters = row
-        M = len(nom_idx)
+        _, words, nom_idx, gold_cid, _, _ = row
+        L = len(words)
+        ids = np.fromiter((word2id[w] for w in words), dtype=np.int64, count=L)
+        bge = torch.from_numpy(matrix[ids][None]).to(device)
+        pad = torch.zeros(1, L, dtype=torch.bool, device=device)
+        nom_t = torch.from_numpy(nom_idx[None]).to(device)
+        nom_mask = torch.ones(1, len(nom_idx), dtype=torch.bool, device=device)
         with torch.inference_mode():
-            attn_bias = model._build_batch_attn_bias([(edges, etypes)], [cat.shape[0]], cat.shape[0], device)
-            scores = model(
-                torch.from_numpy(cat).unsqueeze(0).to(device),
-                torch.from_numpy(cont).unsqueeze(0).to(device),
-                torch.zeros(1, cat.shape[0], dtype=torch.bool, device=device),
-                torch.from_numpy(nom_idx).unsqueeze(0).to(device),
-                torch.ones(1, M, dtype=torch.bool, device=device),
-                torch.from_numpy(nom_lex).unsqueeze(0).to(device),
-                torch.from_numpy(pair_synt).unsqueeze(0).to(device),
-                attn_bias,
-            )
-        scores_np = scores.squeeze(0).cpu().numpy()
-        collected.append((nom_idx, scores_np, gold_clusters))
+            logits = model(bge, pad, nom_t, nom_mask).squeeze(0).float().cpu().numpy()
+        collected.append((nom_idx, logits, _gold_clusters(nom_idx, gold_cid)))
     return collected
 
 
-def _score_predictions(collected: list[tuple[np.ndarray, np.ndarray, list[Cluster]]], null_margin: float, linking_only: bool = False) -> dict[str, float]:
-    muc_pn = muc_pd = muc_rn = muc_rd = 0
-    b3_p = b3_r = 0.0
-    b3_n = 0
-    ceafe_p = ceafe_r = 0.0
-    n_sents = 0
-
-    for nom_idx, scores_np, gold in collected:
-        if linking_only:
-            noms = {int(x) for x in nom_idx}
-            gold = [c & noms for c in gold]
-            gold = [c for c in gold if len(c) >= 2]
-        pred = _pred_clusters(nom_idx, scores_np, null_margin)
-
-        pn, pd, rn, rd = _muc(pred, gold)
-        muc_pn += pn; muc_pd += pd; muc_rn += rn; muc_rd += rd
-
+def _score(collected: list, threshold: float) -> dict:
+    muc = [0, 0, 0, 0]
+    b3p = b3r = 0.0
+    b3n = 0
+    cep = cer = 0.0
+    n = 0
+    glink = plink = tp = 0
+    for nom_idx, logits, gold in collected:
+        pred = decode_clusters(nom_idx, logits, threshold)
+        a, b, c, d = _muc(pred, gold)
+        muc[0] += a; muc[1] += b; muc[2] += c; muc[3] += d
         bp, br, bn = _b3(pred, gold)
-        b3_p += bp; b3_r += br; b3_n += bn
-
+        b3p += bp; b3r += br; b3n += bn
         cp, cr = _ceafe(pred, gold)
-        ceafe_p += cp; ceafe_r += cr
-        n_sents += 1
+        cep += cp; cer += cr; n += 1
+        gl, pl = _links(gold), _links(pred)
+        glink += len(gl); plink += len(pl); tp += len(gl & pl)
+    muc_f = _f1(muc[0] / max(muc[1], 1), muc[2] / max(muc[3], 1))
+    b3_f = _f1(b3p / max(b3n, 1), b3r / max(b3n, 1))
+    ce_f = _f1(cep / max(n, 1), cer / max(n, 1))
+    return {
+        "link_p": tp / max(plink, 1), "link_r": tp / max(glink, 1), "link_f": _f1(tp / max(plink, 1), tp / max(glink, 1)),
+        "MUC": muc_f, "B3": b3_f, "CEAFe": ce_f, "CoNLL": (muc_f + b3_f + ce_f) / 3,
+    }
 
-    muc_f = _f1(muc_pn / max(muc_pd, 1), muc_rn / max(muc_rd, 1))
-    b3_f = _f1(b3_p / max(b3_n, 1), b3_r / max(b3_n, 1))
-    ceafe_f = _f1(ceafe_p / max(n_sents, 1), ceafe_r / max(n_sents, 1))
-    return {"MUC": muc_f, "B3": b3_f, "CEAFe": ceafe_f, "CoNLL": (muc_f + b3_f + ceafe_f) / 3, "n_sents": n_sents}
 
-
-def run_stage1_eval(model: DepGraphTransformer, device: str, val_data: list) -> None:
-    # end_to_end: gold = all gold-mention heads (includes non-nominal heads the model
-    #   cannot reach — the honest metric with the POS recall ceiling baked in).
-    # linking_only: gold restricted to nominals the model actually scores — isolates
-    #   clustering quality from candidate-set recall.
-    collected = _collect_predictions(model, device, val_data)
-    margins = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
-    results: dict[str, list] = {}
-    for label, linking_only in [("end_to_end", False), ("linking_only", True)]:
-        print(f"\n=== {label} null margin sweep ===")
-        rows = []
-        for null_margin in margins:
-            m = _score_predictions(collected, null_margin, linking_only)
-            m["null_margin"] = null_margin
-            rows.append(m)
-            print(f"  null_margin={null_margin:.1f}  MUC={m['MUC']:.4f}  B3={m['B3']:.4f}  CEAFe={m['CEAFe']:.4f}  CoNLL={m['CoNLL']:.4f}  ({m['n_sents']} sents)")
-        results[label] = rows
+def run_eval(model, val_data, word2id, matrix, device) -> None:
+    collected = _collect_predictions(model, val_data, word2id, matrix, device)
+    print("\n=== threshold sweep ===")
+    print(f"{'thr':>5} {'linkP':>6} {'linkR':>6} {'linkF':>6} {'MUC':>6} {'B3':>6} {'CEAFe':>6} {'CoNLL':>6}")
+    results = []
+    for thr in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
+        m = _score(collected, thr)
+        m["threshold"] = thr
+        results.append(m)
+        print(f"{thr:>5.1f} {m['link_p']:>6.3f} {m['link_r']:>6.3f} {m['link_f']:>6.3f} {m['MUC']:>6.3f} {m['B3']:>6.3f} {m['CEAFe']:>6.3f} {m['CoNLL']:>6.3f}")
     with (MODELS_DIR / "stage1_eval_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
 
 def train_stage1(
     learning_rate: float = 1e-3,
-    max_epochs: int = 20,
+    max_epochs: int = 15,
     patience: int = 6,
     n_folds: int = 4,
     fold: int = 0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
-    print("\nBuilding Stage 1 training data...")
+    print("\nBuilding Stage 1 data...")
     data = build_stage1_data()
+    word2id, matrix = build_bge_cache(data)
     print(f"Total rows: {len(data)}")
 
     train_data, val_data = kfold_split(data, n_folds, fold)
     print(f"Fold {fold}/{n_folds}: {len(train_data)} train, {len(val_data)} val")
-    val_data_stripped = [row[1:-1] for row in val_data]
 
-    print(f"\nTraining Stage 1 on {device}")
-    model = DepGraphTransformer(d_model=256, n_heads=8, n_layers=4).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    model_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    print(f"\n=== Model Complexity ===")
-    print(f"Parameters: {total_params:,}")
-    print(f"Model size: {model_bytes / 1024:.1f} KB")
+    print(f"\nTraining on {device}")
+    model = NominalCorefScorer().to(device)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {total:,}")
 
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
-
     train_batches = make_batches(train_data)
-    val_batches = make_batches(val_data_stripped)
+    val_batches = make_batches(val_data)
     print(f"Train batches: {len(train_batches)}, Val batches: {len(val_batches)}")
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = MODELS_DIR / "stage1_train_log.json"
-    tb_dir = CACHE_DIR / "tensorboard" / f"stage1_{datetime.datetime.now():%Y%m%d_%H%M%S}"
-    writer = SummaryWriter(log_dir=str(tb_dir))
-    history: list[dict] = []
-    best_val_loss = float("inf")
-    patience_counter = 0
-    best_epoch = 0
-    min_delta = 1e-4
-    start_epoch = 0
+    tb = SummaryWriter(log_dir=str(CACHE_DIR / "tensorboard" / f"stage1_{datetime.datetime.now():%Y%m%d_%H%M%S}"))
+    best_val, patience_ctr, best_epoch = float("inf"), 0, 0
 
-    ckpt_path = MODELS_DIR / "stage1_graph_transformer.pt"
-    if ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location=device)
-        if isinstance(ckpt, dict) and "model" in ckpt:
-            model.load_state_dict(ckpt["model"])
-            optimizer.load_state_dict(ckpt["optimizer"])
-            scheduler.load_state_dict(ckpt["scheduler"])
-            best_val_loss = ckpt["best_val_loss"]
-            start_epoch = ckpt["epoch"] + 1
-            print(f"Resumed from epoch {ckpt['epoch'] + 1}, best_val_loss={best_val_loss:.6f}")
-
-    for epoch in range(start_epoch, max_epochs):
+    for epoch in range(max_epochs):
         print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
         random.shuffle(train_batches)
-
         model.train()
-        avg_loss = run_epoch(model, train_batches, optimizer, device)
-        print(f"Loss: {avg_loss:.6f}")
-
+        tr_loss = run_epoch(model, train_batches, word2id, matrix, optimizer, device)
+        print(f"Loss: {tr_loss:.6f}")
         model.eval()
         with torch.inference_mode():
-            avg_val_loss = run_epoch(model, val_batches, None, device)
-        print(f"Val loss: {avg_val_loss:.6f}")
-
+            val_loss = run_epoch(model, val_batches, word2id, matrix, None, device)
+        print(f"Val loss: {val_loss:.6f}")
         scheduler.step()
+        tb.add_scalar("loss/train", tr_loss, epoch + 1)
+        tb.add_scalar("loss/val", val_loss, epoch + 1)
 
-        history.append({"epoch": epoch + 1, "train_loss": avg_loss, "val_loss": avg_val_loss})
-        with log_path.open("w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
-        writer.add_scalar("loss/train", avg_loss, epoch + 1)
-        writer.add_scalar("loss/val", avg_val_loss, epoch + 1)
-
-        if avg_val_loss < best_val_loss - min_delta:
-            best_val_loss = avg_val_loss
-            patience_counter = 0
-            best_epoch = epoch
-            torch.save({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "best_val_loss": best_val_loss,
-            }, MODELS_DIR / "stage1_graph_transformer.pt")
+        if val_loss < best_val - 1e-4:
+            best_val, patience_ctr, best_epoch = val_loss, 0, epoch
+            torch.save({"epoch": epoch, "model": model.state_dict(), "best_val_loss": best_val}, MODELS_DIR / CKPT_NAME)
             print("✓ Best model saved")
         else:
-            patience_counter += 1
-            print(f"No improvement. Patience: {patience_counter}/{patience}")
-            if patience_counter >= patience:
-                print(f"\n⊘ Early stopping at epoch {epoch + 1}")
-                print(f"Best: epoch {best_epoch + 1}, val_loss: {best_val_loss:.6f}")
+            patience_ctr += 1
+            print(f"No improvement. Patience: {patience_ctr}/{patience}")
+            if patience_ctr >= patience:
+                print(f"\n⊘ Early stopping. Best epoch {best_epoch + 1}, val_loss {best_val:.6f}")
                 break
 
     print("\n✓ Training complete")
-    writer.close()
-
-    if ckpt_path.exists():
-        best = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(best["model"] if isinstance(best, dict) and "model" in best else best)
+    tb.close()
+    ckpt = torch.load(MODELS_DIR / CKPT_NAME, map_location=device)
+    model.load_state_dict(ckpt["model"])
     model.eval()
-    run_stage1_eval(model, device, val_data)
+    run_eval(model, val_data, word2id, matrix, device)
 
 
 if __name__ == "__main__":

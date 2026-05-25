@@ -11,30 +11,17 @@ import numpy as np
 import spacy
 import spacy.tokens
 import torch
+import torch.nn.functional as F
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
-
-import cupy
 
 MAX_TOKENS = 4000
 CHECKPOINT_INTERVAL = 2000
 CACHE_DIR = Path("data/spacy_trf")
 DATA_DIR = Path("data")
 NOMINAL_POS = {"PRON", "NOUN", "PROPN"}
-
-
-def _compute_cosines(
-    tok: np.ndarray, is_nominal: np.ndarray, chunk_sent_lens: list[int], base_sent_idx: int
-) -> dict[int, np.ndarray]:
-    out: dict[int, np.ndarray] = {}
-    off = 0
-    for k, sl in enumerate(chunk_sent_lens):
-        noms = np.where(is_nominal[off:off + sl])[0] + off
-        if len(noms) >= 2:
-            v = tok[noms]
-            out[base_sent_idx + k] = (v @ v.T).astype(np.float16)
-        off += sl
-    return out
+TRF_BATCH_SIZE = 32
+M_MAX = 320
 
 DATASETS = [
     ("preco", ["train", "validation"]),
@@ -61,7 +48,7 @@ def load_nlp() -> spacy.Language:
     trf = nlp.get_pipe("transformer")
     ws = find_strided_spans(trf.model)
     if ws:
-        ws.attrs["batch_size"] = 32
+        ws.attrs["batch_size"] = TRF_BATCH_SIZE
         print(f"  with_strided_spans batch_size: {ws.attrs['batch_size']}")
     print(f"  pipeline: {nlp.pipe_names}")
     return nlp
@@ -225,6 +212,18 @@ def writer_worker(
     tmp.rename(cp)
 
 
+def flush_batch(
+    batch: list[tuple[int, int, int, torch.Tensor]],
+    sim_buf: torch.Tensor,
+    cosine_cache: dict,
+) -> None:
+    for i, (ex_idx, sent_idx, m, nom_vecs) in enumerate(batch):
+        sim_buf[i, :m, :m] = nom_vecs @ nom_vecs.T
+    cpu = sim_buf[:len(batch)].to(torch.float16).cpu()
+    for i, (ex_idx, sent_idx, m, _) in enumerate(batch):
+        cosine_cache[(ex_idx, sent_idx)] = cpu[i, :m, :m].numpy()
+
+
 def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     out_docs = CACHE_DIR / f"{ds_name}_{split}.spacy"
     out_meta = CACHE_DIR / f"{ds_name}_{split}_meta.json"
@@ -251,7 +250,6 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
     n_chunks = len(chunk_meta)
     print(f"  {n_chunks} chunks")
 
-    # Per-chunk sentence offset within its example (resume-safe sentence indexing).
     chunk_sent_offsets: list[int] = []
     prev_ex = None
     running = 0
@@ -264,6 +262,9 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
 
     n_done, n_written_chunks = load_checkpoint(ds_name, split, ckpt_path)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sim_buf = torch.zeros(TRF_BATCH_SIZE, M_MAX, M_MAX, dtype=torch.float32, device=device)
+    nom_ids = {nlp.vocab.strings[p] for p in NOMINAL_POS}
     cosine_cache: dict[tuple[int, int], np.ndarray] = {}
 
     q: queue.Queue = queue.Queue()
@@ -276,37 +277,45 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
 
     pipe = nlp.pipe(doc_stream(ds, ds_name, nlp, chunk_meta, n_done), batch_size=128)
     remaining = chunk_meta[n_done:]
+    pending: list[tuple[int, int, int, torch.Tensor]] = []
 
     for ci, (doc, (ex_idx, chunk_sent_lens)) in enumerate(tqdm(
         zip(pipe, remaining, strict=True), total=len(remaining), desc=f"{ds_name}/{split}"
     )):
         chunk_idx = n_done + ci
         lhs = doc._.trf_data.last_hidden_layer_state
-        raw = lhs.dataXd
-        lengths = (cupy.asnumpy(lhs.lengths) if isinstance(lhs.lengths, cupy.ndarray) else np.asarray(lhs.lengths)).astype(np.int64)
+        lengths = torch.utils.dlpack.from_dlpack(lhs.lengths).to(torch.long) if hasattr(lhs.lengths, '__dlpack__') else torch.as_tensor(np.asarray(lhs.lengths), dtype=torch.long, device=device)
+        raw = torch.utils.dlpack.from_dlpack(lhs.dataXd) if hasattr(lhs.dataXd, '__dlpack__') else torch.as_tensor(np.asarray(lhs.dataXd), dtype=torch.float32, device=device)
+        raw = raw.to(torch.float32)
+
+        n_tokens = lengths.shape[0]
+        tok_ids = torch.repeat_interleave(torch.arange(n_tokens, device=device), lengths)
+        tok = torch.zeros(n_tokens, raw.shape[1], dtype=torch.float32, device=device)
+        tok.scatter_add_(0, tok_ids.unsqueeze(1).expand(-1, raw.shape[1]), raw)
+        tok = F.normalize(tok, dim=1)
+
         pos_arr = doc.to_array("POS")
-        nom_ids = {doc.vocab.strings[p] for p in NOMINAL_POS}
-        is_nominal = np.isin(pos_arr, list(nom_ids))
-        wp_starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
-        n_wp = int(raw.shape[0])
-        tok_ids = np.repeat(np.arange(len(lengths)), lengths)
-        nom_wp_mask = is_nominal[tok_ids]
-        if isinstance(raw, cupy.ndarray):
-            nom_rows = cupy.asnumpy(raw[cupy.asarray(nom_wp_mask)]).astype(np.float32)
-        else:
-            nom_rows = np.asarray(raw)[nom_wp_mask].astype(np.float32)
-        nom_tok_ids = tok_ids[nom_wp_mask]
-        tok = np.zeros((len(lengths), nom_rows.shape[1]), dtype=np.float32)
-        np.add.at(tok, nom_tok_ids, nom_rows)
-        nom_lengths = lengths[is_nominal]
-        nom_counts = np.maximum(nom_lengths, 1)
-        tok[is_nominal] /= nom_counts[:, None]
-        tok /= np.maximum(np.linalg.norm(tok, axis=1, keepdims=True), 1e-8)
+        is_nominal = torch.as_tensor(np.isin(pos_arr, list(nom_ids)), device=device)
+
+        off = 0
+        base = chunk_sent_offsets[chunk_idx]
+        for k, sl in enumerate(chunk_sent_lens):
+            nom_mask = is_nominal[off:off + sl]
+            m = int(nom_mask.sum())
+            if m >= 2:
+                v = F.normalize(tok[off:off + sl][nom_mask], dim=1)
+                pending.append((ex_idx, base + k, m, v.clone()))
+                if len(pending) == TRF_BATCH_SIZE:
+                    flush_batch(pending, sim_buf, cosine_cache)
+                    pending.clear()
+            off += sl
+
         doc._.trf_data = None
-        for sent_idx, cos in _compute_cosines(tok, is_nominal, chunk_sent_lens, chunk_sent_offsets[chunk_idx]).items():
-            cosine_cache[(ex_idx, sent_idx)] = cos
         doc.tensor = doc.tensor[:0]
         q.put((doc, ex_idx, chunk_sent_lens))
+
+    if pending:
+        flush_batch(pending, sim_buf, cosine_cache)
 
     q.put(None)
     writer.join()
