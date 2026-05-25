@@ -288,22 +288,19 @@ def process_split(nlp: spacy.Language, ds_name: str, split: str) -> None:
         nom_ids = {doc.vocab.strings[p] for p in NOMINAL_POS}
         is_nominal = np.isin(pos_arr, list(nom_ids))
         wp_starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
-        nom_wp_mask = np.zeros(int(raw.shape[0]), dtype=bool)
-        for ti in np.where(is_nominal)[0]:
-            s, ln = int(wp_starts[ti]), int(lengths[ti])
-            if ln > 0:
-                nom_wp_mask[s:s + ln] = True
+        n_wp = int(raw.shape[0])
+        tok_ids = np.repeat(np.arange(len(lengths)), lengths)
+        nom_wp_mask = is_nominal[tok_ids]
         if isinstance(raw, cupy.ndarray):
             nom_rows = cupy.asnumpy(raw[cupy.asarray(nom_wp_mask)]).astype(np.float32)
         else:
             nom_rows = np.asarray(raw)[nom_wp_mask].astype(np.float32)
-        nom_lengths = lengths[is_nominal]
-        nom_wp_starts = np.concatenate([[0], np.cumsum(nom_lengths)[:-1]]) if len(nom_lengths) else np.array([], dtype=np.int64)
+        nom_tok_ids = tok_ids[nom_wp_mask]
         tok = np.zeros((len(lengths), nom_rows.shape[1]), dtype=np.float32)
-        for ii, ti in enumerate(np.where(is_nominal)[0]):
-            ln = int(nom_lengths[ii])
-            if ln > 0:
-                tok[ti] = nom_rows[int(nom_wp_starts[ii]):int(nom_wp_starts[ii]) + ln].mean(axis=0)
+        np.add.at(tok, nom_tok_ids, nom_rows)
+        nom_lengths = lengths[is_nominal]
+        nom_counts = np.maximum(nom_lengths, 1)
+        tok[is_nominal] /= nom_counts[:, None]
         tok /= np.maximum(np.linalg.norm(tok, axis=1, keepdims=True), 1e-8)
         doc._.trf_data = None
         for sent_idx, cos in _compute_cosines(tok, is_nominal, chunk_sent_lens, chunk_sent_offsets[chunk_idx]).items():
