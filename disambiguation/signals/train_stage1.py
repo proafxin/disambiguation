@@ -128,6 +128,7 @@ def build_bge_cache(data: list) -> tuple[dict, np.ndarray]:
     if BGE_CACHE.exists():
         with BGE_CACHE.open("rb") as f:
             word2id, matrix = pickle.load(f)
+        matrix = matrix.astype(np.float32)  # stored f16 to save disk; use f32 in-memory (Linear weights are f32)
         print(f"Loaded BGE cache: {len(word2id)} words")
         return word2id, matrix
 

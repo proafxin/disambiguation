@@ -10,7 +10,7 @@ from disambiguation.signals.train_stage1 import (
     build_stage1_data, build_bge_cache, kfold_split, _gold_clusters, _links, _muc, _b3, _ceafe, _f1,
 )
 
-THRESHOLD = 0.5  # decode threshold (pick from the eval sweep, not re-tuned here)
+THRESHOLD = 0.4  # decode threshold (CoNLL-optimal from the eval sweep)
 ID2POS = {v: k for k, v in POS_IDS.items()}
 NOM_POS = {"PRON", "NOUN", "PROPN"}
 
