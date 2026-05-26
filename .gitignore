@@ -222,3 +222,5 @@ models/*.pt
 RESEARCH.md
 cache/*
 log*.txt
+paper/*
+STAGE2_DESIGN.md
