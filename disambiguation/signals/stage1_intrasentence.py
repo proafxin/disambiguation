@@ -9,10 +9,11 @@ import torch.nn.functional as F
 MODELS_DIR = Path(__file__).parent.parent.parent / "cache" / "models"
 NOMINAL_POS = {"PRON", "NOUN", "PROPN"}
 
-BGE_DIM = 384
+BGE_DIM = 1024
 D_MODEL = 384
 MAX_LEN = 64
 CKPT_NAME = "stage1_nominal_coref.pt"
+BGE_MODEL = "BAAI/bge-large-en-v1.5"
 
 
 class NominalCorefScorer(nn.Module):
@@ -118,7 +119,7 @@ def load_stage1(device: str = "cpu") -> tuple["NominalCorefScorer", spacy.Langua
     model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt)
     model.eval()
     nlp = spacy.load("en_core_web_lg")
-    bge = SentenceTransformer("BAAI/bge-small-en-v1.5", device=device)
+    bge = SentenceTransformer(BGE_MODEL, device=device)
     return model, nlp, bge
 
 

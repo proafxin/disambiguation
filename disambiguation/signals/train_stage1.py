@@ -17,7 +17,7 @@ from tqdm import tqdm
 from disambiguation.signals.abstract_features import POS_IDS
 from disambiguation.signals.stage1_intrasentence import (
     NominalCorefScorer, pair_bce_loss, decode_clusters,
-    NOMINAL_POS, MAX_LEN, BGE_DIM, MODELS_DIR, CKPT_NAME,
+    NOMINAL_POS, MAX_LEN, BGE_DIM, MODELS_DIR, CKPT_NAME, BGE_MODEL,
 )
 from disambiguation.signals.train_full import _clusters, _sent_lens
 
@@ -135,7 +135,7 @@ def build_bge_cache(data: list) -> tuple[dict, np.ndarray]:
 
     vocab = sorted({w for _, words, *_ in data for w in words})
     print(f"Encoding {len(vocab)} unique words with BGE...")
-    bge = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    bge = SentenceTransformer(BGE_MODEL)
     embs = bge.encode(vocab, normalize_embeddings=True, batch_size=512, show_progress_bar=True)
     matrix = np.asarray(embs, dtype=np.float32)
     word2id = {w: i for i, w in enumerate(vocab)}
