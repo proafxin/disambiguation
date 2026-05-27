@@ -89,25 +89,32 @@ def pair_bce_loss(
     return F.binary_cross_entropy_with_logits(logits[valid], gold[valid])
 
 
-def _uf_find(parent: list[int], x: int) -> int:
-    while parent[x] != x:
-        parent[x] = parent[parent[x]]
-        x = parent[x]
-    return x
-
 
 def decode_clusters(nom_idx: np.ndarray, logits: np.ndarray, threshold: float) -> list[list[int]]:
-    # Link nominal pairs whose P(coref) >= threshold, then take connected components.
+    # Complete-linkage via sorted-pair greedy: sort all pairs by prob descending, merge a pair
+    # only if the direct score clears threshold AND every existing cross-cluster pair also clears.
+    # Equivalent to complete-linkage agglomerative but O(n^2 log n) instead of O(n^3).
     M = len(nom_idx)
-    prob = 1.0 / (1.0 + np.exp(-logits))
-    parent = list(range(M))
-    for i in range(M):
-        for j in range(i):
-            if prob[i, j] >= threshold:
-                parent[_uf_find(parent, i)] = _uf_find(parent, j)
+    prob = (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+    label = np.arange(M, dtype=np.int32)
+    ii, jj = np.triu_indices(M, k=1)
+    scores = prob[ii, jj]
+    order = np.argsort(scores)[::-1]
+    for k in order:
+        p = scores[k]
+        if p < threshold:
+            break
+        a, b = int(ii[k]), int(jj[k])
+        ca, cb = int(label[a]), int(label[b])
+        if ca == cb:
+            continue
+        a_mask = label == ca
+        b_mask = label == cb
+        if prob[np.ix_(a_mask, b_mask)].min() >= threshold:
+            label[b_mask] = ca
     groups: dict[int, list[int]] = {}
     for i in range(M):
-        groups.setdefault(_uf_find(parent, i), []).append(int(nom_idx[i]))
+        groups.setdefault(int(label[i]), []).append(int(nom_idx[i]))
     return [frozenset(g) for g in groups.values() if len(g) >= 2]
 
 
