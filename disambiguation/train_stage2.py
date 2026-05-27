@@ -141,13 +141,12 @@ def _raw_from_doc(
         se = w2s.get(gw_end + 1, last + 1)
         sent_sub_off.append(ss)
         sent_sub_len.append(max(1, se - ss))
-    span_sub, width, mention_sent_off, mention_sent_len = [], [], [], []
+    span_sub, mention_sent_off, mention_sent_len = [], [], []
     for si, a, b in spans:
         gw_start, gw_end = offsets[si] + a, offsets[si] + b - 1
         ss = w2s.get(gw_start, min(gw_start, last))
         se = min(max(w2s.get(gw_end + 1, len(content_ids)) - 1, ss), last)
         span_sub.append((ss, se))
-        width.append(b - a)
         mention_sent_off.append(sent_sub_off[si])
         mention_sent_len.append(sent_sub_len[si])
     order = sorted(range(len(spans)), key=lambda k: span_sub[k])
@@ -160,7 +159,6 @@ def _raw_from_doc(
         [mention_surfaces[k] for k in order],
         content_ids,
         [span_sub[k] for k in order],
-        [width[k] for k in order],
         [mention_sent_off[k] for k in order],
         [mention_sent_len[k] for k in order],
     )
@@ -297,7 +295,6 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
         mention_surfaces,
         content_ids,
         span_sub,
-        width,
         sent_sub_offsets,
         sent_sub_lengths,
     ) in raw:
@@ -310,7 +307,6 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
                 "cluster_id": np.asarray(cluster_id, dtype=np.int64),
                 "content_ids": content_ids,
                 "span_sub": np.asarray(span_sub, dtype=np.int64),
-                "width": np.asarray(width, dtype=np.int64),
                 "sent_sub_offsets": np.asarray(sent_sub_offsets, dtype=np.int64),
                 "sent_sub_lengths": np.asarray(sent_sub_lengths, dtype=np.int64),
                 "mention_bge": np.stack([surf2bge[s] for s in mention_surfaces]).astype(np.float32),
@@ -392,8 +388,7 @@ def doc_scores(
         ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
         ctx_vecs = compute_mention_ctx_vecs(ctx, d["span_sub"], d["sent_sub_offsets"], d["sent_sub_lengths"])
     mention_bge = torch.from_numpy(d["mention_bge"]).to(device).float()
-    width = torch.from_numpy(d["width"]).to(device)
-    reps = mention_enc(ctx_vecs[:, 0], ctx_vecs[:, 1], mention_bge, width)
+    reps = mention_enc(ctx_vecs[:, 0], ctx_vecs[:, 1], mention_bge)
     sent_ids = _sent_id(d, device)
     scores, ante_mask = scorer(reps, sent_ids)
     return scores, ante_mask, scorer.null_bias

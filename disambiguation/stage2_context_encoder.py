@@ -9,8 +9,6 @@ BACKBONE = "roberta-large"
 BGE_DIM = 1024
 CTX_DIM = 1024  # roberta-large hidden size
 D_MODEL = 512  # mention representation dim
-WIDTH_DIM = 32  # span-width embedding dim
-MAX_WIDTH = 30  # span widths >= this share the last bucket
 CONTENT = 128  # context subtokens per sliding window
 STRIDE = 64  # window step; overlap = CONTENT - STRIDE = 64
 WINDOW = CONTENT + 2  # + <s>/</s>
@@ -69,14 +67,15 @@ def encode_document_ctx(
 def compute_mention_ctx_vecs(
     ctx: torch.Tensor, span_sub: np.ndarray, sent_offsets: np.ndarray, sent_lengths: np.ndarray
 ) -> torch.Tensor:
-    # Extract (ctx_start, ctx_sent_mean) for each mention — the two non-redundant RoBERTa vectors.
-    # Returns (M, 2, CTX_DIM).
+    # Returns (M, 4, CTX_DIM): ctx_start, ctx_end, ctx_mean, ctx_sent_mean.
     M = len(span_sub)
-    out = torch.zeros(M, 2, ctx.shape[1], dtype=ctx.dtype, device=ctx.device)
-    for k, (s, _e) in enumerate(span_sub):
+    out = torch.zeros(M, 4, ctx.shape[1], dtype=ctx.dtype, device=ctx.device)
+    for k, (s, e) in enumerate(span_sub):
         out[k, 0] = ctx[int(s)]
+        out[k, 1] = ctx[int(e)]
+        out[k, 2] = ctx[int(s) : int(e) + 1].mean(0)
         so, sl = int(sent_offsets[k]), int(sent_lengths[k])
-        out[k, 1] = ctx[so : so + sl].mean(0)
+        out[k, 3] = ctx[so : so + sl].mean(0)
     return out
 
 
@@ -92,27 +91,16 @@ def gather_spans_tensor(ctx: torch.Tensor, span_sub: np.ndarray, device: str) ->
 class MentionEncoder(nn.Module):
     def __init__(self, ctx_dim: int = CTX_DIM, bge_dim: int = BGE_DIM, d_model: int = D_MODEL, dropout: float = 0.3):
         super().__init__()
-        # Two genuine channels per the decomposition thesis:
-        #   ctx_start:     RoBERTa token vector for the mention (contextual binding channel)
-        #   ctx_sent_mean: mean of all RoBERTa vectors in the mention's sentence
-        #                  (sentence-level context -- disambiguates pronouns across sentences)
-        #   width_emb:     span width
-        #   mention_bge:   BGE embedding of the mention surface (semantic identity channel)
-        # ctx_end and ctx_mean are dropped: for the median 1-token span they equal ctx_start,
-        # adding only noise. Two channels, no redundancy.
-        self.width_emb = nn.Embedding(MAX_WIDTH, WIDTH_DIM)
-        self.proj1 = nn.Linear(ctx_dim * 2 + WIDTH_DIM + bge_dim, d_model)
-        self.norm = nn.LayerNorm(d_model)
-        self.proj2 = nn.Linear(d_model, d_model)
+        self.ctx_proj = nn.Linear(ctx_dim * 2, d_model)
+        self.bge_proj = nn.Linear(bge_dim, d_model)
         self.drop = nn.Dropout(dropout)
 
     def forward(
-        self, ctx_start: torch.Tensor, ctx_sent_mean: torch.Tensor, mention_bge: torch.Tensor, width: torch.Tensor
+        self, ctx_start: torch.Tensor, ctx_sent_mean: torch.Tensor, mention_bge: torch.Tensor
     ) -> torch.Tensor:
-        w = self.width_emb(width.clamp(max=MAX_WIDTH - 1))
-        g = torch.cat([ctx_start, ctx_sent_mean, w, mention_bge], dim=-1)
-        h = self.drop(F.relu(self.norm(self.proj1(g))))
-        return self.drop(F.relu(self.proj2(h)))  # (M, d_model)
+        ctx = self.drop(F.relu(self.ctx_proj(torch.cat([ctx_start, ctx_sent_mean], dim=-1))))
+        bge = self.drop(F.relu(self.bge_proj(mention_bge)))
+        return ctx + bge  # (M, d_model)
 
 
 class AntecedentScorer(nn.Module):
