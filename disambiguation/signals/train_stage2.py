@@ -24,7 +24,7 @@ CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 DATA_DIR = CACHE_DIR.parent / "data"
 SPACY_TRF_DIR = DATA_DIR / "spacy_trf"
 NOM_CACHE = DATA_DIR / "stage2_conll_nominals_v4.pkl"
-SPAN_CTX_CACHE = DATA_DIR / "stage2_span_ctx_v4.pkl"  # (M, 4, CTX_DIM) float16 — start/end/mean/sent_mean
+SPAN_CTX_CACHE = DATA_DIR / "stage2_span_ctx_v4"  # directory of per-doc .npy files — never accumulates in RAM
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
 CONLL_SPLITS = ["train", "validation", "test"]
 PRECO_SUBSAMPLE = 5000  # RAM cap: (M,4,1024) ctx_vecs needs more space; 5000 docs fits safely in ~10 GB
@@ -263,36 +263,46 @@ def gather_spans_np(ctx: np.ndarray, span_sub: np.ndarray, sent_offsets: np.ndar
     return out
 
 
+def _ctx_path(i: int) -> Path:
+    return SPAN_CTX_CACHE / f"{i:06d}.npy"
+
+
 def precompute_span_ctx(encoder, docs, cls_id, sep_id, device) -> None:
-    # Precomputes (start, end, mean) ctx vecs per mention as (M, 3, CTX_DIM) float16.
-    # Saves as a single pickle (~4.5 GB) — fits in RAM alongside the nom cache.
-    # Drops content_ids and span_sub from each doc after use: not needed during training.
-    if SPAN_CTX_CACHE.exists():
-        with SPAN_CTX_CACHE.open("rb") as f:
-            cache = pickle.load(f)
-        for d in docs:
-            d["ctx_vecs"] = cache[d["name"]].astype(np.float32)
+    # Writes each doc's (M, 4, CTX_DIM) float16 ctx_vecs to an individual .npy file immediately.
+    # Never accumulates more than one doc in RAM. Resumable: skips already-written files.
+    SPAN_CTX_CACHE.mkdir(parents=True, exist_ok=True)
+    n_existing = sum(1 for i in range(len(docs)) if _ctx_path(i).exists())
+    if n_existing == len(docs):
+        for i, d in enumerate(docs):
+            d["ctx_vecs"] = np.load(_ctx_path(i)).astype(np.float32)
             d.pop("content_ids", None)
             d.pop("span_sub", None)
             d.pop("sent_sub_offsets", None)
             d.pop("sent_sub_lengths", None)
-        print(f"Loaded cached span ctx: {len(cache)} docs")
+        print(f"Loaded cached span ctx: {n_existing} docs")
         return
+    if n_existing > 0:
+        print(f"Resuming span ctx precompute from doc {n_existing}/{len(docs)}...")
     encoder.eval()
-    cache = {}
     with torch.inference_mode():
-        for d in tqdm(docs, desc="span ctx precompute"):
+        for i, d in enumerate(tqdm(docs, desc="span ctx precompute")):
+            p = _ctx_path(i)
+            if p.exists():
+                d["ctx_vecs"] = np.load(p).astype(np.float32)
+                d.pop("content_ids", None)
+                d.pop("span_sub", None)
+                d.pop("sent_sub_offsets", None)
+                d.pop("sent_sub_lengths", None)
+                continue
             ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device).float().cpu().numpy()
             ctx_vecs = gather_spans_np(ctx, d["span_sub"], d["sent_sub_offsets"], d["sent_sub_lengths"])
+            np.save(p, ctx_vecs)
             d["ctx_vecs"] = ctx_vecs.astype(np.float32)
-            cache[d["name"]] = ctx_vecs
             d.pop("content_ids", None)
             d.pop("span_sub", None)
             d.pop("sent_sub_offsets", None)
             d.pop("sent_sub_lengths", None)
-    with SPAN_CTX_CACHE.open("wb") as f:
-        pickle.dump(cache, f)
-    print(f"Cached span ctx to {SPAN_CTX_CACHE.name}")
+    print(f"Cached span ctx to {SPAN_CTX_CACHE.name}/")
 
 
 def _sent_id(d: dict, device=None):
