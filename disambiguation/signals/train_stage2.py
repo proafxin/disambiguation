@@ -280,6 +280,15 @@ def train_stage2(
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     tb = SummaryWriter(log_dir=str(CACHE_DIR / "tensorboard" / f"stage2_{tag}_{datetime.datetime.now():%Y%m%d_%H%M%S}"))
     best_f1, patience_ctr = -1.0, 0
+    disk_best_f1 = -1.0
+    if ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device)
+        mention_enc.load_state_dict(ckpt["mention_enc"])
+        scorer.load_state_dict(ckpt["scorer"])
+        if enc_loop is not None and "encoder" in ckpt:
+            enc_loop.load_state_dict(ckpt["encoder"])
+        disk_best_f1 = ckpt.get("best_val_f1", -1.0)
+        print(f"Warm-started from {ckpt_path.name} (best_val_f1 {disk_best_f1:.4f}); training fresh from epoch 0")
 
     for epoch in range(max_epochs):
         print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
@@ -304,11 +313,15 @@ def train_stage2(
             tb.add_scalar(f"val_f1/{k}", val[k], epoch + 1)
         if val["CoNLL"] > best_f1 + 1e-4:
             best_f1, patience_ctr = val["CoNLL"], 0
-            state = {"mention_enc": mention_enc.state_dict(), "scorer": scorer.state_dict(), "best_val_f1": best_f1}
-            if enc_loop is not None:
-                state["encoder"] = enc_loop.state_dict()
-            torch.save(state, ckpt_path)
-            print(f"✓ Best model saved (val CoNLL F1 {best_f1:.4f})")
+            if best_f1 > disk_best_f1 + 1e-4:
+                disk_best_f1 = best_f1
+                state = {"mention_enc": mention_enc.state_dict(), "scorer": scorer.state_dict(), "best_val_f1": disk_best_f1}
+                if enc_loop is not None:
+                    state["encoder"] = enc_loop.state_dict()
+                torch.save(state, ckpt_path)
+                print(f"✓ Best model saved (val CoNLL F1 {disk_best_f1:.4f})")
+            else:
+                print(f"Improved this run to {best_f1:.4f} (all-time best {disk_best_f1:.4f}; not overwriting)")
         else:
             patience_ctr += 1
             print(f"No improvement. Patience: {patience_ctr}/{patience}")
@@ -323,7 +336,7 @@ def train_stage2(
     scorer.load_state_dict(ckpt["scorer"])
     mention_enc.eval()
     scorer.eval()
-    if enc_loop is not None:
+    if enc_loop is not None and "encoder" in ckpt:
         enc_loop.load_state_dict(ckpt["encoder"])
         enc_loop.eval()
     print("\n=== Test ===")
