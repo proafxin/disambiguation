@@ -65,16 +65,20 @@ def encode_document_ctx(content_ids: np.ndarray, encoder: "ContextEncoder", cls_
     return F.normalize(ctx, p=2, dim=-1)
 
 
-def compute_mention_ctx_vecs(ctx: torch.Tensor, span_sub: np.ndarray) -> torch.Tensor:
-    # Extract (ctx_start, ctx_end, ctx_mean) for each mention from the document context tensor.
-    # Returns (M, 3, CTX_DIM) float32. ctx_mean is the uniform mean over the span's subtokens.
+def compute_mention_ctx_vecs(ctx: torch.Tensor, span_sub: np.ndarray, sent_offsets: np.ndarray, sent_lengths: np.ndarray) -> torch.Tensor:
+    # Extract (ctx_start, ctx_end, ctx_mean, ctx_sent_mean) for each mention.
+    # ctx_sent_mean = mean of all tokens in the mention's sentence -- disambiguates
+    # pronouns that are identical at the token level but appear in different sentence contexts.
+    # Returns (M, 4, CTX_DIM).
     M = len(span_sub)
-    out = torch.zeros(M, 3, ctx.shape[1], dtype=ctx.dtype, device=ctx.device)
+    out = torch.zeros(M, 4, ctx.shape[1], dtype=ctx.dtype, device=ctx.device)
     for k, (s, e) in enumerate(span_sub):
-        s, e = int(s), min(int(e) + 1, ctx.shape[0])  # e is inclusive in span_sub
-        out[k, 0] = ctx[s]           # start
-        out[k, 1] = ctx[e - 1]       # end
-        out[k, 2] = ctx[s:e].mean(0) # mean
+        s, e = int(s), min(int(e) + 1, ctx.shape[0])
+        out[k, 0] = ctx[s]
+        out[k, 1] = ctx[e - 1]
+        out[k, 2] = ctx[s:e].mean(0)
+        so, sl = int(sent_offsets[k]), int(sent_lengths[k])
+        out[k, 3] = ctx[so:so + sl].mean(0)
     return out
 
 
@@ -90,18 +94,18 @@ def gather_spans_tensor(ctx: torch.Tensor, span_sub: np.ndarray, device: str) ->
 class MentionEncoder(nn.Module):
     def __init__(self, ctx_dim: int = CTX_DIM, bge_dim: int = BGE_DIM, d_model: int = D_MODEL, dropout: float = 0.3):
         super().__init__()
-        # Span rep: [ctx_start; ctx_end; ctx_mean; width_emb] ++ mention-surface BGE.
-        # ctx_start/end/mean are precomputed from frozen RoBERTa (mean pooling over span subtokens).
-        # Mean pooling replaces learned attention: median span is 1 subtoken so learned attn is degenerate,
-        # and precomputing 3 fixed vectors per mention lets everything fit in RAM with no disk I/O.
+        # Span rep: [ctx_start; ctx_end; ctx_mean; ctx_sent_mean; width_emb] ++ mention-surface BGE.
+        # ctx_sent_mean is the mean of all RoBERTa token vectors in the mention's sentence.
+        # This disambiguates pronouns: 'he' in the Obama sentence vs 'he' in the Clinton sentence
+        # have identical token vectors but different sentence-mean vectors.
         self.width_emb = nn.Embedding(MAX_WIDTH, WIDTH_DIM)
-        self.proj = nn.Linear(ctx_dim * 3 + WIDTH_DIM + bge_dim, d_model)
+        self.proj = nn.Linear(ctx_dim * 4 + WIDTH_DIM + bge_dim, d_model)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, ctx_start: torch.Tensor, ctx_end: torch.Tensor, ctx_mean: torch.Tensor,
-                mention_bge: torch.Tensor, width: torch.Tensor) -> torch.Tensor:
+                ctx_sent_mean: torch.Tensor, mention_bge: torch.Tensor, width: torch.Tensor) -> torch.Tensor:
         w = self.width_emb(width.clamp(max=MAX_WIDTH - 1))
-        g = torch.cat([ctx_start, ctx_end, ctx_mean, w, mention_bge], dim=-1)
+        g = torch.cat([ctx_start, ctx_end, ctx_mean, ctx_sent_mean, w, mention_bge], dim=-1)
         return self.drop(F.relu(self.proj(g)))  # (M, d_model)
 
 

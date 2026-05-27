@@ -23,11 +23,12 @@ from disambiguation.signals.stage2_context_encoder import (
 CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 DATA_DIR = CACHE_DIR.parent / "data"
 SPACY_TRF_DIR = DATA_DIR / "spacy_trf"
-NOM_CACHE = DATA_DIR / "stage2_conll_nominals_v3.pkl"
-SPAN_CTX_CACHE = DATA_DIR / "stage2_span_ctx_v3.pkl"  # (M, 3, CTX_DIM) float16 per doc — fits in RAM
+NOM_CACHE = DATA_DIR / "stage2_conll_nominals_v4.pkl"
+SPAN_CTX_CACHE = DATA_DIR / "stage2_span_ctx_v4.pkl"  # (M, 4, CTX_DIM) float16 — start/end/mean/sent_mean
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
 CONLL_SPLITS = ["train", "validation", "test"]
-PRECO_SUBSAMPLE = 4000  # preco has 36k train docs; cap to avoid dominating
+PRECO_SUBSAMPLE = 5000  # RAM cap: (M,4,1024) ctx_vecs needs more space; 5000 docs fits safely in ~10 GB
+RANDOM_SEED = 42
 
 
 def _doc_structure_conll(sample: dict, spacy_doc: spacy.tokens.Doc) -> tuple:
@@ -120,13 +121,24 @@ def _raw_from_doc(name: str, split: str, sents: list, offsets: list, spans: list
     words_flat = [w for s in sents for w in s]
     content_ids, w2s = _word_to_subtok(words_flat, tokenizer)
     last = len(content_ids) - 1
-    span_sub, width = [], []
+    # Sentence subtoken offsets and lengths: for sent_mean computation
+    sent_sub_off, sent_sub_len = [], []
+    for si, sent in enumerate(sents):
+        gw_start = offsets[si]
+        gw_end = offsets[si] + len(sent) - 1
+        ss = w2s.get(gw_start, min(gw_start, last))
+        se = w2s.get(gw_end + 1, last + 1)
+        sent_sub_off.append(ss)
+        sent_sub_len.append(max(1, se - ss))
+    span_sub, width, mention_sent_off, mention_sent_len = [], [], [], []
     for si, a, b in spans:
         gw_start, gw_end = offsets[si] + a, offsets[si] + b - 1
         ss = w2s.get(gw_start, min(gw_start, last))
         se = min(max(w2s.get(gw_end + 1, len(content_ids)) - 1, ss), last)
         span_sub.append((ss, se))
         width.append(b - a)
+        mention_sent_off.append(sent_sub_off[si])
+        mention_sent_len.append(sent_sub_len[si])
     order = sorted(range(len(spans)), key=lambda k: span_sub[k])
     return (
         name, split, sents,
@@ -136,6 +148,8 @@ def _raw_from_doc(name: str, split: str, sents: list, offsets: list, spans: list
         content_ids,
         [span_sub[k] for k in order],
         [width[k] for k in order],
+        [mention_sent_off[k] for k in order],
+        [mention_sent_len[k] for k in order],
     )
 
 
@@ -179,6 +193,7 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
     # --- PreCo (train subsampled, validation) ---
     preco_ds = load_from_disk(str(DATA_DIR / "preco"))
     preco_train = list(preco_ds["train"])
+    random.seed(RANDOM_SEED)
     random.shuffle(preco_train)
     for sample in tqdm(preco_train[:PRECO_SUBSAMPLE], desc="preco/train"):
         sents = sample["sentences"]
@@ -215,13 +230,15 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
     del bge
 
     docs = []
-    for name, split, sents, spans, cluster_id, mention_surfaces, content_ids, span_sub, width in raw:
+    for name, split, sents, spans, cluster_id, mention_surfaces, content_ids, span_sub, width, sent_sub_offsets, sent_sub_lengths in raw:
         docs.append({
             "name": name, "split": split, "sentences": sents, "spans": spans,
             "cluster_id": np.asarray(cluster_id, dtype=np.int64),
             "content_ids": content_ids,
             "span_sub": np.asarray(span_sub, dtype=np.int64),
             "width": np.asarray(width, dtype=np.int64),
+            "sent_sub_offsets": np.asarray(sent_sub_offsets, dtype=np.int64),
+            "sent_sub_lengths": np.asarray(sent_sub_lengths, dtype=np.int64),
             "mention_bge": np.stack([surf2bge[s] for s in mention_surfaces]).astype(np.float32),
         })
     with NOM_CACHE.open("wb") as f:
@@ -230,15 +247,19 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
     return docs
 
 
-def gather_spans_np(ctx: np.ndarray, span_sub: np.ndarray) -> np.ndarray:
-    # Extract (start, end, mean) context vectors per mention. Returns (M, 3, CTX_DIM) float16.
+def gather_spans_np(ctx: np.ndarray, span_sub: np.ndarray, sent_offsets: np.ndarray, sent_lengths: np.ndarray) -> np.ndarray:
+    # Extract (start, end, mean, sent_mean) context vectors per mention.
+    # sent_mean = mean of all ctx tokens in the mention's sentence.
+    # Returns (M, 4, CTX_DIM) float16.
     M = len(span_sub)
-    out = np.zeros((M, 3, ctx.shape[1]), dtype=np.float16)
+    out = np.zeros((M, 4, ctx.shape[1]), dtype=np.float16)
     for k, (s, e) in enumerate(span_sub):
-        s, e = int(s), min(int(e) + 1, ctx.shape[0])  # e inclusive -> exclusive
+        s, e = int(s), min(int(e) + 1, ctx.shape[0])
         out[k, 0] = ctx[s]
         out[k, 1] = ctx[e - 1]
         out[k, 2] = ctx[s:e].mean(0)
+        so, sl = int(sent_offsets[k]), int(sent_lengths[k])
+        out[k, 3] = ctx[so:so + sl].mean(0)
     return out
 
 
@@ -253,6 +274,8 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device) -> None:
             d["ctx_vecs"] = cache[d["name"]].astype(np.float32)
             d.pop("content_ids", None)
             d.pop("span_sub", None)
+            d.pop("sent_sub_offsets", None)
+            d.pop("sent_sub_lengths", None)
         print(f"Loaded cached span ctx: {len(cache)} docs")
         return
     encoder.eval()
@@ -260,11 +283,13 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device) -> None:
     with torch.inference_mode():
         for d in tqdm(docs, desc="span ctx precompute"):
             ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device).float().cpu().numpy()
-            ctx_vecs = gather_spans_np(ctx, d["span_sub"])  # (M, 3, CTX_DIM) float16
+            ctx_vecs = gather_spans_np(ctx, d["span_sub"], d["sent_sub_offsets"], d["sent_sub_lengths"])
             d["ctx_vecs"] = ctx_vecs.astype(np.float32)
             cache[d["name"]] = ctx_vecs
             d.pop("content_ids", None)
             d.pop("span_sub", None)
+            d.pop("sent_sub_offsets", None)
+            d.pop("sent_sub_lengths", None)
     with SPAN_CTX_CACHE.open("wb") as f:
         pickle.dump(cache, f)
     print(f"Cached span ctx to {SPAN_CTX_CACHE.name}")
@@ -277,16 +302,15 @@ def _sent_id(d: dict, device=None):
 
 def doc_scores(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device) -> tuple[torch.Tensor, torch.Tensor]:
     if encoder is None:
-        # frozen: ctx_vecs already in RAM as (M, 3, CTX_DIM) float32
-        ctx_vecs = torch.from_numpy(d["ctx_vecs"]).to(device)  # (M, 3, CTX_DIM)
+        ctx_vecs = torch.from_numpy(d["ctx_vecs"]).to(device)  # (M, 4, CTX_DIM)
     else:
         ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
-        ctx_vecs = compute_mention_ctx_vecs(ctx, d["span_sub"])  # (M, 3, CTX_DIM)
+        ctx_vecs = compute_mention_ctx_vecs(ctx, d["span_sub"], d["sent_sub_offsets"], d["sent_sub_lengths"])
     mention_bge = torch.from_numpy(d["mention_bge"]).to(device).float()
     width = torch.from_numpy(d["width"]).to(device)
-    reps = mention_enc(ctx_vecs[:, 0], ctx_vecs[:, 1], ctx_vecs[:, 2], mention_bge, width)
+    reps = mention_enc(ctx_vecs[:, 0], ctx_vecs[:, 1], ctx_vecs[:, 2], ctx_vecs[:, 3], mention_bge, width)
     sent_ids = _sent_id(d, device)
-    return scorer(reps, sent_ids)  # (scores, ante_mask)
+    return scorer(reps, sent_ids)
 
 
 def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence=False) -> float:
@@ -357,6 +381,12 @@ def train_stage2(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
     print(f"\nBuilding Stage 2 nominal data... (finetune={finetune})")
+    print("Evaluation setting: gold mentions (not end-to-end; not comparable to predicted-mention systems)")
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(RANDOM_SEED)
     docs = build_docs(device=device)
     tokenizer = load_tokenizer()
     cls_id, sep_id = tokenizer.cls_token_id, tokenizer.sep_token_id
@@ -390,7 +420,7 @@ def train_stage2(
         del encoder
         if device != "cpu":
             torch.cuda.empty_cache()
-        max_epochs, patience, doc_bs = max_epochs or 30, patience or 5, doc_bs or 8
+        max_epochs, patience, doc_bs = max_epochs or 60, patience or 8, doc_bs or 8
         optimizer = optim.AdamW(list(mention_enc.parameters()) + list(scorer.parameters()), lr=head_lr, weight_decay=0.1)
         enc_loop, ckpt_path, tag = None, MODELS_DIR / "stage2_frozen_head.pt", "frozen"
     if intra_sentence:
@@ -476,6 +506,10 @@ def train_stage2(
         for bucket, sc in sorted(metrics["by_type"].items()):
             print(f"  {bucket:12s}  CoNLL {sc['CoNLL']:.4f}  MUC {sc['muc']:.4f}  B3 {sc['bcub']:.4f}  CEAFe {sc['ceafe']:.4f}")
     metrics["best_val_f1"] = best_f1
+    metrics["setting"] = "gold_mentions"
+    metrics["random_seed"] = RANDOM_SEED
+    metrics["train_datasets"] = ["conll2012", "litbank", "preco", "corefud"]
+    metrics["eval_dataset"] = "conll2012_test"
     final_val_scores = {ds: eval_conll(enc_loop, mention_enc, scorer, vdocs, cls_id, sep_id, device, f"{tag}_final_val_{ds}", intra_sentence)
                         for ds, vdocs in val_sets.items() if vdocs}
     for ds, sc in final_val_scores.items():
