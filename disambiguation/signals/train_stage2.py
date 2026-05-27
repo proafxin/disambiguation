@@ -174,7 +174,12 @@ def doc_scores(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device) ->
     return scorer(reps)  # (M, M) antecedent logits
 
 
-def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs) -> float:
+def _sent_id(d: dict, device=None):
+    sent = np.asarray([sp[0] for sp in d["spans"]], dtype=np.int64)
+    return sent if device is None else torch.from_numpy(sent).to(device)
+
+
+def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence=False) -> float:
     train = optimizer is not None
     total, ndoc = 0.0, 0
     for s in tqdm(range(0, len(docs), doc_bs), desc="train" if train else "val"):
@@ -183,7 +188,8 @@ def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, dev
             optimizer.zero_grad()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
             losses = [mll_loss(doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device),
-                               torch.from_numpy(d["cluster_id"]).to(device)) for d in batch]
+                               torch.from_numpy(d["cluster_id"]).to(device),
+                               _sent_id(d, device) if intra_sentence else None) for d in batch]
             loss = torch.stack(losses).mean()
         if train:
             loss.backward()
@@ -197,20 +203,27 @@ def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, dev
     return total / max(ndoc, 1)
 
 
-def predict_clusters(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device) -> list:
+def predict_clusters(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device, intra_sentence=False) -> list:
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
         scores = doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device)
-    groups = decode_antecedents(scores.float().cpu().numpy())
+    groups = decode_antecedents(scores.float().cpu().numpy(), _sent_id(d) if intra_sentence else None)
     return [[d["spans"][i] for i in g] for g in groups]
 
 
-def eval_conll(encoder, mention_enc, scorer, docs, cls_id, sep_id, device, tag) -> dict:
-    key_docs = [(d["name"], d["sentences"],
-                 [[d["spans"][i] for i in np.where(d["cluster_id"] == c)[0]] for c in np.unique(d["cluster_id"])])
-                for d in docs]
+def _key_clusters(d: dict, intra_sentence: bool) -> list:
+    if not intra_sentence:
+        return [[d["spans"][i] for i in np.where(d["cluster_id"] == c)[0]] for c in np.unique(d["cluster_id"])]
+    groups: dict = {}  # gold clusters split per sentence; an intra-sentence cluster needs >= 2 same-sentence members
+    for i, c in enumerate(d["cluster_id"]):
+        groups.setdefault((int(c), d["spans"][i][0]), []).append(i)
+    return [[d["spans"][i] for i in members] for members in groups.values() if len(members) >= 2]
+
+
+def eval_conll(encoder, mention_enc, scorer, docs, cls_id, sep_id, device, tag, intra_sentence=False) -> dict:
+    key_docs = [(d["name"], d["sentences"], _key_clusters(d, intra_sentence)) for d in docs]
     key_path = MODELS_DIR / f"stage2_{tag}_key.conll"
     write_conll(key_path, key_docs)
-    resp = [(d["name"], d["sentences"], predict_clusters(d, encoder, mention_enc, scorer, cls_id, sep_id, device))
+    resp = [(d["name"], d["sentences"], predict_clusters(d, encoder, mention_enc, scorer, cls_id, sep_id, device, intra_sentence))
             for d in tqdm(docs, desc=f"eval/{tag}")]
     resp_path = MODELS_DIR / f"stage2_{tag}_response.conll"
     write_conll(resp_path, resp)
@@ -219,6 +232,7 @@ def eval_conll(encoder, mention_enc, scorer, docs, cls_id, sep_id, device, tag) 
 
 def train_stage2(
     finetune: bool = False,
+    intra_sentence: bool = False,
     roberta_lr: float = 2e-5,
     head_lr: float = 1e-3,
     max_epochs: int | None = None,
@@ -256,6 +270,10 @@ def train_stage2(
         max_epochs, patience, doc_bs = max_epochs or 30, patience or 5, doc_bs or 8
         optimizer = optim.AdamW(list(mention_enc.parameters()) + list(scorer.parameters()), lr=head_lr, weight_decay=1e-2)
         enc_loop, ckpt_path, tag = None, MODELS_DIR / "stage2_frozen_head.pt", "frozen"
+    if intra_sentence:  # separate checkpoint/metrics so this never clobbers the global run
+        tag = f"{tag}_intra"
+        ckpt_path = ckpt_path.with_name(f"{ckpt_path.stem}_intra{ckpt_path.suffix}")
+    print(f"intra_sentence={intra_sentence}")
     head_params = sum(p.numel() for p in list(mention_enc.parameters()) + list(scorer.parameters()))
     print(f"head params: {head_params:,} | doc_bs={doc_bs} epochs={max_epochs}")
 
@@ -270,14 +288,14 @@ def train_stage2(
             enc_loop.train()
         mention_enc.train()
         scorer.train()
-        tr_loss = run_epoch(enc_loop, mention_enc, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs)
+        tr_loss = run_epoch(enc_loop, mention_enc, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence)
         if enc_loop is not None:
             enc_loop.eval()
         mention_enc.eval()
         scorer.eval()
         with torch.inference_mode():
-            val_loss = run_epoch(enc_loop, mention_enc, scorer, val_docs, None, cls_id, sep_id, device, doc_bs)
-        val = eval_conll(enc_loop, mention_enc, scorer, val_docs, cls_id, sep_id, device, f"{tag}_val")
+            val_loss = run_epoch(enc_loop, mention_enc, scorer, val_docs, None, cls_id, sep_id, device, doc_bs, intra_sentence)
+        val = eval_conll(enc_loop, mention_enc, scorer, val_docs, cls_id, sep_id, device, f"{tag}_val", intra_sentence)
         print(f"Loss: {tr_loss:.6f} | Val loss: {val_loss:.6f} | Val CoNLL F1: {val['CoNLL']:.4f} "
               f"(MUC {val['muc']:.4f} B3 {val['bcub']:.4f} CEAFe {val['ceafe']:.4f})")
         tb.add_scalar("loss/train", tr_loss, epoch + 1)
@@ -309,7 +327,7 @@ def train_stage2(
         enc_loop.load_state_dict(ckpt["encoder"])
         enc_loop.eval()
     print("\n=== Test ===")
-    metrics = eval_conll(enc_loop, mention_enc, scorer, test_docs, cls_id, sep_id, device, f"{tag}_test")
+    metrics = eval_conll(enc_loop, mention_enc, scorer, test_docs, cls_id, sep_id, device, f"{tag}_test", intra_sentence)
     print(f"CoNLL {metrics['CoNLL']:.4f} | MUC {metrics['muc']:.4f} | B3 {metrics['bcub']:.4f} | CEAFe {metrics['ceafe']:.4f}")
     metrics["best_val_f1"] = best_f1
     with (MODELS_DIR / f"stage2_eval_metrics_{tag}.json").open("w", encoding="utf-8") as f:

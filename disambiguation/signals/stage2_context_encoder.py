@@ -110,13 +110,17 @@ class AntecedentScorer(nn.Module):
         return torch.cat(rows, dim=0)  # (M, M)
 
 
-def mll_loss(scores: torch.Tensor, cluster_id: torch.Tensor) -> torch.Tensor:
+def mll_loss(scores: torch.Tensor, cluster_id: torch.Tensor, sent_id: torch.Tensor | None = None) -> torch.Tensor:
     # Mention-ranking marginal log-likelihood. For each mention i (document order), candidates are
     # the dummy null antecedent (score 0) plus every earlier mention j < i. Maximize the probability
     # mass on correct antecedents (earlier same-cluster mentions), or on the null if i opens a cluster.
+    # If sent_id is given, candidates are restricted to earlier mentions in the same sentence
+    # (intra-sentence resolution): a mention whose only coreferents are in other sentences attaches to null.
     M = scores.shape[0]
     idx = torch.arange(M, device=scores.device)
     ante = idx.unsqueeze(0) < idx.unsqueeze(1)            # (M, M) True where j < i
+    if sent_id is not None:
+        ante = ante & (sent_id.unsqueeze(0) == sent_id.unsqueeze(1))
     neg = torch.finfo(scores.dtype).min
     null_col = torch.zeros(M, 1, device=scores.device, dtype=scores.dtype)
     denom = torch.logsumexp(torch.cat([null_col, scores.masked_fill(~ante, neg)], dim=1), dim=1)  # (M,)
@@ -127,9 +131,10 @@ def mll_loss(scores: torch.Tensor, cluster_id: torch.Tensor) -> torch.Tensor:
     return (denom - num)[idx >= 1].mean()
 
 
-def decode_antecedents(scores: np.ndarray) -> list[list[int]]:
+def decode_antecedents(scores: np.ndarray, sent_id: np.ndarray | None = None) -> list[list[int]]:
     # Each mention links to its single best earlier antecedent if that score beats the null (0),
     # else opens a new entity. Clusters are the connected components of the chosen links.
+    # If sent_id is given, candidates are restricted to earlier mentions in the same sentence.
     M = scores.shape[0]
     parent = list(range(M))
 
@@ -140,7 +145,10 @@ def decode_antecedents(scores: np.ndarray) -> list[list[int]]:
         return x
 
     for i in range(1, M):
-        j = int(np.argmax(scores[i, :i]))
+        cand = np.where(sent_id[:i] == sent_id[i])[0] if sent_id is not None else np.arange(i)
+        if len(cand) == 0:
+            continue
+        j = int(cand[np.argmax(scores[i, cand])])
         if scores[i, j] > 0.0:
             parent[find(i)] = find(j)
     groups: dict[int, list[int]] = {}
