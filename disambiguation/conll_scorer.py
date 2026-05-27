@@ -2,23 +2,57 @@ import re
 import subprocess
 from pathlib import Path
 
-SCORER_PL = Path.home() / "Projects" / "reference-coreference-scorers" / "scorer.pl"
+from disambiguation.paths import SCORER_PL
+
 METRICS = ("muc", "bcub", "ceafe")
 _COREF_RE = re.compile(
     r"Coreference: Recall: \(([\d.]+) / ([\d.]+)\).*?Precision: \(([\d.]+) / ([\d.]+)\)",
     re.DOTALL,
 )
-PRONOUNS = frozenset({
-    "i", "me", "my", "mine", "myself",
-    "you", "your", "yours", "yourself", "yourselves",
-    "he", "him", "his", "himself",
-    "she", "her", "hers", "herself",
-    "it", "its", "itself",
-    "we", "us", "our", "ours", "ourselves",
-    "they", "them", "their", "theirs", "themselves",
-    "who", "whom", "whose", "which", "that",
-    "this", "these", "those", "there",
-})
+PRONOUNS = frozenset(
+    {
+        "i",
+        "me",
+        "my",
+        "mine",
+        "myself",
+        "you",
+        "your",
+        "yours",
+        "yourself",
+        "yourselves",
+        "he",
+        "him",
+        "his",
+        "himself",
+        "she",
+        "her",
+        "hers",
+        "herself",
+        "it",
+        "its",
+        "itself",
+        "we",
+        "us",
+        "our",
+        "ours",
+        "ourselves",
+        "they",
+        "them",
+        "their",
+        "theirs",
+        "themselves",
+        "who",
+        "whom",
+        "whose",
+        "which",
+        "that",
+        "this",
+        "these",
+        "those",
+        "there",
+    }
+)
 
 
 def mention_type(words: list[str]) -> str:
@@ -85,11 +119,14 @@ def write_conll(path: Path, docs: list) -> None:
 def run_scorer(key_path: Path, response_path: Path, metric: str) -> dict:
     out = subprocess.run(
         ["perl", str(SCORER_PL), metric, str(key_path), str(response_path), "none"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     m = _COREF_RE.search(out)
     if m is None:
-        raise RuntimeError(f"could not parse {metric} output:\n{out}")
+        msg = f"could not parse {metric} output:\n{out}"
+        raise RuntimeError(msg)
     rn, rd, pn, pd = (float(x) for x in m.groups())
     r = rn / rd if rd else 0.0
     p = pn / pd if pd else 0.0
@@ -111,18 +148,18 @@ def conll_f1_by_type(key_docs: list, resp_docs: list, tmp_dir: Path) -> dict[str
     # key_docs / resp_docs: list of (doc_name, sentences, clusters)
     # Returns {bucket_label: {CoNLL, muc, bcub, ceafe}} for each non-empty bucket.
     buckets: dict[str, frozenset] = {
-        "PRON-only":  frozenset({"PRON"}),
+        "PRON-only": frozenset({"PRON"}),
         "PROPN-only": frozenset({"PROPN"}),
-        "NOUN-only":  frozenset({"NOUN"}),
-        "PRON+NOUN":  frozenset({"PRON", "NOUN"}),
+        "NOUN-only": frozenset({"NOUN"}),
+        "PRON+NOUN": frozenset({"PRON", "NOUN"}),
         "PRON+PROPN": frozenset({"PRON", "PROPN"}),
         "NOUN+PROPN": frozenset({"NOUN", "PROPN"}),
-        "all-mixed":  frozenset({"PRON", "NOUN", "PROPN"}),
+        "all-mixed": frozenset({"PRON", "NOUN", "PROPN"}),
     }
     results = {}
     for label, target_types in buckets.items():
         filtered_key, filtered_resp = [], []
-        for (kname, ksents, kclusters), (_, _, rclusters) in zip(key_docs, resp_docs):
+        for (kname, ksents, kclusters), (_, _, rclusters) in zip(key_docs, resp_docs, strict=False):
             kc = [c for c in kclusters if cluster_type_label(c, ksents) == target_types]
             rc = [c for c in rclusters if cluster_type_label(c, ksents) == target_types]
             if kc or rc:
