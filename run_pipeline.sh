@@ -7,7 +7,7 @@ TB_DIR="$SCRIPT_DIR/cache/tensorboard"
 TB_PORT="${TB_PORT:-6006}"
 
 echo "=== Stage 2 Training ==="
-uv run python disambiguation/signals/train_stage2.py "$@"
+uv run python disambiguation/train_stage2.py "$@"
 
 echo ""
 echo "=== Launching TensorBoard ==="

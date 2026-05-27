@@ -13,8 +13,8 @@ from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from disambiguation.signals.conll_scorer import write_conll, conll_f1, conll_f1_by_type
-from disambiguation.signals.stage2_context_encoder import (
+from disambiguation.conll_scorer import write_conll, conll_f1, conll_f1_by_type
+from disambiguation.stage2_context_encoder import (
     ContextEncoder, MentionEncoder, AntecedentScorer, mll_loss, decode_antecedents,
     encode_document_ctx, compute_mention_ctx_vecs, load_tokenizer,
     MODELS_DIR, CKPT_NAME, TOP_K,
@@ -24,10 +24,10 @@ CACHE_DIR = Path(__file__).parent.parent.parent / "cache"
 DATA_DIR = CACHE_DIR.parent / "data"
 SPACY_TRF_DIR = DATA_DIR / "spacy_trf"
 NOM_CACHE = DATA_DIR / "stage2_conll_nominals_v4.pkl"
-SPAN_CTX_CACHE = DATA_DIR / "stage2_span_ctx_v4"  # directory of per-doc .npy files — never accumulates in RAM
+SPAN_CTX_CACHE = DATA_DIR / "stage2_span_ctx_v5"  # (M, 2, CTX_DIM) float16 — ctx_start + ctx_sent_mean only
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
 CONLL_SPLITS = ["train", "validation", "test"]
-PRECO_SUBSAMPLE = 5000  # RAM cap: (M,4,1024) ctx_vecs needs more space; 5000 docs fits safely in ~10 GB
+PRECO_SUBSAMPLE = 8000  # RAM cap: (M,2,1024) ctx_vecs; 8000 docs fits comfortably in ~10 GB
 RANDOM_SEED = 42
 
 
@@ -248,18 +248,14 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
 
 
 def gather_spans_np(ctx: np.ndarray, span_sub: np.ndarray, sent_offsets: np.ndarray, sent_lengths: np.ndarray) -> np.ndarray:
-    # Extract (start, end, mean, sent_mean) context vectors per mention.
-    # sent_mean = mean of all ctx tokens in the mention's sentence.
-    # Returns (M, 4, CTX_DIM) float16.
+    # Extract (ctx_start, ctx_sent_mean) per mention — the two non-redundant RoBERTa vectors.
+    # Returns (M, 2, CTX_DIM) float16.
     M = len(span_sub)
-    out = np.zeros((M, 4, ctx.shape[1]), dtype=np.float16)
-    for k, (s, e) in enumerate(span_sub):
-        s, e = int(s), min(int(e) + 1, ctx.shape[0])
-        out[k, 0] = ctx[s]
-        out[k, 1] = ctx[e - 1]
-        out[k, 2] = ctx[s:e].mean(0)
+    out = np.zeros((M, 2, ctx.shape[1]), dtype=np.float16)
+    for k, (s, _e) in enumerate(span_sub):
+        out[k, 0] = ctx[int(s)]
         so, sl = int(sent_offsets[k]), int(sent_lengths[k])
-        out[k, 3] = ctx[so:so + sl].mean(0)
+        out[k, 1] = ctx[so:so + sl].mean(0)
     return out
 
 
@@ -310,17 +306,18 @@ def _sent_id(d: dict, device=None):
     return sent if device is None else torch.from_numpy(sent).to(device)
 
 
-def doc_scores(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device) -> tuple[torch.Tensor, torch.Tensor]:
+def doc_scores(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if encoder is None:
-        ctx_vecs = torch.from_numpy(d["ctx_vecs"]).to(device)  # (M, 4, CTX_DIM)
+        ctx_vecs = torch.from_numpy(d["ctx_vecs"]).to(device)  # (M, 2, CTX_DIM)
     else:
         ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
         ctx_vecs = compute_mention_ctx_vecs(ctx, d["span_sub"], d["sent_sub_offsets"], d["sent_sub_lengths"])
     mention_bge = torch.from_numpy(d["mention_bge"]).to(device).float()
     width = torch.from_numpy(d["width"]).to(device)
-    reps = mention_enc(ctx_vecs[:, 0], ctx_vecs[:, 1], ctx_vecs[:, 2], ctx_vecs[:, 3], mention_bge, width)
+    reps = mention_enc(ctx_vecs[:, 0], ctx_vecs[:, 1], mention_bge, width)
     sent_ids = _sent_id(d, device)
-    return scorer(reps, sent_ids)
+    scores, ante_mask = scorer(reps, sent_ids)
+    return scores, ante_mask, scorer.null_bias
 
 
 def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence=False) -> float:
@@ -333,9 +330,9 @@ def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, dev
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
             losses = []
             for d in batch:
-                scores, ante_mask = doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device)
+                scores, ante_mask, null_bias = doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device)
                 losses.append(mll_loss(scores, ante_mask, torch.from_numpy(d["cluster_id"]).to(device),
-                                       _sent_id(d, device) if intra_sentence else None))
+                                       null_bias, _sent_id(d, device) if intra_sentence else None))
             loss = torch.stack(losses).mean()
         if train:
             loss.backward()
@@ -351,9 +348,9 @@ def run_epoch(encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, dev
 
 def predict_clusters(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device, intra_sentence=False) -> list:
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-        scores, ante_mask = doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device)
+        scores, ante_mask, null_bias = doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device)
     groups = decode_antecedents(scores.float().cpu().numpy(), ante_mask.cpu().numpy(),
-                                _sent_id(d) if intra_sentence else None)
+                                float(null_bias.item()), _sent_id(d) if intra_sentence else None)
     return [[d["spans"][i] for i in g] for g in groups]
 
 
@@ -477,6 +474,7 @@ def train_stage2(
             print(f"  {ds:10s} CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})")
         tb.add_scalar("loss/train", tr_loss, epoch + 1)
         tb.add_scalar("loss/val", val_loss, epoch + 1)
+        tb.add_scalar("model/null_bias", scorer.null_bias.item(), epoch + 1)
         for ds, sc in val_scores.items():
             for k in ("CoNLL", "muc", "bcub", "ceafe"):
                 tb.add_scalar(f"val_f1/{ds}/{k}", sc[k], epoch + 1)
