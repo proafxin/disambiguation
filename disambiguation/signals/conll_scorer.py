@@ -8,6 +8,36 @@ _COREF_RE = re.compile(
     r"Coreference: Recall: \(([\d.]+) / ([\d.]+)\).*?Precision: \(([\d.]+) / ([\d.]+)\)",
     re.DOTALL,
 )
+PRONOUNS = frozenset({
+    "i", "me", "my", "mine", "myself",
+    "you", "your", "yours", "yourself", "yourselves",
+    "he", "him", "his", "himself",
+    "she", "her", "hers", "herself",
+    "it", "its", "itself",
+    "we", "us", "our", "ours", "ourselves",
+    "they", "them", "their", "theirs", "themselves",
+    "who", "whom", "whose", "which", "that",
+    "this", "these", "those", "there",
+})
+
+
+def mention_type(words: list[str]) -> str:
+    head = words[0].lower()
+    if head in PRONOUNS:
+        return "PRON"
+    if words[0][0].isupper() and len(words) <= 5:
+        return "PROPN"
+    return "NOUN"
+
+
+def cluster_type_label(cluster: list, sentences: list[list[str]]) -> str:
+    # Returns a frozenset of mention types present in the cluster, e.g. frozenset({'PRON','NOUN'})
+    types = set()
+    for sent_idx, start, end in cluster:
+        words = sentences[sent_idx][start:end]
+        if words:
+            types.add(mention_type(words))
+    return frozenset(types)
 
 
 def _coref_column(starts: list, ends: list, singles: list) -> str:
@@ -71,3 +101,38 @@ def conll_f1(key_path: Path, response_path: Path) -> dict:
     scores = {metric: run_scorer(key_path, response_path, metric) for metric in METRICS}
     avg = sum(scores[m]["f1"] for m in METRICS) / len(METRICS)
     return {"CoNLL": avg, **{m: scores[m]["f1"] for m in METRICS}}
+
+
+def conll_f1_by_type(key_docs: list, resp_docs: list, tmp_dir: Path) -> dict[str, dict]:
+    # Runs the official scorer on type-filtered subsets of the full document set.
+    # Filtering is at the cluster level: a cluster is included in bucket B if its
+    # set of mention types matches or contains the types in B. This preserves full
+    # cluster structure (all mentions kept) so MUC/B3/CEAFe remain well-defined.
+    # key_docs / resp_docs: list of (doc_name, sentences, clusters)
+    # Returns {bucket_label: {CoNLL, muc, bcub, ceafe}} for each non-empty bucket.
+    buckets: dict[str, frozenset] = {
+        "PRON-only":  frozenset({"PRON"}),
+        "PROPN-only": frozenset({"PROPN"}),
+        "NOUN-only":  frozenset({"NOUN"}),
+        "PRON+NOUN":  frozenset({"PRON", "NOUN"}),
+        "PRON+PROPN": frozenset({"PRON", "PROPN"}),
+        "NOUN+PROPN": frozenset({"NOUN", "PROPN"}),
+        "all-mixed":  frozenset({"PRON", "NOUN", "PROPN"}),
+    }
+    results = {}
+    for label, target_types in buckets.items():
+        filtered_key, filtered_resp = [], []
+        for (kname, ksents, kclusters), (_, _, rclusters) in zip(key_docs, resp_docs):
+            kc = [c for c in kclusters if cluster_type_label(c, ksents) == target_types]
+            rc = [c for c in rclusters if cluster_type_label(c, ksents) == target_types]
+            if kc or rc:
+                filtered_key.append((kname, ksents, kc))
+                filtered_resp.append((kname, ksents, rc))
+        if not any(kc for _, _, kc in filtered_key):
+            continue
+        key_path = tmp_dir / f"type_{label}_key.conll"
+        resp_path = tmp_dir / f"type_{label}_resp.conll"
+        write_conll(key_path, filtered_key)
+        write_conll(resp_path, filtered_resp)
+        results[label] = conll_f1(key_path, resp_path)
+    return results
