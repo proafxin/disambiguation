@@ -1,4 +1,5 @@
 import datetime
+import itertools
 import json
 import pickle
 import random
@@ -25,9 +26,9 @@ from disambiguation.paths import (
 )
 from disambiguation.stage2_context_encoder import (
     CKPT_NAME,
+    CONTENT,
     AntecedentScorer,
     ContextEncoder,
-    MentionEncoder,
     compute_mention_ctx_vecs,
     decode_antecedents,
     encode_document_ctx,
@@ -318,17 +319,13 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
     return docs
 
 
-def gather_spans_np(
-    ctx: np.ndarray, span_sub: np.ndarray, sent_offsets: np.ndarray, sent_lengths: np.ndarray
-) -> np.ndarray:
-    # Extract (ctx_start, ctx_sent_mean) per mention — the two non-redundant RoBERTa vectors.
-    # Returns (M, 2, CTX_DIM) float16.
+def gather_spans_np(ctx: np.ndarray, span_sub: np.ndarray) -> np.ndarray:
+    # Returns (M, 2, CTX_DIM) float16: (ctx_start, ctx_end) per mention.
     M = len(span_sub)
     out = np.zeros((M, 2, ctx.shape[1]), dtype=np.float16)
-    for k, (s, _e) in enumerate(span_sub):
+    for k, (s, e) in enumerate(span_sub):
         out[k, 0] = ctx[int(s)]
-        so, sl = int(sent_offsets[k]), int(sent_lengths[k])
-        out[k, 1] = ctx[so : so + sl].mean(0)
+        out[k, 1] = ctx[int(e)]
     return out
 
 
@@ -337,7 +334,7 @@ def _ctx_path(i: int) -> Path:
 
 
 def precompute_span_ctx(encoder, docs, cls_id, sep_id, device) -> None:
-    # Writes each doc's (M, 4, CTX_DIM) float16 ctx_vecs to an individual .npy file immediately.
+    # Writes each doc's (M, 2, CTX_DIM) float16 ctx_vecs (start, end) to an individual .npy file immediately.
     # Never accumulates more than one doc in RAM. Resumable: skips already-written files.
     SPAN_CTX_CACHE.mkdir(parents=True, exist_ok=True)
     n_existing = sum(1 for i in range(len(docs)) if _ctx_path(i).exists())
@@ -364,7 +361,7 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device) -> None:
                 d.pop("sent_sub_lengths", None)
                 continue
             ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device).float().cpu().numpy()
-            ctx_vecs = gather_spans_np(ctx, d["span_sub"], d["sent_sub_offsets"], d["sent_sub_lengths"])
+            ctx_vecs = gather_spans_np(ctx, d["span_sub"])
             np.save(p, ctx_vecs)
             d["ctx_vecs"] = ctx_vecs.astype(np.float32)
             d.pop("content_ids", None)
@@ -380,22 +377,21 @@ def _sent_id(d: dict, device=None):
 
 
 def doc_scores(
-    d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device
+    d: dict, encoder, scorer, cls_id, sep_id, device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if encoder is None:
-        ctx_vecs = torch.from_numpy(d["ctx_vecs"]).to(device)  # (M, 2, CTX_DIM)
+        ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()  # (M, 2, CTX_DIM): start, end
     else:
-        ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
-        ctx_vecs = compute_mention_ctx_vecs(ctx, d["span_sub"], d["sent_sub_offsets"], d["sent_sub_lengths"])
-    mention_bge = torch.from_numpy(d["mention_bge"]).to(device).float()
-    reps = mention_enc(ctx_vecs[:, 0], ctx_vecs[:, 1], mention_bge)
-    sent_ids = _sent_id(d, device)
-    scores, ante_mask = scorer(reps, sent_ids)
+        ctx_doc = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
+        ctx = compute_mention_ctx_vecs(ctx_doc, d["span_sub"])
+    bge = torch.from_numpy(d["mention_bge"]).to(device).float()
+    tok_pos = torch.from_numpy(d["tok_pos"]).to(device)
+    scores, ante_mask = scorer(ctx, bge, tok_pos)
     return scores, ante_mask, scorer.null_bias
 
 
 def run_epoch(
-    encoder, mention_enc, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence=False
+    encoder, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence=False
 ) -> float:
     train = optimizer is not None
     total, ndoc = 0.0, 0
@@ -406,7 +402,7 @@ def run_epoch(
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
             losses = []
             for d in batch:
-                scores, ante_mask, null_bias = doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device)
+                scores, ante_mask, null_bias = doc_scores(d, encoder, scorer, cls_id, sep_id, device)
                 losses.append(
                     mll_loss(
                         scores,
@@ -419,7 +415,7 @@ def run_epoch(
             loss = torch.stack(losses).mean()
         if train:
             loss.backward()
-            params = list(mention_enc.parameters()) + list(scorer.parameters())
+            params = list(scorer.parameters())
             if encoder is not None:
                 params += list(encoder.parameters())
             torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -429,9 +425,9 @@ def run_epoch(
     return total / max(ndoc, 1)
 
 
-def predict_clusters(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, device, intra_sentence=False) -> list:
+def predict_clusters(d: dict, encoder, scorer, cls_id, sep_id, device, intra_sentence=False) -> list:
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-        scores, ante_mask, null_bias = doc_scores(d, encoder, mention_enc, scorer, cls_id, sep_id, device)
+        scores, ante_mask, null_bias = doc_scores(d, encoder, scorer, cls_id, sep_id, device)
     groups = decode_antecedents(
         scores.float().cpu().numpy(),
         ante_mask.cpu().numpy(),
@@ -441,7 +437,21 @@ def predict_clusters(d: dict, encoder, mention_enc, scorer, cls_id, sep_id, devi
     return [[d["spans"][i] for i in g] for g in groups]
 
 
-def _key_clusters(d: dict, intra_sentence: bool) -> list:
+def _key_clusters(d: dict, intra_sentence: bool, window: int | None = None) -> list:
+    if window is not None:  # Stage A gold: split each entity at token gaps > window (within-window reachable groups)
+        pos, cid = d["tok_pos"], d["cluster_id"]
+        out: list = []
+        for c in np.unique(cid):
+            members = sorted((int(i) for i in np.where(cid == c)[0]), key=lambda i: pos[i])
+            comp = [members[0]]
+            for prev, cur in itertools.pairwise(members):
+                if pos[cur] - pos[prev] <= window:
+                    comp.append(cur)
+                else:
+                    out.append(comp)
+                    comp = [cur]
+            out.append(comp)
+        return [[d["spans"][i] for i in comp] for comp in out if len(comp) >= 2]
     if not intra_sentence:
         return [[d["spans"][i] for i in np.where(d["cluster_id"] == c)[0]] for c in np.unique(d["cluster_id"])]
     groups: dict = {}
@@ -451,16 +461,17 @@ def _key_clusters(d: dict, intra_sentence: bool) -> list:
 
 
 def eval_conll(
-    encoder, mention_enc, scorer, docs, cls_id, sep_id, device, tag, intra_sentence=False, type_breakdown=False
+    encoder, scorer, docs, cls_id, sep_id, device, tag, intra_sentence=False, type_breakdown=False,
+    window: int | None = None,
 ) -> dict:
-    key_docs = [(d["name"], d["sentences"], _key_clusters(d, intra_sentence)) for d in docs]
+    key_docs = [(d["name"], d["sentences"], _key_clusters(d, intra_sentence, window)) for d in docs]
     key_path = MODELS_DIR / f"stage2_{tag}_key.conll"
     write_conll(key_path, key_docs)
     resp_docs = [
         (
             d["name"],
             d["sentences"],
-            predict_clusters(d, encoder, mention_enc, scorer, cls_id, sep_id, device, intra_sentence),
+            predict_clusters(d, encoder, scorer, cls_id, sep_id, device, intra_sentence),
         )
         for d in tqdm(docs, desc=f"eval/{tag}")
     ]
@@ -490,6 +501,8 @@ def train_stage2(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
     docs = build_docs(device=device)
+    for d in docs:  # retain mention subtoken start positions before precompute drops span_sub
+        d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
     tokenizer = load_tokenizer()
     cls_id, sep_id = tokenizer.cls_token_id, tokenizer.sep_token_id
 
@@ -503,7 +516,6 @@ def train_stage2(
         "corefud": [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
     }
 
-    mention_enc = MentionEncoder().to(device)
     scorer = AntecedentScorer().to(device)
     encoder = ContextEncoder().to(device)
     if finetune:
@@ -512,7 +524,7 @@ def train_stage2(
         optimizer = optim.AdamW(
             [
                 {"params": encoder.parameters(), "lr": roberta_lr},
-                {"params": list(mention_enc.parameters()) + list(scorer.parameters()), "lr": head_lr},
+                {"params": list(scorer.parameters()), "lr": head_lr},
             ],
             weight_decay=0.1,
         )
@@ -526,14 +538,14 @@ def train_stage2(
             torch.cuda.empty_cache()
         max_epochs, patience, doc_bs = max_epochs or 60, patience or 8, doc_bs or 8
         optimizer = optim.AdamW(
-            list(mention_enc.parameters()) + list(scorer.parameters()), lr=head_lr, weight_decay=0.1
+            list(scorer.parameters()), lr=head_lr, weight_decay=0.1
         )
         enc_loop, ckpt_path, tag = None, MODELS_DIR / "stage2_frozen_head.pt", "frozen"
     if intra_sentence:
         tag = f"{tag}_intra"
         ckpt_path = ckpt_path.with_name(f"{ckpt_path.stem}_intra{ckpt_path.suffix}")
     print(f"intra_sentence={intra_sentence}")
-    head_params = sum(p.numel() for p in list(mention_enc.parameters()) + list(scorer.parameters()))
+    head_params = sum(p.numel() for p in scorer.parameters())
     print(f"head params: {head_params:,} | doc_bs={doc_bs} epochs={max_epochs}")
     print(f"train docs: {len(train_docs)} | conll val: {len(conll_val_docs)} | conll test: {len(conll_test_docs)}")
 
@@ -543,7 +555,6 @@ def train_stage2(
     best_f1, patience_ctr, disk_best_f1 = -1.0, 0, -1.0
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device)
-        mention_enc.load_state_dict(ckpt["mention_enc"])
         scorer.load_state_dict(ckpt["scorer"])
         if enc_loop is not None and "encoder" in ckpt:
             enc_loop.load_state_dict(ckpt["encoder"])
@@ -555,23 +566,21 @@ def train_stage2(
         random.shuffle(train_docs)
         if enc_loop is not None:
             enc_loop.train()
-        mention_enc.train()
         scorer.train()
         tr_loss = run_epoch(
-            enc_loop, mention_enc, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence
+            enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence
         )
         scheduler.step()
         if enc_loop is not None:
             enc_loop.eval()
-        mention_enc.eval()
         scorer.eval()
         with torch.inference_mode():
             val_loss = run_epoch(
-                enc_loop, mention_enc, scorer, conll_val_docs, None, cls_id, sep_id, device, doc_bs, intra_sentence
+                enc_loop, scorer, conll_val_docs, None, cls_id, sep_id, device, doc_bs, intra_sentence
             )
         val_scores = {
             ds: eval_conll(
-                enc_loop, mention_enc, scorer, vdocs, cls_id, sep_id, device, f"{tag}_val_{ds}", intra_sentence
+                enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_val_{ds}", intra_sentence, window=CONTENT
             )
             for ds, vdocs in val_sets.items()
             if vdocs
@@ -593,7 +602,6 @@ def train_stage2(
             if best_f1 > disk_best_f1 + 1e-4:
                 disk_best_f1 = best_f1
                 state = {
-                    "mention_enc": mention_enc.state_dict(),
                     "scorer": scorer.state_dict(),
                     "best_val_f1": disk_best_f1,
                 }
@@ -613,9 +621,7 @@ def train_stage2(
     print("\n✓ Training complete")
     tb.close()
     ckpt = torch.load(ckpt_path, map_location=device)
-    mention_enc.load_state_dict(ckpt["mention_enc"])
     scorer.load_state_dict(ckpt["scorer"])
-    mention_enc.eval()
     scorer.eval()
     if enc_loop is not None and "encoder" in ckpt:
         enc_loop.load_state_dict(ckpt["encoder"])
@@ -623,7 +629,6 @@ def train_stage2(
     print("\n=== Test ===")
     metrics = eval_conll(
         enc_loop,
-        mention_enc,
         scorer,
         conll_test_docs,
         cls_id,
@@ -632,6 +637,7 @@ def train_stage2(
         f"{tag}_test",
         intra_sentence,
         type_breakdown=True,
+        window=CONTENT,
     )
     print(
         f"CoNLL {metrics['CoNLL']:.4f} | MUC {metrics['muc']:.4f} | B3 {metrics['bcub']:.4f} | CEAFe {metrics['ceafe']:.4f}"
@@ -649,7 +655,7 @@ def train_stage2(
     metrics["eval_dataset"] = "conll2012_test"
     final_val_scores = {
         ds: eval_conll(
-            enc_loop, mention_enc, scorer, vdocs, cls_id, sep_id, device, f"{tag}_final_val_{ds}", intra_sentence
+            enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_final_val_{ds}", intra_sentence, window=CONTENT
         )
         for ds, vdocs in val_sets.items()
         if vdocs
