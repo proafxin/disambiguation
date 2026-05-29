@@ -660,11 +660,11 @@ if __name__ == "__main__":
 
 
 def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str) -> dict[int, dict]:
-    # Returns {win_id: {"ctx": (Mw,2,CTX_DIM), "bge": (Mw,BGE_DIM),
-    #                   "clusters": list[list[int]],  # window-local indices
+    # Returns {win_id: {"clusters": list[list[int]],  # window-local indices
     #                   "global_idx": np.ndarray}}    # local->global mention index map
-    ctx_all = d["ctx_vecs"]   # (M, 2, CTX_DIM)
-    bge_all = d["mention_bge"]  # (M, BGE_DIM)
+    # ctx/bge arrays are NOT stored — loaded from d at training time
+    ctx_all = d["ctx_vecs"]
+    bge_all = d["mention_bge"]
     tok_pos = d["tok_pos"]
     win_ids = tok_pos // CONTENT
     per_window: dict[int, dict] = {}
@@ -685,8 +685,6 @@ def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str) ->
                 local_clusters = [list(g) for g in groups]
                 local_clusters += [[i] for i in range(Mw) if i not in grouped]
             per_window[int(w)] = {
-                "ctx": ctx_w.cpu().numpy(),
-                "bge": bge_w.cpu().numpy(),
                 "clusters": local_clusters,
                 "global_idx": global_idx,
             }
@@ -746,14 +744,17 @@ def _predict_full_doc_clusters(
         total += len(per_window[w]["clusters"])
     parent = list(range(total))
     with torch.inference_mode():
+        ctx_all, bge_all = d["ctx_vecs"], d["mention_bge"]
         for i in range(len(windows)):
             for j in range(i + 1, len(windows)):
                 wi, wj = per_window[windows[i]], per_window[windows[j]]
                 lc, rc = wi["clusters"], wj["clusters"]
                 if not lc or not rc:
                     continue
-                left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wi["ctx"], wi["bge"]) for cl in lc]]
-                right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wj["ctx"], wj["bge"]) for cl in rc]]
+                ctx_i, bge_i = ctx_all[wi["global_idx"]], bge_all[wi["global_idx"]]
+                ctx_j, bge_j = ctx_all[wj["global_idx"]], bge_all[wj["global_idx"]]
+                left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
+                right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
                 scores = cluster_matcher(left, right).float().cpu().numpy()
                 pairs = decode_cluster_matches(scores, float(cluster_matcher.null_bias.item()))
                 lo, ro = win_offsets[windows[i]], win_offsets[windows[j]]
@@ -862,7 +863,7 @@ def train_stage_b(
             per_window = train_clusters[bi]
             if not per_window:
                 continue
-            cid = d["cluster_id"]
+            ctx_all, bge_all, cid = d["ctx_vecs"], d["mention_bge"], d["cluster_id"]
             windows = sorted(per_window.keys())
             for i in range(len(windows)):
                 for j in range(i + 1, len(windows)):
@@ -870,8 +871,12 @@ def train_stage_b(
                     lc, rc = wi["clusters"], wj["clusters"]
                     if not lc or not rc:
                         continue
-                    left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wi["ctx"], wi["bge"]) for cl in lc]]
-                    right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wj["ctx"], wj["bge"]) for cl in rc]]
+                    ctx_i = ctx_all[wi["global_idx"]]
+                    bge_i = bge_all[wi["global_idx"]]
+                    ctx_j = ctx_all[wj["global_idx"]]
+                    bge_j = bge_all[wj["global_idx"]]
+                    left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
+                    right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
                     left_cids  = [_cluster_gold_cids([wi["global_idx"][li] for li in cl], cid) for cl in lc]
                     right_cids = [_cluster_gold_cids([wj["global_idx"][li] for li in cl], cid) for cl in rc]
                     pending.append((left, right, left_cids, right_cids))
