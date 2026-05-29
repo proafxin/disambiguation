@@ -37,6 +37,7 @@ from disambiguation.stage2_context_encoder import (
     encode_document_ctx,
     load_tokenizer,
     mll_loss,
+    _uf_find,
 )
 
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
@@ -827,7 +828,8 @@ def train_stage_b(
         random.shuffle(order)
         cluster_matcher.train()
         total, n_pairs = 0.0, 0
-        losses = []
+        # accumulate (left_clusters, right_clusters, left_cids, right_cids) across docs
+        pending: list[tuple] = []
         for bi in tqdm(order, desc="train_b"):
             d = train_docs[bi]
             per_window = train_clusters[bi]
@@ -841,24 +843,23 @@ def train_stage_b(
                     continue
                 left  = [(torch.from_numpy(ctx[np.array(c)]).to(device).float(), torch.from_numpy(bge[np.array(c)]).to(device).float()) for c in lc]
                 right = [(torch.from_numpy(ctx[np.array(c)]).to(device).float(), torch.from_numpy(bge[np.array(c)]).to(device).float()) for c in rc]
-                left_cids  = [_cluster_gold_cids(c, cid) for c in lc]
-                right_cids = [_cluster_gold_cids(c, cid) for c in rc]
-                losses.append(cluster_match_loss(cluster_matcher(left, right), left_cids, right_cids, cluster_matcher.null_bias))
+                pending.append((left, right, [_cluster_gold_cids(c, cid) for c in lc], [_cluster_gold_cids(c, cid) for c in rc]))
                 n_pairs += 1
-                if len(losses) >= doc_bs:
-                    optimizer.zero_grad()
-                    torch.stack(losses).mean().backward()
-                    torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
-                    optimizer.step()
-                    total += sum(l.item() for l in losses)
-                    losses = []
-        if losses:
+            if len(pending) >= doc_bs:
+                optimizer.zero_grad()
+                losses = [cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending]
+                torch.stack(losses).mean().backward()
+                torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
+                optimizer.step()
+                total += sum(lo.item() for lo in losses)
+                pending = []
+        if pending:
             optimizer.zero_grad()
+            losses = [cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending]
             torch.stack(losses).mean().backward()
             torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
             optimizer.step()
-            total += sum(l.item() for l in losses)
-            losses = []
+            total += sum(lo.item() for lo in losses)
         scheduler.step()
         tr_loss = total / max(n_pairs, 1)
         print(f"cluster pairs: {n_pairs}")

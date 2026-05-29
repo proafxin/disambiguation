@@ -12,7 +12,7 @@ CKPT_B_NAME = "stage2_cluster_matcher.pt"
 BACKBONE = "roberta-large"
 BGE_DIM = 1024
 CTX_DIM = 1024
-CONTENT = 128  # tokens per fixed window
+CONTENT = 256  # tokens per fixed window
 WINDOW = CONTENT + 2  # + <s>/</s>
 
 
