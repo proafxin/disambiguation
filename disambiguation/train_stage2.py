@@ -25,11 +25,15 @@ from disambiguation.paths import (
 )
 from disambiguation.stage2_context_encoder import (
     CKPT_NAME,
+    CKPT_B_NAME,
     CONTENT,
     AntecedentScorer,
+    ClusterMatcher,
     ContextEncoder,
+    cluster_match_loss,
     compute_mention_ctx_vecs,
     decode_antecedents,
+    decode_cluster_matches,
     encode_document_ctx,
     load_tokenizer,
     mll_loss,
@@ -652,3 +656,248 @@ def train_stage2(
 
 if __name__ == "__main__":
     train_stage2()
+
+
+def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str) -> dict[int, list[int]]:
+    # Run Stage A decode on doc, return {win_id: [cluster_member_global_indices]} grouped by window.
+    # Returns per-window list of clusters, each cluster is a list of global mention indices.
+    ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()
+    bge = torch.from_numpy(d["mention_bge"]).to(device).float()
+    tok_pos = d["tok_pos"]
+    win_ids = tok_pos // CONTENT
+    per_window: dict[int, list[list[int]]] = {}
+    with torch.inference_mode():
+        for w in np.unique(win_ids):
+            idx = np.where(win_ids == w)[0]
+            if len(idx) < 2:
+                per_window[int(w)] = [[int(i)] for i in idx]
+                continue
+            w_scores, w_mask = scorer(ctx[idx], bge[idx])
+            groups = decode_antecedents(
+                w_scores.float().cpu().numpy(), w_mask.cpu().numpy(), float(scorer.null_bias.item())
+            )
+            # singletons not in any group
+            grouped = {i for g in groups for i in g}
+            clusters = [[int(idx[i]) for i in g] for g in groups]
+            clusters += [[int(idx[i])] for i in range(len(idx)) if i not in grouped]
+            per_window[int(w)] = clusters
+    return per_window
+
+
+def _cluster_reps(
+    cluster: list[int], ctx: np.ndarray, bge: np.ndarray, device: str = "cpu"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    idx = np.array(cluster)
+    return (
+        torch.from_numpy(ctx[idx]).float(),   # (M, 2, CTX_DIM) — stays on CPU until batch
+        torch.from_numpy(bge[idx]).float(),   # (M, BGE_DIM)
+    )
+
+
+def _cluster_gold_cids(cluster: list[int], cluster_id: np.ndarray) -> int:
+    # Representative cluster_id for a predicted cluster: majority vote.
+    cids = cluster_id[np.array(cluster)]
+    return int(np.bincount(cids).argmax())
+
+
+def _precompute_stage_a_clusters(
+    docs: list, scorer: AntecedentScorer, device: str
+) -> list[dict[int, list[list[int]]]]:
+    print("Precomputing Stage A clusters...")
+    result = []
+    scorer.eval()
+    with torch.inference_mode():
+        for d in tqdm(docs, desc="stage A clusters"):
+            if "ctx_vecs" not in d:
+                result.append({})
+                continue
+            result.append(_stage_a_clusters_for_doc(d, scorer, device))
+    return result
+
+
+def _predict_full_doc_clusters(
+    d: dict, per_window: dict[int, list[list[int]]], cluster_matcher: ClusterMatcher, device: str
+) -> list[list]:
+    ctx, bge = d["ctx_vecs"], d["mention_bge"]
+    windows = sorted(per_window.keys())
+    # initialise union-find over cluster indices (global across all windows)
+    # assign each cluster a unique global id
+    all_clusters: list[list[int]] = []
+    win_offsets: dict[int, int] = {}
+    for w in windows:
+        win_offsets[w] = len(all_clusters)
+        all_clusters.extend(per_window[w])
+    parent = list(range(len(all_clusters)))
+    with torch.inference_mode():
+        for k in range(len(windows) - 1):
+            left_clusters = per_window[windows[k]]
+            right_clusters = per_window[windows[k + 1]]
+            if not left_clusters or not right_clusters:
+                continue
+            left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(m, ctx, bge) for m in left_clusters]]
+            right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(m, ctx, bge) for m in right_clusters]]
+            scores = cluster_matcher(left, right).float().cpu().numpy()
+            pairs = decode_cluster_matches(scores, float(cluster_matcher.null_bias.item()))
+            lo, ro = win_offsets[windows[k]], win_offsets[windows[k + 1]]
+            for li, ri in pairs:
+                a, b = _uf_find(parent, lo + li), _uf_find(parent, ro + ri)
+                if a != b:
+                    parent[a] = b
+    groups: dict[int, list[int]] = {}
+    for i in range(len(all_clusters)):
+        groups.setdefault(_uf_find(parent, i), []).append(i)
+    result = []
+    for members in groups.values():
+        spans = [d["spans"][m] for ci in members for m in all_clusters[ci]]
+        if len(spans) >= 2:
+            result.append(spans)
+    return result
+
+
+def eval_stage_b(
+    docs: list,
+    stage_a_clusters: list[dict[int, list[list[int]]]],
+    cluster_matcher: ClusterMatcher,
+    device: str,
+    tag: str,
+    type_breakdown: bool = False,
+) -> dict:
+    cluster_matcher.eval()
+    key_docs, resp_docs = [], []
+    for d, per_window in zip(docs, stage_a_clusters):
+        if not per_window:
+            continue
+        key_docs.append((d["name"], d["sentences"], _key_clusters(d)))
+        resp_docs.append((d["name"], d["sentences"], _predict_full_doc_clusters(d, per_window, cluster_matcher, device)))
+    key_path = MODELS_DIR / f"stageb_{tag}_key.conll"
+    resp_path = MODELS_DIR / f"stageb_{tag}_resp.conll"
+    write_conll(key_path, key_docs)
+    write_conll(resp_path, resp_docs)
+    result = conll_f1(key_path, resp_path)
+    if type_breakdown:
+        result["by_type"] = conll_f1_by_type(key_docs, resp_docs, MODELS_DIR)
+    return result
+
+
+
+
+def train_stage_b(
+    head_lr: float = 1e-3,
+    max_epochs: int = 30,
+    patience: int = 5,
+    doc_bs: int = 8,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    print("\nTraining Stage B cluster matcher...")
+    docs = build_docs(device=device)
+    for d in docs:
+        if "tok_pos" not in d:
+            d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
+
+    stage_a = AntecedentScorer().to(device)
+    stage_a.load_state_dict(torch.load(MODELS_DIR / "stage2_frozen_head.pt", map_location=device)["scorer"])
+    for p in stage_a.parameters():
+        p.requires_grad_(False)
+    stage_a.eval()
+
+    for i, d in enumerate(docs):
+        p = SPAN_CTX_CACHE / f"{i:06d}.npy"
+        if p.exists() and "ctx_vecs" not in d:
+            d["ctx_vecs"] = np.load(p).astype(np.float32)
+
+    train_docs = [d for d in docs if d["split"] == "train"]
+    val_docs   = [d for d in docs if d["split"] == "validation" and d["name"].startswith("conll2012/")]
+    test_docs  = [d for d in docs if d["split"] == "test"       and d["name"].startswith("conll2012/")]
+
+    # precompute Stage A clusters once — avoids re-running Stage A every epoch
+    all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device)
+    train_clusters = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "train"]
+    val_clusters   = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")]
+    test_clusters  = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "test"       and d["name"].startswith("conll2012/")]
+
+    cluster_matcher = ClusterMatcher().to(device)
+    optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=0.1)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
+    ckpt_path = MODELS_DIR / CKPT_B_NAME
+    best_val_f1, patience_ctr = -1.0, 0
+
+    for epoch in range(max_epochs):
+        print(f"\n=== Stage B Epoch {epoch + 1}/{max_epochs} ===")
+        order = list(range(len(train_docs)))
+        random.shuffle(order)
+        cluster_matcher.train()
+        total, n_pairs = 0.0, 0
+        losses = []
+        for bi in tqdm(order, desc="train_b"):
+            d = train_docs[bi]
+            per_window = train_clusters[bi]
+            if not per_window or "ctx_vecs" not in d:
+                continue
+            ctx, bge, cid = d["ctx_vecs"], d["mention_bge"], d["cluster_id"]
+            windows = sorted(per_window.keys())
+            for k in range(len(windows) - 1):
+                lc, rc = per_window[windows[k]], per_window[windows[k + 1]]
+                if not lc or not rc:
+                    continue
+                left  = [(torch.from_numpy(ctx[np.array(c)]).to(device).float(), torch.from_numpy(bge[np.array(c)]).to(device).float()) for c in lc]
+                right = [(torch.from_numpy(ctx[np.array(c)]).to(device).float(), torch.from_numpy(bge[np.array(c)]).to(device).float()) for c in rc]
+                left_cids  = [_cluster_gold_cids(c, cid) for c in lc]
+                right_cids = [_cluster_gold_cids(c, cid) for c in rc]
+                losses.append(cluster_match_loss(cluster_matcher(left, right), left_cids, right_cids, cluster_matcher.null_bias))
+                n_pairs += 1
+                if len(losses) >= doc_bs:
+                    optimizer.zero_grad()
+                    torch.stack(losses).mean().backward()
+                    torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
+                    optimizer.step()
+                    total += sum(l.item() for l in losses)
+                    losses = []
+        if losses:
+            optimizer.zero_grad()
+            torch.stack(losses).mean().backward()
+            torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
+            optimizer.step()
+            total += sum(l.item() for l in losses)
+            losses = []
+        scheduler.step()
+        tr_loss = total / max(n_pairs, 1)
+        print(f"cluster pairs: {n_pairs}")
+
+        val_sets = {
+            "conll2012": (val_docs, val_clusters),
+            "litbank":   ([d for d in docs if d["split"] == "validation" and d["name"].startswith("litbank/")],
+                          [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("litbank/")]),
+            "preco":     ([d for d in docs if d["split"] == "validation" and d["name"].startswith("preco/")],
+                          [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("preco/")]),
+            "corefud":   ([d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
+                          [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("corefud/")]),
+        }
+        val_scores_all = {
+            ds: eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"val_{ds}_epoch{epoch+1}")
+            for ds, (vdocs, vclusters) in val_sets.items() if vdocs
+        }
+        val_scores = val_scores_all["conll2012"]
+        print(f"Loss: {tr_loss:.6f}")
+        for ds, sc in val_scores_all.items():
+            print(f"  {ds:10s} CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})")
+
+        if val_scores["CoNLL"] > best_val_f1 + 1e-4:
+            best_val_f1, patience_ctr = val_scores["CoNLL"], 0
+            torch.save({"cluster_matcher": cluster_matcher.state_dict(), "best_val_f1": best_val_f1}, ckpt_path)
+            print(f"✓ Best cluster matcher saved (val CoNLL F1 {best_val_f1:.4f})")
+        else:
+            patience_ctr += 1
+            print(f"No improvement. Patience: {patience_ctr}/{patience}")
+            if patience_ctr >= patience:
+                print(f"\n⊘ Early stopping. Best val CoNLL F1 {best_val_f1:.4f}")
+                break
+
+    print("\n✓ Stage B training complete")
+    cluster_matcher.load_state_dict(torch.load(ckpt_path, map_location=device)["cluster_matcher"])
+    cluster_matcher.eval()
+    print("\n=== Stage B Test ===")
+    test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
+    print(f"CoNLL {test_scores['CoNLL']:.4f} | MUC {test_scores['muc']:.4f} | B3 {test_scores['bcub']:.4f} | CEAFe {test_scores['ceafe']:.4f}")
+    if "by_type" in test_scores:
+        for bucket, sc in sorted(test_scores["by_type"].items()):
+            print(f"  {bucket:12s}  CoNLL {sc['CoNLL']:.4f}  MUC {sc['muc']:.4f}  B3 {sc['bcub']:.4f}  CEAFe {sc['ceafe']:.4f}")

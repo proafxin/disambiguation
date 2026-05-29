@@ -8,9 +8,10 @@ from transformers import AutoModel, AutoTokenizer
 from disambiguation.paths import MODELS_DIR
 
 CKPT_NAME = "stage2_global_coref.pt"
+CKPT_B_NAME = "stage2_cluster_matcher.pt"
 BACKBONE = "roberta-large"
 BGE_DIM = 1024
-CTX_DIM = 1024  # roberta-large hidden size
+CTX_DIM = 1024
 CONTENT = 128  # tokens per fixed window
 WINDOW = CONTENT + 2  # + <s>/</s>
 
@@ -22,7 +23,7 @@ class ContextEncoder(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        return F.normalize(out.last_hidden_state, p=2, dim=-1)  # (B, L, CTX_DIM) unit vectors
+        return F.normalize(out.last_hidden_state, p=2, dim=-1)
 
 
 def encode_document_ctx(
@@ -66,15 +67,17 @@ def compute_mention_ctx_vecs(
     return out
 
 
+# ── Stage A ───────────────────────────────────────────────────────────────────
+
 class AntecedentScorer(nn.Module):
     def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3, chunk: int = 8192):
         super().__init__()
-        self.chunk = chunk  # candidate pairs scored per FFNN batch
-        self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)  # contextual channel: [start; end] -> learned space
-        self.P_bge = nn.Linear(BGE_DIM, proj_dim)  # semantic channel: bge -> learned space
+        self.chunk = chunk
+        self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
+        self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
         self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
-        g = 2 * proj_dim  # per-mention representation: [ctx_proj ; bge_proj]
+        g = 2 * proj_dim
         self.ffnn = nn.Sequential(
             nn.Linear(2 * g + 32, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
@@ -84,7 +87,7 @@ class AntecedentScorer(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def mention_rep(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # (M, 2*proj_dim): projected [start;end] contextual channel concatenated with projected bge channel
+        # (M, 2*proj_dim)
         c = self.P_ctx(self.drop(ctx.flatten(1)))
         s = self.P_bge(self.drop(bge))
         return torch.cat([c, s], dim=-1)
@@ -95,9 +98,9 @@ class AntecedentScorer(nn.Module):
         M = ctx.shape[0]
         device = ctx.device
         idx = torch.arange(M, device=device)
-        ante_mask = idx.unsqueeze(0) < idx.unsqueeze(1)  # (M, M) j < i, all within same window
+        ante_mask = idx.unsqueeze(0) < idx.unsqueeze(1)
 
-        g = self.mention_rep(ctx, bge)  # (M, 2*proj_dim)
+        g = self.mention_rep(ctx, bge)
         scores = torch.zeros(M, M, device=device, dtype=g.dtype)
         i_idx, j_idx = ante_mask.nonzero(as_tuple=True)
         for s0 in range(0, i_idx.shape[0], self.chunk):
@@ -114,22 +117,101 @@ def mll_loss(
     ante_mask: torch.Tensor,
     cluster_id: torch.Tensor,
     null_bias: torch.Tensor,
-    sent_id: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M = scores.shape[0]
     idx = torch.arange(M, device=scores.device)
-    if sent_id is not None:
-        ante_mask = ante_mask & (sent_id.unsqueeze(0) == sent_id.unsqueeze(1))
     neg = torch.finfo(scores.dtype).min
     null_col = null_bias.expand(M, 1)
     denom = torch.logsumexp(torch.cat([null_col, scores.masked_fill(~ante_mask, neg)], dim=1), dim=1)
     gold = (cluster_id.unsqueeze(0) == cluster_id.unsqueeze(1)) & ante_mask
     has_gold = gold.any(dim=1)
-    # marginalize over ALL gold antecedents: any correct link yields the right cluster, so no coreferent is penalized
     gold_num = torch.logsumexp(scores.masked_fill(~gold, neg), dim=1)
     num = torch.where(has_gold, gold_num, null_bias.squeeze().expand(M))
     return (denom - num)[idx >= 1].mean()
 
+
+# ── Stage B ───────────────────────────────────────────────────────────────────
+
+class ClusterEncoder(nn.Module):
+    def __init__(self, proj_dim: int = 1024, dropout: float = 0.3):
+        super().__init__()
+        self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
+        self.P_bge = nn.Linear(BGE_DIM, proj_dim)
+        self.query = nn.Parameter(torch.randn(2 * proj_dim))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
+        # ctx: (M, 2, CTX_DIM), bge: (M, BGE_DIM) -> (2*proj_dim,)
+        m = torch.cat([self.P_ctx(self.drop(ctx.flatten(1))), self.P_bge(self.drop(bge))], dim=-1)  # (M, 2*proj_dim)
+        attn = torch.softmax(m @ self.query / (m.shape[-1] ** 0.5), dim=0)  # (M,)
+        return attn @ m  # (2*proj_dim,)
+
+
+class ClusterMatcher(nn.Module):
+    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3):
+        super().__init__()
+        self.cluster_enc = ClusterEncoder(proj_dim, dropout)
+        g = 2 * proj_dim
+        self.ffnn = nn.Sequential(
+            nn.Linear(2 * g, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self.null_bias = nn.Parameter(torch.zeros(1))
+
+    def encode_clusters(
+        self, clusters: list[tuple[torch.Tensor, torch.Tensor]]
+    ) -> torch.Tensor:
+        # clusters: list of (ctx, bge) -> (C, 2*proj_dim)
+        return torch.stack([self.cluster_enc(ctx, bge) for ctx, bge in clusters])
+
+    def forward(
+        self,
+        left: list[tuple[torch.Tensor, torch.Tensor]],
+        right: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        # returns (L, R) score matrix
+        gl = self.encode_clusters(left)   # (L, 2*proj_dim)
+        gr = self.encode_clusters(right)  # (R, 2*proj_dim)
+        L, R = gl.shape[0], gr.shape[0]
+        gi = gl.unsqueeze(1).expand(L, R, -1)
+        gj = gr.unsqueeze(0).expand(L, R, -1)
+        return self.ffnn(torch.cat([gi, gj], dim=-1)).squeeze(-1)  # (L, R)
+
+
+def cluster_match_loss(
+    scores: torch.Tensor,
+    left_cids: list[int],
+    right_cids: list[int],
+    null_bias: torch.Tensor,
+) -> torch.Tensor:
+    # MLL over right clusters + null for each left cluster.
+    neg = torch.finfo(scores.dtype).min
+    losses = []
+    for i, lcid in enumerate(left_cids):
+        gold_mask = torch.tensor([rcid == lcid for rcid in right_cids], device=scores.device)
+        denom = torch.logsumexp(torch.cat([null_bias, scores[i]]), dim=0)
+        if gold_mask.any():
+            num = torch.logsumexp(scores[i].masked_fill(~gold_mask, neg), dim=0)
+        else:
+            num = null_bias.squeeze()
+        losses.append(denom - num)
+    return torch.stack(losses).mean()
+
+
+def decode_cluster_matches(
+    scores: np.ndarray, null_bias: float
+) -> list[tuple[int, int]]:
+    # For each left cluster, link to best right cluster if score > null_bias.
+    pairs = []
+    for i in range(scores.shape[0]):
+        j = int(np.argmax(scores[i]))
+        if scores[i, j] > null_bias:
+            pairs.append((i, j))
+    return pairs
+
+
+# ── Shared utilities ──────────────────────────────────────────────────────────
 
 def _uf_find(parent: list, x: int) -> int:
     while parent[x] != x:
@@ -139,15 +221,12 @@ def _uf_find(parent: list, x: int) -> int:
 
 
 def decode_antecedents(
-    scores: np.ndarray, ante_mask: np.ndarray, null_bias: float = 0.0, sent_id: np.ndarray | None = None
+    scores: np.ndarray, ante_mask: np.ndarray, null_bias: float = 0.0
 ) -> list[list[int]]:
     M = scores.shape[0]
     parent = list(range(M))
     for i in range(1, M):
-        mask = ante_mask[i]
-        if sent_id is not None:
-            mask = mask & (sent_id[:M] == sent_id[i])
-        cand = np.where(mask)[0]
+        cand = np.where(ante_mask[i])[0]
         if len(cand) == 0:
             continue
         j = int(cand[np.argmax(scores[i, cand])])
