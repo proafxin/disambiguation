@@ -844,6 +844,11 @@ def train_stage_b(
     val_clusters   = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")]
     test_clusters  = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "test"       and d["name"].startswith("conll2012/")]
 
+    all_train_pairs_count = sum(
+        len(per_window) * (len(per_window) - 1) // 2
+        for per_window in train_clusters if per_window
+    )
+    print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     cluster_matcher = ClusterMatcher().to(device)
     optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=0.1)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
@@ -898,7 +903,6 @@ def train_stage_b(
             total += sum(lo.item() for lo in losses)
         scheduler.step()
         tr_loss = total / max(n_pairs, 1)
-        print(f"cluster pairs: {n_pairs}")
 
         val_sets = {
             "conll2012": (val_docs, val_clusters),
