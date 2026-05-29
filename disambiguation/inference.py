@@ -141,21 +141,22 @@ def _stage_b(
     bge_np = bge_vecs.cpu().numpy()
 
     with torch.inference_mode():
-        for k in range(len(windows) - 1):
-            lc = per_window[windows[k]]
-            rc = per_window[windows[k + 1]]
-            if not lc or not rc:
-                continue
-            left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(c, ctx_np, bge_np) for c in lc]]
-            right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(c, ctx_np, bge_np) for c in rc]]
-            scores = matcher(left, right).float().cpu().numpy()
-            pairs = decode_cluster_matches(scores, float(matcher.null_bias.item()))
-            lo, ro = win_offsets[windows[k]], win_offsets[windows[k + 1]]
-            for li, ri in pairs:
-                a, b = uf_find(lo + li), uf_find(ro + ri)
-                if a != b:
-                    parent[a] = b
-                    merge_log.append((windows[k], li, windows[k + 1], ri, float(scores[li, ri])))
+        for i in range(len(windows)):
+            for j in range(i + 1, len(windows)):
+                lc = per_window[windows[i]]
+                rc = per_window[windows[j]]
+                if not lc or not rc:
+                    continue
+                left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(c, ctx_np, bge_np) for c in lc]]
+                right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(c, ctx_np, bge_np) for c in rc]]
+                scores = matcher(left, right).float().cpu().numpy()
+                pairs = decode_cluster_matches(scores, float(matcher.null_bias.item()))
+                lo, ro = win_offsets[windows[i]], win_offsets[windows[j]]
+                for li, ri in pairs:
+                    a, b = uf_find(lo + li), uf_find(ro + ri)
+                    if a != b:
+                        parent[a] = b
+                        merge_log.append((windows[i], li, windows[j], ri, float(scores[li, ri])))
 
     groups: dict[int, list[int]] = {}
     for i in range(len(all_clusters)):

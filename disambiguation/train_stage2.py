@@ -659,39 +659,48 @@ if __name__ == "__main__":
     train_stage2()
 
 
-def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str) -> dict[int, list[int]]:
-    # Run Stage A decode on doc, return {win_id: [cluster_member_global_indices]} grouped by window.
-    # Returns per-window list of clusters, each cluster is a list of global mention indices.
-    ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()
-    bge = torch.from_numpy(d["mention_bge"]).to(device).float()
+def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str) -> dict[int, dict]:
+    # Returns {win_id: {"ctx": (Mw,2,CTX_DIM), "bge": (Mw,BGE_DIM),
+    #                   "clusters": list[list[int]],  # window-local indices
+    #                   "global_idx": np.ndarray}}    # local->global mention index map
+    ctx_all = d["ctx_vecs"]   # (M, 2, CTX_DIM)
+    bge_all = d["mention_bge"]  # (M, BGE_DIM)
     tok_pos = d["tok_pos"]
     win_ids = tok_pos // CONTENT
-    per_window: dict[int, list[list[int]]] = {}
+    per_window: dict[int, dict] = {}
     with torch.inference_mode():
         for w in np.unique(win_ids):
-            idx = np.where(win_ids == w)[0]
-            if len(idx) < 2:
-                per_window[int(w)] = [[int(i)] for i in idx]
-                continue
-            w_scores, w_mask = scorer(ctx[idx], bge[idx])
-            groups = decode_antecedents(
-                w_scores.float().cpu().numpy(), w_mask.cpu().numpy(), float(scorer.null_bias.item())
-            )
-            # singletons not in any group
-            grouped = {i for g in groups for i in g}
-            clusters = [[int(idx[i]) for i in g] for g in groups]
-            clusters += [[int(idx[i])] for i in range(len(idx)) if i not in grouped]
-            per_window[int(w)] = clusters
+            global_idx = np.where(win_ids == w)[0]
+            ctx_w = torch.from_numpy(ctx_all[global_idx]).to(device).float()
+            bge_w = torch.from_numpy(bge_all[global_idx]).to(device).float()
+            Mw = len(global_idx)
+            if Mw < 2:
+                local_clusters = [[i] for i in range(Mw)]
+            else:
+                w_scores, w_mask = scorer(ctx_w, bge_w)
+                groups = decode_antecedents(
+                    w_scores.float().cpu().numpy(), w_mask.cpu().numpy(), float(scorer.null_bias.item())
+                )
+                grouped = {i for g in groups for i in g}
+                local_clusters = [list(g) for g in groups]
+                local_clusters += [[i] for i in range(Mw) if i not in grouped]
+            per_window[int(w)] = {
+                "ctx": ctx_w.cpu().numpy(),
+                "bge": bge_w.cpu().numpy(),
+                "clusters": local_clusters,
+                "global_idx": global_idx,
+            }
     return per_window
 
 
 def _cluster_reps(
-    cluster: list[int], ctx: np.ndarray, bge: np.ndarray, device: str = "cpu"
+    local_cluster: list[int], ctx_w: np.ndarray, bge_w: np.ndarray
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    idx = np.array(cluster)
+    # ctx_w: (Mw, 2, CTX_DIM), bge_w: (Mw, BGE_DIM) — window-local arrays
+    idx = np.array(local_cluster)
     return (
-        torch.from_numpy(ctx[idx]).float(),   # (M, 2, CTX_DIM) — stays on CPU until batch
-        torch.from_numpy(bge[idx]).float(),   # (M, BGE_DIM)
+        torch.from_numpy(ctx_w[idx]).float(),
+        torch.from_numpy(bge_w[idx]).float(),
     )
 
 
@@ -703,7 +712,12 @@ def _cluster_gold_cids(cluster: list[int], cluster_id: np.ndarray) -> int:
 
 def _precompute_stage_a_clusters(
     docs: list, scorer: AntecedentScorer, device: str
-) -> list[dict[int, list[list[int]]]]:
+) -> list[dict[int, dict]]:
+    cache_path = MODELS_DIR / "stage_a_clusters_cache.pkl"
+    if cache_path.exists():
+        print("Loading cached Stage A clusters...")
+        with cache_path.open("rb") as f:
+            return pickle.load(f)
     print("Precomputing Stage A clusters...")
     result = []
     scorer.eval()
@@ -713,43 +727,56 @@ def _precompute_stage_a_clusters(
                 result.append({})
                 continue
             result.append(_stage_a_clusters_for_doc(d, scorer, device))
+    with cache_path.open("wb") as f:
+        pickle.dump(result, f)
+    print(f"Cached Stage A clusters to {cache_path.name}")
     return result
 
 
 def _predict_full_doc_clusters(
-    d: dict, per_window: dict[int, list[list[int]]], cluster_matcher: ClusterMatcher, device: str
+    d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher, device: str
 ) -> list[list]:
-    ctx, bge = d["ctx_vecs"], d["mention_bge"]
     windows = sorted(per_window.keys())
-    # initialise union-find over cluster indices (global across all windows)
+    # union-find over (win_id, local_cluster_idx) pairs
     # assign each cluster a unique global id
-    all_clusters: list[list[int]] = []
     win_offsets: dict[int, int] = {}
+    total = 0
     for w in windows:
-        win_offsets[w] = len(all_clusters)
-        all_clusters.extend(per_window[w])
-    parent = list(range(len(all_clusters)))
+        win_offsets[w] = total
+        total += len(per_window[w]["clusters"])
+    parent = list(range(total))
     with torch.inference_mode():
-        for k in range(len(windows) - 1):
-            left_clusters = per_window[windows[k]]
-            right_clusters = per_window[windows[k + 1]]
-            if not left_clusters or not right_clusters:
-                continue
-            left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(m, ctx, bge) for m in left_clusters]]
-            right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(m, ctx, bge) for m in right_clusters]]
-            scores = cluster_matcher(left, right).float().cpu().numpy()
-            pairs = decode_cluster_matches(scores, float(cluster_matcher.null_bias.item()))
-            lo, ro = win_offsets[windows[k]], win_offsets[windows[k + 1]]
-            for li, ri in pairs:
-                a, b = _uf_find(parent, lo + li), _uf_find(parent, ro + ri)
-                if a != b:
-                    parent[a] = b
+        for i in range(len(windows)):
+            for j in range(i + 1, len(windows)):
+                wi, wj = per_window[windows[i]], per_window[windows[j]]
+                lc, rc = wi["clusters"], wj["clusters"]
+                if not lc or not rc:
+                    continue
+                left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wi["ctx"], wi["bge"]) for cl in lc]]
+                right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wj["ctx"], wj["bge"]) for cl in rc]]
+                scores = cluster_matcher(left, right).float().cpu().numpy()
+                pairs = decode_cluster_matches(scores, float(cluster_matcher.null_bias.item()))
+                lo, ro = win_offsets[windows[i]], win_offsets[windows[j]]
+                for li, ri in pairs:
+                    a, b = _uf_find(parent, lo + li), _uf_find(parent, ro + ri)
+                    if a != b:
+                        parent[a] = b
     groups: dict[int, list[int]] = {}
-    for i in range(len(all_clusters)):
+    for i in range(total):
         groups.setdefault(_uf_find(parent, i), []).append(i)
     result = []
     for members in groups.values():
-        spans = [d["spans"][m] for ci in members for m in all_clusters[ci]]
+        spans = []
+        for ci in members:
+            # find which window this cluster belongs to
+            for w in windows:
+                lo = win_offsets[w]
+                lc = per_window[w]["clusters"]
+                if lo <= ci < lo + len(lc):
+                    local_cluster = lc[ci - lo]
+                    global_idx = per_window[w]["global_idx"]
+                    spans.extend(d["spans"][global_idx[li]] for li in local_cluster)
+                    break
         if len(spans) >= 2:
             result.append(spans)
     return result
@@ -833,18 +860,22 @@ def train_stage_b(
         for bi in tqdm(order, desc="train_b"):
             d = train_docs[bi]
             per_window = train_clusters[bi]
-            if not per_window or "ctx_vecs" not in d:
+            if not per_window:
                 continue
-            ctx, bge, cid = d["ctx_vecs"], d["mention_bge"], d["cluster_id"]
+            cid = d["cluster_id"]
             windows = sorted(per_window.keys())
-            for k in range(len(windows) - 1):
-                lc, rc = per_window[windows[k]], per_window[windows[k + 1]]
-                if not lc or not rc:
-                    continue
-                left  = [(torch.from_numpy(ctx[np.array(c)]).to(device).float(), torch.from_numpy(bge[np.array(c)]).to(device).float()) for c in lc]
-                right = [(torch.from_numpy(ctx[np.array(c)]).to(device).float(), torch.from_numpy(bge[np.array(c)]).to(device).float()) for c in rc]
-                pending.append((left, right, [_cluster_gold_cids(c, cid) for c in lc], [_cluster_gold_cids(c, cid) for c in rc]))
-                n_pairs += 1
+            for i in range(len(windows)):
+                for j in range(i + 1, len(windows)):
+                    wi, wj = per_window[windows[i]], per_window[windows[j]]
+                    lc, rc = wi["clusters"], wj["clusters"]
+                    if not lc or not rc:
+                        continue
+                    left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wi["ctx"], wi["bge"]) for cl in lc]]
+                    right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, wj["ctx"], wj["bge"]) for cl in rc]]
+                    left_cids  = [_cluster_gold_cids([wi["global_idx"][li] for li in cl], cid) for cl in lc]
+                    right_cids = [_cluster_gold_cids([wj["global_idx"][li] for li in cl], cid) for cl in rc]
+                    pending.append((left, right, left_cids, right_cids))
+                    n_pairs += 1
             if len(pending) >= doc_bs:
                 optimizer.zero_grad()
                 losses = [cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending]

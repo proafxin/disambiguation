@@ -163,7 +163,27 @@ class ClusterMatcher(nn.Module):
         self, clusters: list[tuple[torch.Tensor, torch.Tensor]]
     ) -> torch.Tensor:
         # clusters: list of (ctx, bge) -> (C, 2*proj_dim)
-        return torch.stack([self.cluster_enc(ctx, bge) for ctx, bge in clusters])
+        # pad all clusters to same member count for batched forward
+        max_m = max(ctx.shape[0] for ctx, _ in clusters)
+        ctx_pad = torch.zeros(len(clusters), max_m, 2 * CTX_DIM, device=self.query.device, dtype=clusters[0][0].dtype)
+        bge_pad = torch.zeros(len(clusters), max_m, BGE_DIM, device=self.query.device, dtype=clusters[0][1].dtype)
+        lengths = []
+        for k, (ctx, bge) in enumerate(clusters):
+            m = ctx.shape[0]
+            ctx_pad[k, :m] = ctx.flatten(1)
+            bge_pad[k, :m] = bge
+            lengths.append(m)
+        c = self.P_ctx(self.drop(ctx_pad))  # (C, max_m, proj_dim)
+        s = self.P_bge(self.drop(bge_pad))  # (C, max_m, proj_dim)
+        m_all = torch.cat([c, s], dim=-1)   # (C, max_m, 2*proj_dim)
+        # masked attention: zero out padding positions
+        mask = torch.zeros(len(clusters), max_m, device=self.query.device)
+        for k, l in enumerate(lengths):
+            mask[k, :l] = 1.0
+        attn = (m_all @ self.query) / (m_all.shape[-1] ** 0.5)  # (C, max_m)
+        attn = attn.masked_fill(mask == 0, float("-inf"))
+        attn = torch.softmax(attn, dim=1).unsqueeze(-1)  # (C, max_m, 1)
+        return (attn * m_all).sum(dim=1)  # (C, 2*proj_dim)
 
     def forward(
         self,
