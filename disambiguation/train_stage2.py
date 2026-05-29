@@ -1,5 +1,4 @@
 import datetime
-import itertools
 import json
 import pickle
 import random
@@ -371,27 +370,28 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device) -> None:
     print(f"Cached span ctx to {SPAN_CTX_CACHE.name}/")
 
 
-def _sent_id(d: dict, device=None):
-    sent = np.asarray([sp[0] for sp in d["spans"]], dtype=np.int64)
-    return sent if device is None else torch.from_numpy(sent).to(device)
-
-
 def doc_scores(
     d: dict, encoder, scorer, cls_id, sep_id, device
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> list[tuple[torch.Tensor, torch.Tensor, np.ndarray]]:
     if encoder is None:
-        ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()  # (M, 2, CTX_DIM): start, end
+        ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()
     else:
         ctx_doc = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
         ctx = compute_mention_ctx_vecs(ctx_doc, d["span_sub"])
     bge = torch.from_numpy(d["mention_bge"]).to(device).float()
-    tok_pos = torch.from_numpy(d["tok_pos"]).to(device)
-    scores, ante_mask = scorer(ctx, bge, tok_pos)
-    return scores, ante_mask, scorer.null_bias
+    win_ids = d["tok_pos"] // CONTENT
+    results = []
+    for w in np.unique(win_ids):
+        idx = np.where(win_ids == w)[0]
+        if len(idx) < 2:
+            continue
+        w_scores, w_mask = scorer(ctx[idx], bge[idx])
+        results.append((w_scores, w_mask, idx))
+    return results
 
 
 def run_epoch(
-    encoder, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence=False
+    encoder, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs
 ) -> float:
     train = optimizer is not None
     total, ndoc = 0.0, 0
@@ -402,16 +402,11 @@ def run_epoch(
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
             losses = []
             for d in batch:
-                scores, ante_mask, null_bias = doc_scores(d, encoder, scorer, cls_id, sep_id, device)
-                losses.append(
-                    mll_loss(
-                        scores,
-                        ante_mask,
-                        torch.from_numpy(d["cluster_id"]).to(device),
-                        null_bias,
-                        _sent_id(d, device) if intra_sentence else None,
-                    )
-                )
+                cluster_id = torch.from_numpy(d["cluster_id"]).to(device)
+                for w_scores, w_mask, idx in doc_scores(d, encoder, scorer, cls_id, sep_id, device):
+                    losses.append(mll_loss(w_scores, w_mask, cluster_id[idx], scorer.null_bias))
+            if not losses:
+                continue
             loss = torch.stack(losses).mean()
         if train:
             loss.backward()
@@ -425,53 +420,45 @@ def run_epoch(
     return total / max(ndoc, 1)
 
 
-def predict_clusters(d: dict, encoder, scorer, cls_id, sep_id, device, intra_sentence=False) -> list:
+def predict_clusters(d: dict, encoder, scorer, cls_id, sep_id, device) -> list:
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-        scores, ante_mask, null_bias = doc_scores(d, encoder, scorer, cls_id, sep_id, device)
-    groups = decode_antecedents(
-        scores.float().cpu().numpy(),
-        ante_mask.cpu().numpy(),
-        float(null_bias.item()),
-        _sent_id(d) if intra_sentence else None,
-    )
-    return [[d["spans"][i] for i in g] for g in groups]
+        windows = doc_scores(d, encoder, scorer, cls_id, sep_id, device)
+    clusters = []
+    null_bias = float(scorer.null_bias.item())
+    for w_scores, w_mask, idx in windows:
+        groups = decode_antecedents(w_scores.float().cpu().numpy(), w_mask.cpu().numpy(), null_bias)
+        clusters.extend([d["spans"][idx[i]] for i in g] for g in groups)
+    return clusters
 
 
-def _key_clusters(d: dict, intra_sentence: bool, window: int | None = None) -> list:
-    if window is not None:  # Stage A gold: split each entity at token gaps > window (within-window reachable groups)
-        pos, cid = d["tok_pos"], d["cluster_id"]
+def _key_clusters(d: dict, window: int | None = None) -> list:
+    if window is not None:
+        # gold for Stage A: split each entity cluster at fixed window boundaries
+        win_ids = d["tok_pos"] // window
+        cid = d["cluster_id"]
         out: list = []
         for c in np.unique(cid):
-            members = sorted((int(i) for i in np.where(cid == c)[0]), key=lambda i: pos[i])
-            comp = [members[0]]
-            for prev, cur in itertools.pairwise(members):
-                if pos[cur] - pos[prev] <= window:
-                    comp.append(cur)
-                else:
+            members = np.where(cid == c)[0]
+            for w in np.unique(win_ids[members]):
+                comp = members[win_ids[members] == w].tolist()
+                if len(comp) >= 2:
                     out.append(comp)
-                    comp = [cur]
-            out.append(comp)
-        return [[d["spans"][i] for i in comp] for comp in out if len(comp) >= 2]
-    if not intra_sentence:
-        return [[d["spans"][i] for i in np.where(d["cluster_id"] == c)[0]] for c in np.unique(d["cluster_id"])]
-    groups: dict = {}
-    for i, c in enumerate(d["cluster_id"]):
-        groups.setdefault((int(c), d["spans"][i][0]), []).append(i)
-    return [[d["spans"][i] for i in members] for members in groups.values() if len(members) >= 2]
+        return [[d["spans"][i] for i in comp] for comp in out]
+    return [[d["spans"][i] for i in np.where(d["cluster_id"] == c)[0]] for c in np.unique(d["cluster_id"])]
 
 
 def eval_conll(
-    encoder, scorer, docs, cls_id, sep_id, device, tag, intra_sentence=False, type_breakdown=False,
+    encoder, scorer, docs, cls_id, sep_id, device, tag, type_breakdown=False,
     window: int | None = None,
 ) -> dict:
-    key_docs = [(d["name"], d["sentences"], _key_clusters(d, intra_sentence, window)) for d in docs]
+    key_docs = [(d["name"], d["sentences"], _key_clusters(d, window)) for d in docs]
     key_path = MODELS_DIR / f"stage2_{tag}_key.conll"
     write_conll(key_path, key_docs)
     resp_docs = [
         (
             d["name"],
             d["sentences"],
-            predict_clusters(d, encoder, scorer, cls_id, sep_id, device, intra_sentence),
+            predict_clusters(d, encoder, scorer, cls_id, sep_id, device),
         )
         for d in tqdm(docs, desc=f"eval/{tag}")
     ]
@@ -485,7 +472,6 @@ def eval_conll(
 
 def train_stage2(
     finetune: bool = False,
-    intra_sentence: bool = False,
     roberta_lr: float = 2e-5,
     head_lr: float = 1e-3,
     max_epochs: int | None = None,
@@ -541,10 +527,6 @@ def train_stage2(
             list(scorer.parameters()), lr=head_lr, weight_decay=0.1
         )
         enc_loop, ckpt_path, tag = None, MODELS_DIR / "stage2_frozen_head.pt", "frozen"
-    if intra_sentence:
-        tag = f"{tag}_intra"
-        ckpt_path = ckpt_path.with_name(f"{ckpt_path.stem}_intra{ckpt_path.suffix}")
-    print(f"intra_sentence={intra_sentence}")
     head_params = sum(p.numel() for p in scorer.parameters())
     print(f"head params: {head_params:,} | doc_bs={doc_bs} epochs={max_epochs}")
     print(f"train docs: {len(train_docs)} | conll val: {len(conll_val_docs)} | conll test: {len(conll_test_docs)}")
@@ -568,7 +550,7 @@ def train_stage2(
             enc_loop.train()
         scorer.train()
         tr_loss = run_epoch(
-            enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, intra_sentence
+            enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs
         )
         scheduler.step()
         if enc_loop is not None:
@@ -576,11 +558,11 @@ def train_stage2(
         scorer.eval()
         with torch.inference_mode():
             val_loss = run_epoch(
-                enc_loop, scorer, conll_val_docs, None, cls_id, sep_id, device, doc_bs, intra_sentence
+                enc_loop, scorer, conll_val_docs, None, cls_id, sep_id, device, doc_bs
             )
         val_scores = {
             ds: eval_conll(
-                enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_val_{ds}", intra_sentence, window=CONTENT
+                enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_val_{ds}", window=CONTENT
             )
             for ds, vdocs in val_sets.items()
             if vdocs
@@ -635,7 +617,6 @@ def train_stage2(
         sep_id,
         device,
         f"{tag}_test",
-        intra_sentence,
         type_breakdown=True,
         window=CONTENT,
     )
@@ -655,7 +636,7 @@ def train_stage2(
     metrics["eval_dataset"] = "conll2012_test"
     final_val_scores = {
         ds: eval_conll(
-            enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_final_val_{ds}", intra_sentence, window=CONTENT
+            enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_final_val_{ds}", window=CONTENT
         )
         for ds, vdocs in val_sets.items()
         if vdocs

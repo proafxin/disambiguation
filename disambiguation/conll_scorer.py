@@ -64,6 +64,30 @@ def mention_type(words: list[str]) -> str:
     return "NOUN"
 
 
+# Per-mention agreement class for the scorer: 0 NOUN, 1 PROPN, 2-9 pronoun agreement classes.
+N_MENTION_CLASS = 10
+_PRON_CLASS = {
+    **dict.fromkeys(["i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "ourselves"], 2),  # 1st
+    **dict.fromkeys(["you", "your", "yours", "yourself", "yourselves"], 3),  # 2nd
+    **dict.fromkeys(["he", "him", "his", "himself"], 4),  # 3sg masc
+    **dict.fromkeys(["she", "her", "hers", "herself"], 5),  # 3sg fem
+    **dict.fromkeys(["it", "its", "itself"], 6),  # 3sg neuter
+    **dict.fromkeys(["they", "them", "their", "theirs", "themselves"], 7),  # 3pl
+    **dict.fromkeys(["who", "whom", "whose", "which", "that", "this", "these", "those", "there"], 8),  # rel/dem
+}
+
+
+def mention_class(words: list[str]) -> int:
+    if not words:
+        return 0
+    t = mention_type(words)
+    if t == "NOUN":
+        return 0
+    if t == "PROPN":
+        return 1
+    return _PRON_CLASS.get(words[0].lower(), 9)  # 9 = other pronoun
+
+
 def cluster_type_label(cluster: list, sentences: list[list[str]]) -> str:
     # Returns a frozenset of mention types present in the cluster, e.g. frozenset({'PRON','NOUN'})
     types = set()

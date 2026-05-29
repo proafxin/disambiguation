@@ -11,8 +11,7 @@ CKPT_NAME = "stage2_global_coref.pt"
 BACKBONE = "roberta-large"
 BGE_DIM = 1024
 CTX_DIM = 1024  # roberta-large hidden size
-CONTENT = 128  # context subtokens per sliding window
-STRIDE = 64  # window step; overlap = CONTENT - STRIDE = 64
+CONTENT = 128  # tokens per fixed window
 WINDOW = CONTENT + 2  # + <s>/</s>
 
 
@@ -30,13 +29,7 @@ def encode_document_ctx(
     content_ids: np.ndarray, encoder: "ContextEncoder", cls_id: int, sep_id: int, device: str
 ) -> torch.Tensor:
     n = len(content_ids)
-    spans, start = [], 0
-    while True:
-        end = min(start + CONTENT, n)
-        spans.append((start, end))
-        if end >= n:
-            break
-        start += STRIDE
+    spans = [(s, min(s + CONTENT, n)) for s in range(0, n, CONTENT)]
     width = max(e - s for s, e in spans) + 2
     ids = np.ones((len(spans), width), dtype=np.int64)
     mask = np.zeros((len(spans), width), dtype=np.int64)
@@ -82,8 +75,8 @@ class AntecedentScorer(nn.Module):
         self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
         self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
         g = 2 * proj_dim  # per-mention representation: [ctx_proj ; bge_proj]
-        self.ffnn = nn.Sequential(  # full-signal pairwise classifier: [g_i, g_j, g_i*g_j, dist]
-            nn.Linear(3 * g + 32, hidden), nn.ReLU(), nn.Dropout(dropout),
+        self.ffnn = nn.Sequential(
+            nn.Linear(2 * g + 32, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
@@ -97,23 +90,21 @@ class AntecedentScorer(nn.Module):
         return torch.cat([c, s], dim=-1)
 
     def forward(
-        self, ctx: torch.Tensor, bge: torch.Tensor, tok_pos: torch.Tensor, window: int = CONTENT
+        self, ctx: torch.Tensor, bge: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         M = ctx.shape[0]
         device = ctx.device
         idx = torch.arange(M, device=device)
-        ante = idx.unsqueeze(0) < idx.unsqueeze(1)  # (M, M) j < i
-        tok = tok_pos.unsqueeze(1) - tok_pos.unsqueeze(0)  # token dist; >= 0 for j < i (mentions sorted)
-        ante_mask = ante & (tok <= window)  # local: candidate only if within the context window
+        ante_mask = idx.unsqueeze(0) < idx.unsqueeze(1)  # (M, M) j < i, all within same window
 
-        g = self.mention_rep(ctx, bge)  # (M, 2*proj_dim) per-mention rep
+        g = self.mention_rep(ctx, bge)  # (M, 2*proj_dim)
         scores = torch.zeros(M, M, device=device, dtype=g.dtype)
-        i_idx, j_idx = ante_mask.nonzero(as_tuple=True)  # in-window candidate pairs
+        i_idx, j_idx = ante_mask.nonzero(as_tuple=True)
         for s0 in range(0, i_idx.shape[0], self.chunk):
             ii, jj = i_idx[s0 : s0 + self.chunk], j_idx[s0 : s0 + self.chunk]
             gi, gj = g[ii], g[jj]
             bucket = torch.bucketize((ii - jj).clamp(min=0), self.dist_bounds, right=True)
-            feat = torch.cat([gi, gj, gi * gj, self.dist_emb(bucket)], dim=-1)
+            feat = torch.cat([gi, gj, self.dist_emb(bucket)], dim=-1)
             scores[ii, jj] = self.ffnn(feat).squeeze(-1).to(scores.dtype)
         return scores, ante_mask
 
