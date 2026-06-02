@@ -70,16 +70,21 @@ def compute_mention_ctx_vecs(
 # ── Stage A ───────────────────────────────────────────────────────────────────
 
 class AntecedentScorer(nn.Module):
-    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3, chunk: int = 8192):
+    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3, chunk: int = 8192,
+                 use_lexical: bool = False, use_agreement: bool = False):
         super().__init__()
         self.chunk = chunk
+        self.use_lexical = use_lexical
+        self.use_agreement = use_agreement
         self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
         self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
         self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
         g = 2 * proj_dim
+        # lexical: same_lemma, same_surface (2); agreement: NER-type, number, gender match (3)
+        n_lex = (2 if use_lexical else 0) + (3 if use_agreement else 0)
         self.ffnn = nn.Sequential(
-            nn.Linear(2 * g + 32, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(2 * g + 32 + n_lex, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
@@ -93,8 +98,9 @@ class AntecedentScorer(nn.Module):
         return torch.cat([c, s], dim=-1)
 
     def forward(
-        self, ctx: torch.Tensor, bge: torch.Tensor
+        self, ctx: torch.Tensor, bge: torch.Tensor, nom_lex: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # nom_lex: (M, 2) int64 [head lemma_id, head surface_id]; only used when use_lexical
         M = ctx.shape[0]
         device = ctx.device
         idx = torch.arange(M, device=device)
@@ -107,7 +113,26 @@ class AntecedentScorer(nn.Module):
             ii, jj = i_idx[s0 : s0 + self.chunk], j_idx[s0 : s0 + self.chunk]
             gi, gj = g[ii], g[jj]
             bucket = torch.bucketize((ii - jj).clamp(min=0), self.dist_bounds, right=True)
-            feat = torch.cat([gi, gj, self.dist_emb(bucket)], dim=-1)
+            parts = [gi, gj, self.dist_emb(bucket)]
+            if self.use_lexical:
+                if nom_lex is None:
+                    lex = torch.zeros(ii.shape[0], 2, device=device, dtype=gi.dtype)
+                else:
+                    same_lemma = (nom_lex[ii, 0] == nom_lex[jj, 0]).to(gi.dtype)
+                    same_surface = (nom_lex[ii, 1] == nom_lex[jj, 1]).to(gi.dtype)
+                    lex = torch.stack([same_lemma, same_surface], dim=-1)
+                parts.append(lex)
+            if self.use_agreement:
+                if nom_lex is None:
+                    agr = torch.zeros(ii.shape[0], 3, device=device, dtype=gi.dtype)
+                else:
+                    # match only counts when the attribute is known (id != 0)
+                    ner = ((nom_lex[ii, 2] == nom_lex[jj, 2]) & (nom_lex[ii, 2] != 0)).to(gi.dtype)
+                    num = ((nom_lex[ii, 3] == nom_lex[jj, 3]) & (nom_lex[ii, 3] != 0)).to(gi.dtype)
+                    gen = ((nom_lex[ii, 4] == nom_lex[jj, 4]) & (nom_lex[ii, 4] != 0)).to(gi.dtype)
+                    agr = torch.stack([ner, num, gen], dim=-1)
+                parts.append(agr)
+            feat = torch.cat(parts, dim=-1)
             scores[ii, jj] = self.ffnn(feat).squeeze(-1).to(scores.dtype)
         return scores, ante_mask
 
