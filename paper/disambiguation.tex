@@ -1,48 +1,39 @@
 \documentclass[12pt]{article}
 \usepackage{jmlr2e}
 \let\circledR\relax\let\circledS\relax\usepackage{newcomputermodern}
-\usepackage{lastpage}
-\usepackage{amsmath}
-\usepackage{amssymb}
-\usepackage{booktabs}
+\usepackage{amsmath,amssymb,enumerate,booktabs,lastpage}
 
 \newtheorem{hypothesis}{Hypothesis}
 
 \jmlrheading{27}{2026}{1-\pageref{LastPage}}{1/26; Revised 5/26}{9/26}{26-0000}{Masum Billal}
 
-\ShortHeadings{Global Entity Disambiguation}{Masum Billal}
+\ShortHeadings{Global Entity Resolution}{Masum Billal}
 \firstpageno{1}
 
 \begin{document}
 
-	\title{Global Entity Disambiguation by Signal Decomposition}
+	\title{Global Coreference Resolution via Local Resolution and Quotient-Graph Inference}
 
-	\author{\name Masum Billal \email billalmasum93@gmail.com}
+	\author{\name Masum Billal \email billalmasum93@gmail.com \addr}
 
 	\editor{TBD}
 
 	\maketitle
 
 	\begin{abstract}
-		This paper studies a factorized architecture for global entity disambiguation that replaces end-to-end global self-attention over full documents with a staged pipeline of frozen specialist encoders and cluster-level reasoning. The proposed system decomposes representation learning into independent semantic and contextual channels and performs inference through two stages: (i) local windowed coreference resolution over fixed-length segments, and (ii) cross-window cluster matching on a quotient graph of locally induced entity clusters.
-
-		Unlike standard end-to-end coreference systems, all large pretrained encoders (BGE and RoBERTa) are kept frozen, and only lightweight scoring and aggregation modules are trained. Despite this constraint, the full system achieves a CoNLL F$_1$ score of 0.8533 on CoNLL-2012 under standard evaluation.
-
-		Empirically, we find that (i) separating semantic and contextual information into distinct channels improves stability over scalar similarity-based scoring, (ii) local window resolution captures most within-segment coreference structure, and (iii) cross-window consistency can be recovered through cluster-level matching on a compressed representation of the mention graph. The results suggest that strong coreference performance can be achieved without fine-tuning large language encoders and without explicit full-document quadratic attention, provided that representation factorization and hierarchical aggregation are used.
+		This paper proposes a factorized architecture for global entity disambiguation or coreference resolution to replace full document quadratic attention with a two-stage inference pipeline. The model separates semantic and contextual representations using independent frozen encoders and performs inference through local window-based clustering of mentions and cross-window matching over cluster-level representations constructed from a quotient graph. All pretrained encoders (RoBERTa and BGE) are kept frozen, and only lightweight scoring and aggregation modules are trained. Despite this constraint, the system achieves a CoNLL F$_1$ score of 0.8533 on CoNLL-2012 (gold mentions), comparable to fine-tuned end-to-end baselines. Empirically, we find that local window clustering captures most within-segment coreference structure, while cluster-level representations are sufficient for recovering long-range dependencies. The results suggest that hierarchical clustering over frozen representations can serve as a feasible alternative to full-document attention for coreference resolution.
 	\end{abstract}
 
-	%\begin{keywords}
-	%	Coreference Resolution, Information Channels, Channel Factorization, Linear Time Complexity, Green AI
-	%\end{keywords}
+	\begin{keywords}
+		coreference resolution, entity disambiguation, hierarchical clustering, frozen language models, window-based inference, quotient graph, representation factorization, efficient inference
+	\end{keywords}
 
 	\section{Introduction}\label{sec:intro}
-	Coreference resolution aims to recover an equivalence relation over a set of nominal mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ in a document, where $m_i \sim m_j$ indicates that two mentions refer to the same underlying entity. The induced partition $\mathcal{E} = \{E_1, \ldots, E_k\}$ defines the entity structure of the document. Standard approaches model this problem by scoring mention pairs, often using contextualized representations produced by transformer encoders with full-document self-attention. While effective, these approaches couple representation learning and global inference inside a single end-to-end model, typically incurring $O(N^2)$ attention cost and requiring full-document contextualization during encoding.
+	Coreference resolution aims to recover an equivalence relation over a set of nominal mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ in a document, where $m_i \sim m_j$ indicates that two mentions refer to the same underlying entity. The induced partition $\mathcal{E} = \{E_1, \ldots, E_k\}$ defines the entity structure of the document.
 
-	This paper investigates an alternative architectural decomposition in which representation learning and global inference are explicitly separated. Instead of relying on a single monolithic model that jointly encodes and resolves entity structure, we construct a staged system composed of frozen pretrained encoders, local windowed inference, and cluster-level global reconciliation.
+	Modern coreference systems perform entity resolution through direct mention-level interaction over the entire document. Whether implemented through pairwise scoring, mention ranking, or transformer self-attention, the dominant paradigm assumes that global entity structure must be inferred from a space in which individual mentions remain the primary objects of reasoning throughout inference.
 
-
-	The proposed system consists of three components:
-
+	This paper investigates a different hypothesis: global entity resolution may not require global mention-level reasoning. Instead, most entity structure may be recoverable through local resolution within bounded contexts, after which global consistency can be reconstructed through interactions between locally induced entity clusters. If true, the problem can be reformulated from global mention inference to hierarchical entity construction. The proposed system consists of three components:
 	\begin{enumerate}
 		\item \textbf{Channel-separated representation:} Each mention is encoded using two frozen encoders that produce distinct semantic (surface-based) and contextual representations. These are kept separate throughout inference rather than collapsed into a single vector.
 
@@ -55,11 +46,95 @@
 
 	The main contributions of this work are:
 	\begin{itemize}
-		\item A factorized coreference architecture that separates semantic and contextual information into independent channels using frozen pretrained encoders.
-		\item A two-stage inference pipeline consisting of windowed local clustering followed by cluster-level matching on a quotient graph.
-		\item Empirical results on CoNLL-2012 showing that strong coreference performance (F$_1$ = 0.8533) can be achieved without fine-tuning large encoders and without full-document self-attention.
-		\item An analysis of how hierarchical compression from mentions to clusters enables efficient global reasoning over long documents.
+
+		\item We formulate global coreference resolution as a hierarchical inference problem in which entity clusters, rather than mentions, become the primary objects of global reasoning.
+
+		\item We introduce a quotient-graph formulation that lifts locally resolved mention clusters into a reduced entity space for cross-window inference.
+
+		\item We demonstrate that strong full-document coreference performance can be achieved without full-document self-attention and without fine-tuning large pretrained encoders.
+
+		\item We provide empirical evidence that most coreference structure is recoverable through bounded local resolution, with long-range dependencies reconstructed through cluster-level reconciliation.
 	\end{itemize}
+	Unlike prior long-document coreference systems, the proposed approach does not approximate global mention interactions through sparse attention, sliding or overlapping windows, memory mechanisms, or document chunking followed by mention-level reconciliation. Instead, local resolution is treated as an explicit clustering stage whose outputs become the nodes of a quotient graph. Global inference is then performed exclusively over cluster representations. To our knowledge, existing neural coreference systems have not evaluated whether full-document entity structure can be recovered through this form of quotient-space reasoning.
+
+	\section{Model Class Definition}
+	\label{sec:model_class}
+
+	We formalize the proposed system as a structured inference model over a partitioned mention space. The key property of the model class is the absence of any cross-partition mention-level interaction during local inference, followed by a single lifting step to a quotient space where global reasoning is performed exclusively over aggregated cluster representations. Let a document be represented as a sequence of tokens from which a set of mentions
+	\begin{align*}
+		\mathcal{M} = \{m_1, m_2, \dots, m_N\}
+	\end{align*}
+	is extracted. The document is partitioned into a collection of disjoint, non-overlapping windows
+	\begin{align*}
+		\mathcal{W}
+			& = \{W_1, W_2, \dots, W_K\}
+	\end{align*}
+	such that $W_i \cap W_j = \emptyset\forall i \neq j$ and
+	\begin{align*}
+		\bigcup_{i=1}^{K} W_i
+			& = \mathcal{M}
+	\end{align*}
+	Each mention belongs to exactly one window via a deterministic assignment function $\pi: \mathcal{M} \rightarrow \mathcal{W}$. Let $f_\theta$ denote a frozen mention encoder producing representations:
+	\begin{align*}
+		\mathbf{h}_i
+			& = f_\theta(m_i) \in \mathbb{R}^d
+	\end{align*}
+	For each window $W_k$, we define a restricted local model:
+	\begin{align*}
+		\mathcal{F}_k
+			& = \{ f_\theta(m) \mid m \in W_k \}
+	\end{align*}
+	Within each window $W_k$, we define a local coreference relation:
+	\begin{align*}
+		\sim_k
+			& \subseteq W_k \times W_k
+	\end{align*}
+	computed via a scoring function:
+	\begin{align*}
+		s_\theta:
+			& \mathbb{R}^d \times \mathbb{R}^d \rightarrow \mathbb{R}
+	\end{align*}
+	Two mentions are linked if
+	\begin{align*}
+		m_i \sim_k m_j \iff s_\theta(\mathbf{h}_i, \mathbf{h}_j) > \tau
+	\end{align*}
+
+	Let $\sim_k^*$ denote the transitive closure of this relation, inducing a partition $\mathcal{C}_k= W_k / \sim_k^*$. Stage A produces a collection of disjoint local clusters:
+	\begin{align*}
+		\mathcal{C}
+			& = \bigcup_{k=1}^{K} \mathcal{C}_k
+	\end{align*}
+	Each cluster satisfies $C \subseteq W_k$ for exactly one $k$. We define a quotient mapping $q: \mathcal{M} \rightarrow \mathcal{C}$ inducing the quotient space $\mathcal{Q} = \mathcal{C}$. Each cluster $C \in \mathcal{Q}$ is treated as an atomic node in subsequent inference. Each cluster is embedded via a permutation-invariant function $E: \mathcal{Q} \rightarrow \mathbb{R}^d$.
+	\begin{align*}
+		E(C)
+			& = \mathrm{Agg}(\{ \mathbf{h}_i \mid m_i \in C \})
+	\end{align*}
+	We define a fully connected weighted graph $G_Q= (\mathcal{Q}, E_Q)$ over clusters with edge scoring function:
+	\begin{align*}
+		\sigma:
+			& \mathbb{R}^d \times \mathbb{R}^d \rightarrow \mathbb{R}
+	\end{align*}
+	Cluster-level coreference is defined as
+	\begin{align*}
+		C_a \sim_Q C_b \iff \sigma(E(C_a), E(C_b)) > \beta
+	\end{align*}
+	Let $\sim_Q^*$ denote the transitive closure over cluster relations. The final entity partition is:
+	\begin{align*}
+		\mathcal{E}
+			& = \mathcal{Q} / \sim_Q^*
+	\end{align*}
+	All cross-window reasoning is restricted to
+	\begin{align*}
+		\mathcal{Q}
+			& = \bigcup_k (W_k / \sim_k^*)
+	\end{align*}
+	and not $\mathcal{M}$. Standard neural coreference models operate over a global mention interaction function
+	\begin{align*}
+		f:
+			& \mathcal{M} \times \mathcal{M} \rightarrow \mathbb{R}
+	\end{align*}
+	possibly with pruning. In contrast, this model class enforces a strict factorization of inference into:
+	(i) disjoint local equivalence construction and (ii) quotient-space graph inference over induced clusters.
 	\section{Experimental Setup}
 	We study coreference resolution over a set of mentions $\mathcal{M}$ extracted from documents in the CoNLL-2012 dataset. All experiments are conducted on the CoNLL-2012 English coreference benchmark \citep{pradhan2012conll}. All reported results assume gold mention boundaries. The system performs clustering over provided mentions and does not include a mention detection component. We report standard CoNLL $F_1$, defined as the average of MUC, B$^3$, and CEAFe scores. We distinguish three evaluation settings:
 
@@ -80,15 +155,7 @@
 	\section{Theoretical Foundation and Design Principles}
 	\label{sec:hypothesis}
 
-	We model coreference resolution as the construction of an entity partition over a set of mentions. Let
-	\begin{align}
-		\mathcal{M} = \{m_1, \ldots, m_n\}
-	\end{align}
-	denote the set of mentions in a document. We define the coreference relation as
-	\begin{align}
-		\sim \subseteq \mathcal{M} \times \mathcal{M},
-	\end{align}
-	where $m_i \sim m_j$ if and only if both mentions refer to the same underlying entity. Since coreference is an equivalence relation, it induces a partition of $\mathcal{M}$ into disjoint entity sets $\mathcal{E} = \{E_1, \ldots, E_k\}$ such that $E_a \cap E_b = \emptyset \ (a \neq b)$ and
+	We model coreference resolution as the construction of an entity partition over a set of mentions. Let $\mathcal{M}= \{m_1, \ldots, m_n\}$ denote the set of mentions in a document. We define the coreference relation as $\sim \subseteq \mathcal{M} \times \mathcal{M}$ where $m_i \sim m_j$ if and only if both mentions refer to the same underlying entity. Since coreference is an equivalence relation, it induces a partition of $\mathcal{M}$ into disjoint entity sets $\mathcal{E} = \{E_1, \ldots, E_k\}$ such that $E_a \cap E_b = \emptyset \ (a \neq b)$ and
 		\begin{align*}
 			\bigcup_{a=1}^k E_a
 				& = \mathcal{M}
@@ -96,16 +163,11 @@
 	The objective of coreference resolution is to construct $\mathcal{E}$ from observed linguistic input. We formalize the structural assumptions underlying the proposed architecture.
 
 	\begin{hypothesis}[Chain of Locality]
-		Any two mentions of an entity can be connected through a chain of locally supported references. That is, $\forall e\in \mathcal{E},∀u,v\in\mathcal{E},\exists m_{1},\ldots,m_{r}\in\mathcal{E}$ such that $m_{1}\equiv u,m_{r}\equiv v$ and $|i_{j+1}-i_{j}|\leq K$ where $\equiv$ denotes equivalence under entity membership.
+		Any two mentions of an entity can be connected through a chain of locally supported references. That is, $\forall e\in \mathcal{E},\forall u,v\in\mathcal{E},\exists m_{1},\ldots,m_{r}\in\mathcal{E}$ such that $m_{1}\equiv u,m_{r}\equiv v$ and $|i_{j+1}-i_{j}|\leq K$ where $\equiv$ denotes equivalence under entity membership.
 	\end{hypothesis}
 
-	\begin{hypothesis}[Conditional Complementarity of Signals]
-		Let $Z_s$ and $Z_c$ denote semantic and contextual features, and let $Y$ denote the coreference indicator for a mention pair. Then neither signal is conditionally sufficient:
-		\[
-		I(Y; Z_s \mid Z_c) > 0
-		\quad \text{and} \quad
-		I(Y; Z_c \mid Z_s) > 0.
-		\]
+	\begin{hypothesis}
+		Let $Z_s$ and $Z_c$ denote semantic and contextual features, and let $Y$ denote the coreference indicator for a mention pair. Then neither signal is conditionally sufficient $I(Y; Z_s \mid Z_c) > 0$ and $I(Y; Z_c \mid Z_s) > 0$.
 	\end{hypothesis}
 
 	\begin{hypothesis}
@@ -121,28 +183,14 @@
 		g(m)
 			& = P_c(\hat{z}_{\text{context}}(m)) \,\Vert\, P_s(\hat{z}_{\text{semantic}}(m)),
 	\end{align}
-	where $\Vert$ denotes concatenation. Then any scalar similarity $\psi(g_{i},g_{j})$ is a many to one mapping. Let $Y$ denote the coreference label for a pair of mentions and let
-	\begin{align}
-		\psi(g_i, g_j) = \cos(g_i, g_j)
-	\end{align}
-	By the Data Processing Inequality,
-		\begin{align}
-			I(Y; \psi(g_i, g_j)) \le I(Y; g_i, g_j)
-		\end{align}
-	This clearly establishes that a learned scorer operating on full channel vectors can exploit information unavailable to a scalar similarity measure. If $\cos(\mathbf{u}, \mathbf{v})\ge \gamma$ and $\cos(\mathbf{v}, \mathbf{w})\ge \gamma$ then
-	\begin{align*}
-		\cos(\mathbf{u}, \mathbf{w})
-			& \ge 2\gamma^2 - 1.
-	\end{align*}
-
+	where $\Vert$ denotes concatenation. Then any scalar similarity $\psi(g_{i},g_{j})$ is a many to one mapping. Let $Y$ denote the coreference label for a pair of mentions and let $\psi(g_i, g_j) = \cos(g_i, g_j)$. By the Data Processing Inequality,
+		\begin{align*}
+			I(Y; \psi(g_i, g_j))
+				& \le I(Y; g_i, g_j)
+		\end{align*}
+	This clearly establishes that a learned scorer operating on full channel vectors can exploit information unavailable to a scalar similarity measure.
 	\subsection{Quotient Graph Construction}
-	Let
-	\begin{align}
-		G
-			& = (\mathcal{M}, \mathcal{R})
-	\end{align}
-	be the mention graph. Stage A induces clusters $C_1, \ldots, C_T$. We define the quotient graph $G / \sim_A$ whose nodes correspond to clusters. Each cluster is embedded as $E(C) \in \mathbb{R}^d$.
-
+	Let $G= (\mathcal{M}, \mathcal{R})$ be the mention graph. Stage A induces clusters $C_1, \ldots, C_T$. We define the quotient graph $G / \sim_A$ whose nodes correspond to clusters. Each cluster is embedded as $E(C) \in \mathbb{R}^d$.
 	\begin{proposition}
 		Let $G=(M,R)$ be the mention graph. Let Stage A induce equivalence classes $C_{1},\ldots,C_{t}$. Then any entity partition consistent with Stage A can be recovered by reasoning over $G/\sim_A$ rather than G.
 	\end{proposition}
@@ -153,10 +201,11 @@
 
 
 	\section{Intra-Sentence Baseline}\label{sec:stage1}
-	The first test was scoped to a single sentence. Per token: a BGE embedding provides the semantic channel; a small learned bidirectional transformer (6.9M parameters) provides the contextual channel. Nominal heads are extracted via dependency parsing. For each mention $k$, the representation $r_k = [\mathbf{c}_k \,|\, \mathbf{s}_k]$ concatenates the contextual and semantic channel vectors. Per nominal pair $(i, j)$:
-	\begin{align}
-		\Phi(i,j) = \mathrm{MLP}\bigl([\,r_i \;|\; r_j \;|\; r_i - r_j\,]\bigr),
-	\end{align}
+	The first test was scoped to a single sentence. Per token: a BGE embedding provides the semantic channel; a small learned bidirectional transformer (6.9M parameters) provides the contextual channel. Nominal heads are extracted via dependency parsing. For each mention $k$, the representation $r_k = [\mathbf{c}_k \,|\, \mathbf{s}_k]$ concatenates the contextual and semantic channel vectors. Per nominal pair $(i, j)$
+	\begin{align*}
+		\Phi(i,j)
+			& = \mathrm{MLP}\left([\,r_i \;|\; r_j \;|\; r_i - r_j\,]\right)
+	\end{align*}
 	trained with binary cross-entropy; sigmoid-threshold decode into connected components via union-find. BGE-large + learned context reaches \textbf{CoNLL $F_1 = 0.890$} across four corpora.
 
 	\subsection{Semantic Channel Ablation}
@@ -197,55 +246,24 @@
 	The contextual channel in \S\ref{sec:stage1} was a small learned transformer trained from scratch. This section replaces it with a frozen RoBERTa-large backbone, training only the composition head. The goal is to establish how much of the disambiguation signal is already present in a general-purpose pretrained encoder before any task-specific adaptation.
 
 	\subsection{Model}
-	Neither large model is fine-tuned. The only trained component is a 2.6M-parameter head.
-
-	\paragraph{Mention representation}
-	For each gold mention $i$, the contextual channel supplies the RoBERTa token vector at the span start $\mathbf{c}^{(s)}_i$ and end $\mathbf{c}^{(e)}_i$. Let $\mathbf{s}_i$ denote the BGE vector of the mention's surface text. Each channel is projected independently:
-	\begin{align}
-		g_i = [\,P_c([\mathbf{c}^{(s)}_i \;|\; \mathbf{c}^{(e)}_i]) \;|\; P_s(\mathbf{s}_i)\,] \in \mathbb{R}^{2048},
-	\end{align}
-	where $P_c \in \mathbb{R}^{1024 \times 2048}$ and
-	$P_s \in \mathbb{R}^{1024 \times 1024}$ are learned,
-	keeping the two information channels unblended within $g_i$.
-	The channels are concatenated rather than summed: vector addition would collapse the channel decomposition and prevent the composition head from distinguishing semantic identity from contextual binding.
-
-	\paragraph{Antecedent scorer}
-	\begin{align}
-		s(i,j) = \mathrm{MLP}_p\bigl([\,g_i \;|\; g_j \;|\; \mathbf{d}_{ij}\,]\bigr),
-	\end{align}
-	where $\mathbf{d}_{ij} \in \mathbb{R}^{32}$ is a learned mention-distance embedding.
-
-	\paragraph{Objective}
-	Mention-ranking marginal log-likelihood: each mention $i$ softmaxes over $\{\varepsilon\} \cup \{j < i\}$, where $\varepsilon$ is a learned null antecedent. The loss marginalises over all gold antecedents.
-
-	\paragraph{Why mention-ranking over pairwise BCE}
-	Pairwise BCE over the same channels scored CoNLL $F_1 = 0.42$ (MUC 0.876, B$^3$ 0.263, CEAFe 0.110) --- a textbook over-merge. A global threshold trained on $\sim$33\% positive rate is miscalibrated at inference ($\sim$1\%--2\% positive rate), and one wrong high-confidence link chains two entities through transitive closure. Mention-ranking with a null antecedent fixes both. The $0.42 \to 0.843$ jump uses the same underlying vectors; it is entirely objective and decode.
-
+	Neither large model is fine-tuned. The only trained component is a 2.6M-parameter head. For each gold mention $i$, the contextual channel supplies the RoBERTa token vector at the span start $\mathbf{c}^{(s)}_i$ and end $\mathbf{c}^{(e)}_i$. Let $\mathbf{s}_i$ denote the BGE vector of the mention's surface text. Each channel is projected independently:
+	\begin{align*}
+		g_i
+			& = [\,P_c([\mathbf{c}^{(s)}_i \;|\; \mathbf{c}^{(e)}_i]) \;|\; P_s(\mathbf{s}_i)\,] \in \mathbb{R}^{2048}
+	\end{align*}
+	where $P_c \in \mathbb{R}^{1024 \times 2048}$ and $P_s \in \mathbb{R}^{1024 \times 1024}$ are learned, keeping the two information channels unblended within $g_i$. The channels are concatenated rather than summed: vector addition would collapse the channel decomposition and prevent the composition head from distinguishing semantic identity from contextual binding.
+	\begin{align*}
+		s(i,j)
+			& = \mathrm{MLP}_{p}\left([\,g_i \;|\; g_j \;|\; \mathbf{d}_{ij}\,]\right)
+	\end{align*}
+	where $\mathbf{d}_{ij} \in \mathbb{R}^{32}$ is a learned mention-distance embedding. Mention-ranking marginal log-likelihood: each mention $i$ softmaxes over $\{\varepsilon\} \cup \{j < i\}$, where $\varepsilon$ is a learned null antecedent. The loss marginalises over all gold antecedents. Pairwise BCE over the same channels scored CoNLL $F_1 = 0.42$ (MUC 0.876, B$^3$ 0.263, CEAFe 0.110) --- a textbook over-merge. A global threshold trained on $\sim$33\% positive rate is miscalibrated at inference ($\sim$1\%--2\% positive rate), and one wrong high-confidence link chains two entities through transitive closure. Mention-ranking with a null antecedent fixes both. The $0.42 \to 0.843$ jump uses the same underlying vectors; it is entirely objective and decode.
 	\subsection{Results}
 	CoNLL $F_1 = 0.843$ (MUC 0.912, B$^3$ 0.814, CEAFe 0.804). The intra-sentence restriction of the same system reaches $0.924$. These are results with both backbones entirely frozen.
 
 	\section{Local Intra-Window Resolution (Stage A)}\label{sec:stagea}
-	This section analyzes the feasibility of intra-window coreference resolution under the proposed factorized architecture. The goal is not to evaluate an end-to-end system, but to estimate how much coreference structure can be recovered when all mentions are restricted to a bounded context window and encoded with frozen backbones.
+	This section analyzes the feasibility of intra-window coreference resolution under the proposed factorized architecture. The goal is not to evaluate an end-to-end system, but to estimate how much coreference structure can be recovered when all mentions are restricted to a bounded context window and encoded with frozen backbones. This setting removes cross-window dependencies by construction and therefore isolates the capacity of the local scoring model to recover entity structure within a constrained context. As such, the resulting metric is an \textbf{intra-window feasibility indicator} and is not comparable to full-document CoNLL-2012 scores or any SOTA systems. The document is partitioned into fixed non-overlapping windows of size $K = 256$ subtokens. Coreference links are computed independently within each window using the same frozen encoders and scoring architecture described in Section~\ref{sec:intro}. Transitive closure is applied locally within each window to form clusters.
 
-	This setting removes cross-window dependencies by construction and therefore isolates the capacity of the local scoring model to recover entity structure within a constrained context. As such, the resulting metric is an \textbf{intra-window feasibility indicator} and is not comparable to full-document CoNLL-2012 scores or any SOTA systems.
-
-	\paragraph{Setup}
-	The document is partitioned into fixed non-overlapping windows of size $K = 256$ subtokens. Coreference links are computed independently within each window using the same frozen encoders and scoring architecture described in Section~\ref{sec:intro}. Transitive closure is applied locally within each window to form clusters.
-
-	\paragraph{Evaluation}
-	We report a single aggregated measure of intra-window clustering quality under this constraint:
-
-	\begin{align}
-		\text{Intra-window resolution F}_1 = 0.8974
-	\end{align}
-
-	This value represents the upper bound of local clustering performance under the frozen-encoder constraint. It should be interpreted strictly as a diagnostic measure of separability and not as a benchmark-comparable score.
-
-	\paragraph{Interpretation}
-	The high intra-window score indicates that most coreference structure is recoverable when contextual ambiguity is restricted to bounded segments. This supports the hypothesis that global reasoning in the full system is primarily a clustering and reconciliation problem rather than a representation learning problem.
-
-	We emphasize again that this metric is used solely to validate the viability of Stage A as a local resolution module and is not used in any comparison against prior work.
-
+	We report a single aggregated measure of intra-window clustering quality under this constraint: Intra-window resolution $F_1 = 0.8974$. This value represents the upper bound of local clustering performance under the frozen-encoder constraint. It should be interpreted strictly as a diagnostic measure of separability and not as a benchmark-comparable score. The high intra-window score indicates that most coreference structure is recoverable when contextual ambiguity is restricted to bounded segments. This supports the hypothesis that global reasoning in the full system is primarily a clustering and reconciliation problem rather than a representation learning problem. We emphasize again that this metric is used solely to validate the viability of Stage A as a local resolution module and is not used in any comparison against prior work.
 	\section{Cross-Window Cluster Matching}\label{sec:stageb}
 	Stage A resolves coreference within each fixed window independently. Its output is a set of per-window clusters: groups of mentions within the same window that refer to the same entity. These clusters are the nodes of the quotient graph $G/\!\sim_A$ that Stage A's union-find has already collapsed locally coreferent mentions into single nodes, reducing the problem from $n$ mentions to $T \ll n$ clusters. Stage B's job is to connect the clusters in different windows that refer to the same entity. It does not re-examine individual mentions. It does not re-run Stage A. It operates purely on cluster-level representations.
 
@@ -257,7 +275,6 @@
 	merge $C_a$ and $\hat{C}_b$ if and only if $\sigma > b$, where $b \in \mathbb{R}$ is the learned null bias and $E(\cdot)$ is the cluster encoder. Accepted merges are applied via union-find, and the final entity partition is the connected components of the resulting graph.
 
 	\subsection{Cluster Encoder}
-
 	Each Stage A cluster $C = \{m_1, \ldots, m_t\}$ is a set of mentions. Each mention $m$ has a cached representation $\mathbf{m} = [P_c(\mathbf{c}_m) \,|\, P_s(\mathbf{s}_m)] \in \mathbb{R}^{2p}$ from Stage A. The cluster encoder $E(C)$ produces a single vector summarizing all members via attention pooling with a learned query $\mathbf{q} \in \mathbb{R}^{2p}$:
 	\begin{align*}
 		\alpha_m
@@ -287,7 +304,7 @@
 			\citet{luo2025imcoref}              & 0.851 & 0.889 & 0.835 & 0.829 \\
 			\bottomrule
 		\end{tabular}
-		\caption{Full-document CoNLL-2012 test results \citep{pradhan2012conll}. SOTA systems use predicted mentions and fine-tune end to end.}
+		\caption{Full-document CoNLL-2012 test results \citep{pradhan2012conll}. Prior systems differ in mention settings and training policies; results are reported as published.}
 		\label{tab:stageb}
 	\end{table}
 
@@ -309,81 +326,65 @@
 		\caption{Stage A + B chronological type breakdown, CoNLL-2012 test.}
 		\label{tab:stageb_type}
 	\end{table}
-
 	Evaluated directly against full-document gold, Stage A suffers a substantial loss due to entity fragmentation at window boundaries. Stage B exists specifically to recover these missing global links. It is therefore not a post-processing heuristic but the mechanism that reconstructs the full-document entity partition from locally resolved components. Stage B recovers $\approx$0.06 CoNLL points over Stage A alone on full-document gold, bringing the two-stage system to 0.8533. PRON-only (0.664) remains the hardest bucket: pronouns carry an uninformative signature inside the semantic channel, forcing Stage B to rely entirely on context profiles which naturally decay across window gaps.
 
 	\section{Complexity Analysis}\label{sec:efficiency}
-
-	By utilizing frozen backbones, our architecture completely circumvents the $O(N^2)$ backpropagation cost through large transformer layers during training. The entire trainable component of the system contains only 8.4M parameters and trains in $\approx$63 seconds per epoch on an NVIDIA RTX 4060 GPU following a one-time feature caching pass. In this section, we analyze the computational complexity of our inference pipeline, demonstrating how the hierarchy moves the unavoidable quadratic terms from token interactions to a highly compressed cluster space.
-
-	Let $N$ be the document length in tokens, $M$ the total number of mentions, and $K$ the fixed window size ($K = 256$), which yields $W = N/K$ windows. We decompose the total computational cost $T(N)$ into three independent operational terms. Each window of size $K$ is processed by the contextual encoder independently. The self-attention cost within a single window is $O(K^2)$. Across all $W = N/K$ uniform windows, the total encoding cost scales as:
+	We analyze the computational complexity of the inference pipeline in terms of document length $N$, number of mentions $M$, window size $K$, and number of Stage A clusters $C$. The system consists of three components:
+		\begin{enumerate}[(i)]
+			\item windowed encoder processing
+			\item intra-window mention linking
+			\item cross-window cluster matching
+		\end{enumerate}
+	The document is partitioned into $W = N/K$ windows. Each window is processed independently by a transformer encoder with self-attention cost $O(K^2)$. The total encoding cost is:
 	\begin{align*}
 		T_{\text{encode}}
-			& = O(W \cdot K^2)\\
-			& = O\left(\frac{N}{K} \cdot K^2\right)\\
-			& = O(NK)
+		&= O\left(\frac{N}{K} \cdot K^2\right) \\
+		&= O(NK)
 	\end{align*}
-	This replaces the full-document token self-attention cost ($O(N^2)$) with an attention cost that scales linearly with respect to document length $N$ for a fixed window size $K$.
-
-	\subsection{Intra-Window Mention Linking (Stage A)}
-	Let $m_w$ be the number of mentions located within window $w$, such that $\sum_{w=1}^W m_w = M$. Stage A performs exhaustive pairwise scoring within each window, costing $\sum_{w=1}^W O(m_w^2)$. Assuming an approximately uniform distribution of mentions across windows ($m_w \approx M/W$), this cost evaluates to:
+	This replaces full-document self-attention cost $O(N^2)$ with windowed attention over fixed-length segments. Let $m_w$ be the number of mentions in window $w$. Stage A performs pairwise scoring within each window:
+	\begin{align*}
+		T_{\text{local}} = \sum_{w=1}^{W} O(m_w^2)
+	\end{align*}
+	Assuming approximately uniform mention distribution $m_w \approx M/W$, we obtain:
 	\begin{align*}
 		T_{\text{local}}
-			& = O\left(W \cdot \left(\frac{M}{W}\right)^2\right)\\
-			& = O\left(\frac{M^2}{W}\right)\\
-			& = O\left(\frac{M^2 K}{N}\right)
+		&= O\left(W \cdot (M/W)^2\right) \\
+		&= O(M^2 / W)
 	\end{align*}
-	We define the document mention density as $\rho = M/N$. Substituting $M = \rho N$ yields:
+	Substituting $W = N/K$ and $M = \rho N$,
 	\begin{align*}
 		T_{\text{local}}
 			& = O(\rho^2 N K)
 	\end{align*}
-	For a stable corporate or narrative document type with a fixed mention density $\rho$, the Stage A scoring cost scales linearly with $N$. However, it remains inherently quadratic with respect to the density parameter $\rho$.
-
-	\subsection{Cross-Window Cluster Matching (Stage B)}
-	Stage B establishes global coreference by evaluating cluster pairs across different windows. Let $C$ be the total number of local clusters produced by Stage A across the entire document. Stage B scores all cross-window pairs, which is bounded by:
-	\begin{align}
-		T_{\text{cross}} = \sum_{i < j} C_i C_j = O(C^2).
-	\end{align}
-	To express this cost in terms of document length, we introduce a structural compression factor. Let $(s_1, \dots, s_C)$ represent the sizes (number of mentions) of the Stage A clusters, and let $\bar{s} = \frac{1}{C}\sum_{i=1}^C s_i$ denote the empirical mean cluster size. Since every mention belongs to exactly one local cluster, we have $M = C \bar{s}$, which implies $C = M / \bar{s}$. Substituting this into the cross-window cost yields:
+	Thus, Stage A scales linearly in $N$ for fixed window size $K$ and mention density $\rho$, and quadratically in $\rho$. Stage A produces $C$ clusters across the document. Stage B evaluates pairwise interactions between clusters across windows:
 	\begin{align*}
 		T_{\text{cross}}
-			& = O\left(\frac{M^2}{\bar{s}^2}\right)\\
-			& = O\left(\frac{\rho^2 N^2}{\bar{s}^2}\right)
+			& = O(C^2)
 	\end{align*}
-
-	\subsection{Total Complexity Decomposition and Regime Analysis}
-	Combining all three operational phases, the complete formal complexity of our system is:
+	Let $\bar{s} = M/C$ denote the average cluster size. Then $C = M / \bar{s}$, giving:
+	\begin{align*}
+		T_{\text{cross}}
+		&= O\left(\frac{M^2}{\bar{s}^2}\right) \\
+		&= O\left(\frac{\rho^2 N^2}{\bar{s}^2}\right)
+	\end{align*}
+	Combining all components
 	\begin{align*}
 		T(N)
-			& = O(NK) + O(\rho^2 N K) + O\left(\frac{\rho^2 N^2}{\bar{s}^2}\right)
+		&= O(NK) + O(\rho^2 N K) + O\left(\frac{\rho^2 N^2}{\bar{s}^2}\right)
 	\end{align*}
-	which simplifies to:
+	or equivalently
 	\begin{align*}
 		T(N)
-			& = O\left(NK(1 + \rho^2)\right) + O\left(\frac{\rho^2 N^2}{\bar{s}^2}\right)
+		&= O\left(NK(1 + \rho^2)\right) + O\left(\frac{\rho^2 N^2}{\bar{s}^2}\right)
 	\end{align*}
-	The proposed architecture does not eliminate quadratic reasoning. Rather, it relocates quadratic computation from the token graph to a compressed cluster graph. Full-document transformers perform $O(n^{2})$ interactions over tokens, whereas Stage B performs $O(C^{2})$ interactions over Stage-A clusters, where $C\approx M/\bar{s}$. Since $C\ll N$ in natural language documents, the quadratic term operates on a substantially smaller state space. The resulting reduction is therefore not merely a constant-factor optimization of token-level attention, but a structural compression of the objects participating in quadratic inference. The consequence is that the current hardware available to us can actually afford this computation whereas full $O(N^{2})$ is completely beyond our reach.
-
-	\paragraph{Mention-Sparse Documents ($\rho \ll 1, \bar{s} \to 1$).} In documents where mentions are rare, the linear token encoding term $O(NK)$ dominates computational overhead, and the quadratic cluster matching term remains negligible due to the small absolute value of $C$.
-
-	\paragraph{Typical CoNLL Regime ($0.05 \le \rho \le 0.15$ and $3 \le \bar{s} \le 6$).} In standard natural language datasets, the empirical structural compression ratio is highly stable. For instance, with a typical density $\rho = 0.10$ and an average local cluster size $\bar{s} = 4$, the coefficient of the quadratic term evaluates to:
-	\begin{align*}
-		\frac{\rho^2}{\bar{s}^2}
-			& = \frac{0.01}{16} = 6.25 \times 10^{-4}
-	\end{align*}
-	This represents a three-to-four orders of magnitude reduction in the quadratic constant compared to token-level self-attention. The system does not reduce worst-case complexity; it reduces the constant factor by restricting quadratic interactions to a compressed cluster space induced by Stage A. The quadratic crossover point where $T_{\text{cross}}$ matches the linear encoding cost $T_{\text{encode}}$ occurs when $\frac{\rho^2 N^2}{\bar{s}^2} \approx NK$, which implies:
-	\begin{align*}
-		N \approx \frac{K \bar{s}^2}{\rho^2}
-			& = \frac{256 \cdot 16}{0.01}
-	\end{align*}
-	which is about $410000$ tokens. For documents shorter than this threshold—which includes all standard evaluation corpora—the quadratic term is heavily suppressed, allowing the system to operate within a highly efficient practical regime on consumer-grade hardware.
+	The system does not remove quadratic interactions. Instead, it restricts quadratic computation to a reduced set of entities induced by Stage A clustering. Standard transformer architectures perform $O(N^2)$ interactions over tokens. In contrast, Stage B performs $O(C^2)$ interactions over clusters, where $C = M/\bar{s}$. Since clustering compresses mentions into a smaller set of entities ($C \ll N$ in typical documents), the quadratic term operates on a reduced state space. The overall complexity therefore depends on the structure induced by Stage A, particularly the number and size of clusters, rather than directly on token count alone.
 	\section{Limitations and Future Work}\label{sec:future}
 	Every result in this paper uses both encoders frozen, so the contextual channel is whatever RoBERTa supplies without any coreference adaptation, and RoBERTa was never trained to bind referents. The hardest buckets reflect exactly this: PRON-only clusters fall to $0.664$ after Stage B because pronouns carry no semantic signature and the contextual channel alone must carry the decision. The decomposition isolates this limitation to a single, replaceable component.
 
 	Every result in this paper assumes gold mention boundaries: the system is evaluated as a linker given mentions. Extending the decomposition to predicted mentions is left to future work.
 	\section{Conclusion}\label{sec:conclusion}
 	We presented a factorized architecture for global entity disambiguation that separates representation learning into frozen semantic and contextual channels and performs inference through a two-stage hierarchy consisting of local window clustering followed by cross-window cluster matching. Across all experiments, both encoders are kept frozen and only lightweight scoring and aggregation modules are trained. The full system achieves a CoNLL F$_1$ of 0.8533 on CoNLL-2012 under standard full-document evaluation. A non-windowed all-pairs variant reaches 0.843, indicating that the hierarchical decomposition preserves overall effectiveness while restructuring inference. The intra-window evaluation is used strictly as a diagnostic of local separability under bounded context and is not treated as a comparable benchmark metric. It serves to characterize the behavior of Stage A in isolation prior to global reconciliation. Empirically, results across intra-sentence, all-pairs, and hierarchical settings suggest that entity structure can be recovered using factorized representations combined with cluster-level matching, without fine-tuning large encoders or using full-document self-attention. Overall, the findings support the feasibility of decomposing entity disambiguation into local resolution followed by hierarchical merging over compressed cluster representations under frozen-encoder constraints.
+
 
 	\bibliography{references}
 
