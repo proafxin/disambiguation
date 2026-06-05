@@ -1,18 +1,15 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from pathlib import Path
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
-
-from disambiguation.paths import MODELS_DIR
 
 CKPT_NAME = "stage2_global_coref.pt"
 CKPT_B_NAME = "stage2_cluster_matcher.pt"
 BACKBONE = "roberta-large"
 BGE_DIM = 1024
 CTX_DIM = 1024
-CONTENT = 256  # tokens per fixed window
+CONTENT = 512  # tokens per fixed window
 WINDOW = CONTENT + 2  # + <s>/</s>
 
 
@@ -55,9 +52,7 @@ def encode_document_ctx(
     return F.normalize(ctx, p=2, dim=-1)
 
 
-def compute_mention_ctx_vecs(
-    ctx: torch.Tensor, span_sub: np.ndarray
-) -> torch.Tensor:
+def compute_mention_ctx_vecs(ctx: torch.Tensor, span_sub: np.ndarray) -> torch.Tensor:
     # Returns (M, 2, CTX_DIM): (ctx_start, ctx_end) per mention.
     M = len(span_sub)
     out = torch.zeros(M, 2, ctx.shape[1], dtype=ctx.dtype, device=ctx.device)
@@ -69,23 +64,29 @@ def compute_mention_ctx_vecs(
 
 # ── Stage A ───────────────────────────────────────────────────────────────────
 
+
 class AntecedentScorer(nn.Module):
-    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3, chunk: int = 8192,
-                 use_lexical: bool = False, use_agreement: bool = False):
+    def __init__(
+        self,
+        proj_dim: int = 1024,
+        hidden: int = 1024,
+        dropout: float = 0.3,
+        chunk: int = 8192,
+    ):
         super().__init__()
         self.chunk = chunk
-        self.use_lexical = use_lexical
-        self.use_agreement = use_agreement
         self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
         self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
         self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
         g = 2 * proj_dim
-        # lexical: same_lemma, same_surface (2); agreement: NER-type, number, gender match (3)
-        n_lex = (2 if use_lexical else 0) + (3 if use_agreement else 0)
         self.ffnn = nn.Sequential(
-            nn.Linear(2 * g + 32 + n_lex, hidden), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(2 * g + 32, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
         self.drop = nn.Dropout(dropout)
@@ -98,9 +99,8 @@ class AntecedentScorer(nn.Module):
         return torch.cat([c, s], dim=-1)
 
     def forward(
-        self, ctx: torch.Tensor, bge: torch.Tensor, nom_lex: torch.Tensor | None = None
+        self, ctx: torch.Tensor, bge: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # nom_lex: (M, 2) int64 [head lemma_id, head surface_id]; only used when use_lexical
         M = ctx.shape[0]
         device = ctx.device
         idx = torch.arange(M, device=device)
@@ -114,24 +114,6 @@ class AntecedentScorer(nn.Module):
             gi, gj = g[ii], g[jj]
             bucket = torch.bucketize((ii - jj).clamp(min=0), self.dist_bounds, right=True)
             parts = [gi, gj, self.dist_emb(bucket)]
-            if self.use_lexical:
-                if nom_lex is None:
-                    lex = torch.zeros(ii.shape[0], 2, device=device, dtype=gi.dtype)
-                else:
-                    same_lemma = (nom_lex[ii, 0] == nom_lex[jj, 0]).to(gi.dtype)
-                    same_surface = (nom_lex[ii, 1] == nom_lex[jj, 1]).to(gi.dtype)
-                    lex = torch.stack([same_lemma, same_surface], dim=-1)
-                parts.append(lex)
-            if self.use_agreement:
-                if nom_lex is None:
-                    agr = torch.zeros(ii.shape[0], 3, device=device, dtype=gi.dtype)
-                else:
-                    # match only counts when the attribute is known (id != 0)
-                    ner = ((nom_lex[ii, 2] == nom_lex[jj, 2]) & (nom_lex[ii, 2] != 0)).to(gi.dtype)
-                    num = ((nom_lex[ii, 3] == nom_lex[jj, 3]) & (nom_lex[ii, 3] != 0)).to(gi.dtype)
-                    gen = ((nom_lex[ii, 4] == nom_lex[jj, 4]) & (nom_lex[ii, 4] != 0)).to(gi.dtype)
-                    agr = torch.stack([ner, num, gen], dim=-1)
-                parts.append(agr)
             feat = torch.cat(parts, dim=-1)
             scores[ii, jj] = self.ffnn(feat).squeeze(-1).to(scores.dtype)
         return scores, ante_mask
@@ -156,6 +138,7 @@ def mll_loss(
 
 
 # ── Stage B ───────────────────────────────────────────────────────────────────
+
 
 class ClusterEncoder(nn.Module):
     def __init__(self, proj_dim: int = 1024, dropout: float = 0.3):
@@ -184,16 +167,16 @@ class ClusterEncoder(nn.Module):
             ctx_pad[k, :m] = ctx.flatten(1)
             bge_pad[k, :m] = bge
             lengths.append(m)
-        c = self.P_ctx(self.drop(ctx_pad))          # (C, max_m, proj_dim)
-        s = self.P_bge(self.drop(bge_pad))          # (C, max_m, proj_dim)
-        m_all = torch.cat([c, s], dim=-1)           # (C, max_m, 2*proj_dim)
+        c = self.P_ctx(self.drop(ctx_pad))  # (C, max_m, proj_dim)
+        s = self.P_bge(self.drop(bge_pad))  # (C, max_m, proj_dim)
+        m_all = torch.cat([c, s], dim=-1)  # (C, max_m, 2*proj_dim)
         mask = torch.zeros(len(clusters), max_m, device=device)
         for k, l in enumerate(lengths):
             mask[k, :l] = 1.0
         attn = (m_all @ self.query) / (m_all.shape[-1] ** 0.5)
         attn = attn.masked_fill(mask == 0, float("-inf"))
         attn = torch.softmax(attn, dim=1).unsqueeze(-1)
-        return (attn * m_all).sum(dim=1)            # (C, 2*proj_dim)
+        return (attn * m_all).sum(dim=1)  # (C, 2*proj_dim)
 
 
 class ClusterMatcher(nn.Module):
@@ -202,15 +185,17 @@ class ClusterMatcher(nn.Module):
         self.cluster_enc = ClusterEncoder(proj_dim, dropout)
         g = 2 * proj_dim
         self.ffnn = nn.Sequential(
-            nn.Linear(2 * g, hidden), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(2 * g, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
         self.null_bias = nn.Parameter(torch.zeros(1))
 
-    def encode_clusters(
-        self, clusters: list[tuple[torch.Tensor, torch.Tensor]]
-    ) -> torch.Tensor:
+    def encode_clusters(self, clusters: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
         return self.cluster_enc.forward_batched(clusters)
 
     def forward(
@@ -219,7 +204,7 @@ class ClusterMatcher(nn.Module):
         right: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
         # returns (L, R) score matrix
-        gl = self.encode_clusters(left)   # (L, 2*proj_dim)
+        gl = self.encode_clusters(left)  # (L, 2*proj_dim)
         gr = self.encode_clusters(right)  # (R, 2*proj_dim)
         L, R = gl.shape[0], gr.shape[0]
         gi = gl.unsqueeze(1).expand(L, R, -1)
@@ -247,9 +232,7 @@ def cluster_match_loss(
     return torch.stack(losses).mean()
 
 
-def decode_cluster_matches(
-    scores: np.ndarray, null_bias: float
-) -> list[tuple[int, int]]:
+def decode_cluster_matches(scores: np.ndarray, null_bias: float) -> list[tuple[int, int]]:
     # For each left cluster, link to best right cluster if score > null_bias.
     pairs = []
     for i in range(scores.shape[0]):
@@ -261,6 +244,7 @@ def decode_cluster_matches(
 
 # ── Shared utilities ──────────────────────────────────────────────────────────
 
+
 def _uf_find(parent: list, x: int) -> int:
     while parent[x] != x:
         parent[x] = parent[parent[x]]
@@ -268,9 +252,7 @@ def _uf_find(parent: list, x: int) -> int:
     return x
 
 
-def decode_antecedents(
-    scores: np.ndarray, ante_mask: np.ndarray, null_bias: float = 0.0
-) -> list[list[int]]:
+def decode_antecedents(scores: np.ndarray, ante_mask: np.ndarray, null_bias: float = 0.0) -> list[list[int]]:
     M = scores.shape[0]
     parent = list(range(M))
     for i in range(1, M):

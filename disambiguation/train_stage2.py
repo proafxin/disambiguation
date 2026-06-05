@@ -1,7 +1,9 @@
+import csv
 import datetime
 import json
 import pickle
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -24,12 +26,12 @@ from disambiguation.paths import (
     TENSORBOARD_DIR,
 )
 from disambiguation.stage2_context_encoder import (
-    CKPT_NAME,
     CKPT_B_NAME,
     CONTENT,
     AntecedentScorer,
     ClusterMatcher,
     ContextEncoder,
+    _uf_find,
     cluster_match_loss,
     compute_mention_ctx_vecs,
     decode_antecedents,
@@ -37,13 +39,20 @@ from disambiguation.stage2_context_encoder import (
     encode_document_ctx,
     load_tokenizer,
     mll_loss,
-    _uf_find,
 )
 
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
 CONLL_SPLITS = ["train", "validation", "test"]
 PRECO_SUBSAMPLE = 8000  # RAM cap: (M,2,1024) ctx_vecs; 8000 docs fits comfortably in ~10 GB
 RANDOM_SEED = 42
+
+# All window-derived artifacts are tagged by the context window so K=128/256/512
+# never collide or silently reuse each other's caches/checkpoints.
+WIN_TAG = f"_k{CONTENT}"
+SPAN_CTX_CACHE = SPAN_CTX_CACHE.with_name(SPAN_CTX_CACHE.name + WIN_TAG)
+CKPT_B_NAME = f"stage2_cluster_matcher{WIN_TAG}.pt"
+FROZEN_HEAD_BASE = f"stage2_frozen_head{WIN_TAG}"
+STAGE_A_CLUSTERS_NAME = f"stage_a_clusters_cache{WIN_TAG}.pkl"
 
 
 def _doc_structure_conll(sample: dict, spacy_doc: spacy.tokens.Doc) -> tuple:
@@ -135,8 +144,16 @@ def _word_to_subtok(words: list, tokenizer) -> tuple:
 
 
 def _raw_from_doc(
-    name: str, split: str, sents: list, offsets: list, spans: list, cluster_id: list, mention_surfaces: list,
-    head_lex: list, tokenizer, gold_clusters: list | None = None
+    name: str,
+    split: str,
+    sents: list,
+    offsets: list,
+    spans: list,
+    cluster_id: list,
+    mention_surfaces: list,
+    head_lex: list,
+    tokenizer,
+    gold_clusters: list | None = None,
 ) -> tuple | None:
     if len(spans) < 2:
         return None
@@ -161,17 +178,6 @@ def _raw_from_doc(
         mention_sent_off.append(sent_sub_off[si])
         mention_sent_len.append(sent_sub_len[si])
     order = sorted(range(len(spans)), key=lambda k: span_sub[k])
-    # Per-mention head features: [lemma_id, surface_id, ner_id, number_id, gender_id].
-    # Cols 0-1 are dense doc-level ids (only equality matters); cols 2-4 are fixed-category ids
-    # (0 = unknown), populated only where a parse is available (predicted path). Compared pairwise.
-    lemma_ids: dict[str, int] = {}
-    surf_ids: dict[str, int] = {}
-    nom_lex = np.zeros((len(spans), 5), dtype=np.int64)
-    for k, lex in enumerate(head_lex):
-        nom_lex[k, 0] = lemma_ids.setdefault(lex[0], len(lemma_ids))
-        nom_lex[k, 1] = surf_ids.setdefault(lex[1], len(surf_ids))
-        for c in range(2, len(lex)):
-            nom_lex[k, c] = lex[c]
     return (
         name,
         split,
@@ -183,7 +189,6 @@ def _raw_from_doc(
         [span_sub[k] for k in order],
         [mention_sent_off[k] for k in order],
         [mention_sent_len[k] for k in order],
-        nom_lex[order],
         gold_clusters,
     )
 
@@ -203,22 +208,34 @@ def _assemble_docs(raw: list, device: str, cache_path) -> list:
     surf2bge = {s: embs[i] for i, s in enumerate(surface_vocab)}
     del bge
     docs = []
-    for (name, split, sents, spans, cluster_id, mention_surfaces, content_ids, span_sub,
-         sent_sub_offsets, sent_sub_lengths, nom_lex, gold_clusters) in raw:
-        docs.append({
-            "name": name,
-            "split": split,
-            "sentences": sents,
-            "spans": spans,
-            "cluster_id": np.asarray(cluster_id, dtype=np.int64),
-            "content_ids": content_ids,
-            "span_sub": np.asarray(span_sub, dtype=np.int64),
-            "sent_sub_offsets": np.asarray(sent_sub_offsets, dtype=np.int64),
-            "sent_sub_lengths": np.asarray(sent_sub_lengths, dtype=np.int64),
-            "mention_bge": np.stack([surf2bge[s] for s in mention_surfaces]).astype(np.float32),
-            "nom_lex": np.asarray(nom_lex, dtype=np.int64),
-            "gold_clusters": gold_clusters,
-        })
+    for (
+        name,
+        split,
+        sents,
+        spans,
+        cluster_id,
+        mention_surfaces,
+        content_ids,
+        span_sub,
+        sent_sub_offsets,
+        sent_sub_lengths,
+        gold_clusters,
+    ) in raw:
+        docs.append(
+            {
+                "name": name,
+                "split": split,
+                "sentences": sents,
+                "spans": spans,
+                "cluster_id": np.asarray(cluster_id, dtype=np.int64),
+                "content_ids": content_ids,
+                "span_sub": np.asarray(span_sub, dtype=np.int64),
+                "sent_sub_offsets": np.asarray(sent_sub_offsets, dtype=np.int64),
+                "sent_sub_lengths": np.asarray(sent_sub_lengths, dtype=np.int64),
+                "mention_bge": np.stack([surf2bge[s] for s in mention_surfaces]).astype(np.float32),
+                "gold_clusters": gold_clusters,
+            }
+        )
     with cache_path.open("wb") as f:
         pickle.dump([{**d, "mention_bge": d["mention_bge"].astype(np.float16)} for d in docs], f)
     print(f"Cached {len(docs)} docs to {cache_path.name}")
@@ -243,11 +260,12 @@ def _predicted_doc_spans() -> dict:
             for si, words in enumerate(sample["sentences"]):
                 if len(words) < 1:
                     continue
-                e = entries[ci]; ci += 1
+                e = entries[ci]
+                ci += 1
                 if list(e["tokens"]) != list(words):
                     raise ValueError(f"predicted-cache misalignment at {split} doc {di} sent {si}")
                 doc_map[si] = [(int(a), int(b) + 1) for a, b in e["pred_spans"]]  # inclusive -> exclusive
-            out[(split, di)] = doc_map
+            out[split, di] = doc_map
     return out
 
 
@@ -312,8 +330,9 @@ def _doc_structure_conll_predicted(sample: dict, spacy_doc: spacy.tokens.Doc, pr
                 cluster_id.append(next_singleton)
                 next_singleton += 1
             mention_surfaces.append(" ".join(sents[si][a:b]))
-            head_lex.append((head_tok.lemma_, head_tok.lower_,
-                             _ner_id(head_tok), _morph_num_id(head_tok), _morph_gen_id(head_tok)))
+            head_lex.append(
+                (head_tok.lemma_, head_tok.lower_, _ner_id(head_tok), _morph_num_id(head_tok), _morph_gen_id(head_tok))
+            )
     return sents, offsets, spans, cluster_id, mention_surfaces, head_lex, gold_clusters
 
 
@@ -336,11 +355,19 @@ def build_conll_predicted_docs(device: str = "cuda" if torch.cuda.is_available()
             tqdm(zip(ds, db.get_docs(vocab), strict=True), total=len(ds), desc=f"conll2012-pred/{split}")
         ):
             sents, offsets, spans, cluster_id, mention_surfaces, head_lex, gold_clusters = (
-                _doc_structure_conll_predicted(sample, sdoc, pred_all[(split, di)])
+                _doc_structure_conll_predicted(sample, sdoc, pred_all[split, di])
             )
             rec = _raw_from_doc(
-                f"conll2012/{sample['doc_id']}#{len(raw)}", split, sents, offsets, spans,
-                cluster_id, mention_surfaces, head_lex, tokenizer, gold_clusters,
+                f"conll2012/{sample['doc_id']}#{len(raw)}",
+                split,
+                sents,
+                offsets,
+                spans,
+                cluster_id,
+                mention_surfaces,
+                head_lex,
+                tokenizer,
+                gold_clusters,
             )
             if rec:
                 raw.append(rec)
@@ -387,8 +414,8 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
             sents = sample["sentences"]
             clusters = _clusters_litbank(sample)
             sents_list = [list(s) if not isinstance(s, list) else s for s in sents]
-            sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = (
-                _doc_structure_generic(sents_list, clusters)
+            sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_generic(
+                sents_list, clusters
             )
             rec = _raw_from_doc(
                 f"litbank/{sample['doc_name']}#{len(raw)}",
@@ -530,7 +557,6 @@ def doc_scores(
         ctx_doc = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
         ctx = compute_mention_ctx_vecs(ctx_doc, d["span_sub"])
     bge = torch.from_numpy(d["mention_bge"]).to(device).float()
-    nom_lex = torch.from_numpy(d["nom_lex"]).to(device)
     # all_pairs: score every mention against every prior mention in the whole doc (one group);
     # otherwise partition into fixed CONTENT-subtoken windows (Stage A).
     # all_pairs scores the whole doc as one group; but a memory cap (used during fine-tune training,
@@ -545,13 +571,21 @@ def doc_scores(
         idx = np.where(win_ids == w)[0]
         if len(idx) < 2:
             continue
-        w_scores, w_mask = scorer(ctx[idx], bge[idx], nom_lex[idx])
+        w_scores, w_mask = scorer(ctx[idx], bge[idx])
         results.append((w_scores, w_mask, idx))
     return results
 
 
 def run_epoch(
-    encoder, scorer, docs, optimizer, cls_id, sep_id, device, doc_bs, all_pairs: bool = False,
+    encoder,
+    scorer,
+    docs,
+    optimizer,
+    cls_id,
+    sep_id,
+    device,
+    doc_bs,
+    all_pairs: bool = False,
     max_mentions: int | None = None,
 ) -> float:
     train = optimizer is not None
@@ -564,7 +598,9 @@ def run_epoch(
             losses = []
             for d in batch:
                 cluster_id = torch.from_numpy(d["cluster_id"]).to(device)
-                for w_scores, w_mask, idx in doc_scores(d, encoder, scorer, cls_id, sep_id, device, all_pairs, max_mentions):
+                for w_scores, w_mask, idx in doc_scores(
+                    d, encoder, scorer, cls_id, sep_id, device, all_pairs, max_mentions
+                ):
                     losses.append(mll_loss(w_scores, w_mask, cluster_id[idx], scorer.null_bias))
             if not losses:
                 continue
@@ -613,8 +649,16 @@ def _key_clusters(d: dict, window: int | None = None) -> list:
 
 
 def eval_conll(
-    encoder, scorer, docs, cls_id, sep_id, device, tag, type_breakdown=False,
-    window: int | None = None, all_pairs: bool = False,
+    encoder,
+    scorer,
+    docs,
+    cls_id,
+    sep_id,
+    device,
+    tag,
+    type_breakdown=False,
+    window: int | None = None,
+    all_pairs: bool = False,
 ) -> dict:
     key_docs = [(d["name"], d["sentences"], _key_clusters(d, window)) for d in docs]
     key_path = MODELS_DIR / f"stage2_{tag}_key.conll"
@@ -642,13 +686,11 @@ def train_stage2(
     max_epochs: int | None = None,
     patience: int | None = None,
     doc_bs: int | None = None,
-    use_lexical: bool = False,
-    use_agreement: bool = False,
     predicted: bool = False,
     all_pairs: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
-    print(f"\nBuilding Stage 2 nominal data... (finetune={finetune}, use_lexical={use_lexical}, predicted={predicted})")
+    print(f"\nBuilding Stage 2 nominal data... (finetune={finetune}, predicted={predicted})")
     if predicted:
         print("Evaluation setting: PREDICTED mentions (end-to-end), CoNLL only; KEY = true gold clusters")
     else:
@@ -677,16 +719,12 @@ def train_stage2(
             "corefud": [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
         }
 
-    frozen_name = "stage2_frozen_head"
+    frozen_name = FROZEN_HEAD_BASE
     if predicted:
         frozen_name += "_pred"
     if all_pairs:
         frozen_name += "_ap"
-    if use_lexical:
-        frozen_name += "_lex"
-    if use_agreement:
-        frozen_name += "_agr"
-    scorer = AntecedentScorer(use_lexical=use_lexical, use_agreement=use_agreement).to(device)
+    scorer = AntecedentScorer().to(device)
     encoder = ContextEncoder().to(device)
     if finetune:
         # Head warmup: start fine-tuning from the trained frozen head, not a random one — joint
@@ -710,15 +748,14 @@ def train_stage2(
     else:
         for p in encoder.parameters():
             p.requires_grad_(False)
-        precompute_span_ctx(encoder, docs, cls_id, sep_id, device,
-                            cache_dir=SPAN_CTX_CACHE_PRED if predicted else SPAN_CTX_CACHE)
+        precompute_span_ctx(
+            encoder, docs, cls_id, sep_id, device, cache_dir=SPAN_CTX_CACHE_PRED if predicted else SPAN_CTX_CACHE
+        )
         del encoder
         if device != "cpu":
             torch.cuda.empty_cache()
         max_epochs, patience, doc_bs = max_epochs or 60, patience or 8, doc_bs or 8
-        optimizer = optim.AdamW(
-            list(scorer.parameters()), lr=head_lr, weight_decay=0.1
-        )
+        optimizer = optim.AdamW(list(scorer.parameters()), lr=head_lr, weight_decay=0.1)
         enc_loop, ckpt_path, tag = None, MODELS_DIR / f"{frozen_name}.pt", "frozen"
     head_params = sum(p.numel() for p in scorer.parameters())
     print(f"head params: {head_params:,} | doc_bs={doc_bs} epochs={max_epochs}")
@@ -745,20 +782,28 @@ def train_stage2(
         if enc_loop is not None:
             enc_loop.train()
         scorer.train()
-        tr_loss = run_epoch(
-            enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap
-        )
+        tr_loss = run_epoch(enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap)
         scheduler.step()
         if enc_loop is not None:
             enc_loop.eval()
         scorer.eval()
         with torch.inference_mode():
-            val_loss = run_epoch(
-                enc_loop, scorer, conll_val_docs, None, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap
-            )
+            val_losses = {
+                ds: run_epoch(enc_loop, scorer, vdocs, None, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap)
+                for ds, vdocs in val_sets.items()
+                if vdocs
+            }
+        val_loss = val_losses["conll2012"]
         val_scores = {
             ds: eval_conll(
-                enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_val_{ds}", window=CONTENT,
+                enc_loop,
+                scorer,
+                vdocs,
+                cls_id,
+                sep_id,
+                device,
+                f"{tag}_val_{ds}",
+                window=CONTENT,
                 all_pairs=all_pairs,
             )
             for ds, vdocs in val_sets.items()
@@ -768,10 +813,12 @@ def train_stage2(
         print(f"Loss: {tr_loss:.6f} | Val loss: {val_loss:.6f}")
         for ds, sc in val_scores.items():
             print(
-                f"  {ds:10s} CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})"
+                f"  {ds:10s} loss {val_losses[ds]:.4f}  CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})"
             )
         tb.add_scalar("loss/train", tr_loss, epoch + 1)
         tb.add_scalar("loss/val", val_loss, epoch + 1)
+        for ds, lo in val_losses.items():
+            tb.add_scalar(f"loss/val/{ds}", lo, epoch + 1)
         tb.add_scalar("model/null_bias", scorer.null_bias.item(), epoch + 1)
         for ds, sc in val_scores.items():
             for k in ("CoNLL", "muc", "bcub", "ceafe"):
@@ -834,7 +881,14 @@ def train_stage2(
     metrics["eval_dataset"] = "conll2012_test"
     final_val_scores = {
         ds: eval_conll(
-            enc_loop, scorer, vdocs, cls_id, sep_id, device, f"{tag}_final_val_{ds}", window=CONTENT,
+            enc_loop,
+            scorer,
+            vdocs,
+            cls_id,
+            sep_id,
+            device,
+            f"{tag}_final_val_{ds}",
+            window=CONTENT,
             all_pairs=all_pairs,
         )
         for ds, vdocs in val_sets.items()
@@ -885,9 +939,7 @@ def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str) ->
     return per_window
 
 
-def _cluster_reps(
-    local_cluster: list[int], ctx_w: np.ndarray, bge_w: np.ndarray
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _cluster_reps(local_cluster: list[int], ctx_w: np.ndarray, bge_w: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
     # ctx_w: (Mw, 2, CTX_DIM), bge_w: (Mw, BGE_DIM) — window-local arrays
     idx = np.array(local_cluster)
     return (
@@ -902,10 +954,8 @@ def _cluster_gold_cids(cluster: list[int], cluster_id: np.ndarray) -> int:
     return int(np.bincount(cids).argmax())
 
 
-def _precompute_stage_a_clusters(
-    docs: list, scorer: AntecedentScorer, device: str
-) -> list[dict[int, dict]]:
-    cache_path = MODELS_DIR / "stage_a_clusters_cache.pkl"
+def _precompute_stage_a_clusters(docs: list, scorer: AntecedentScorer, device: str) -> list[dict[int, dict]]:
+    cache_path = MODELS_DIR / STAGE_A_CLUSTERS_NAME
     if cache_path.exists():
         print("Loading cached Stage A clusters...")
         with cache_path.open("rb") as f:
@@ -925,18 +975,21 @@ def _precompute_stage_a_clusters(
     return result
 
 
-def _predict_full_doc_clusters(
+def _stage_b_merge_edges(
     d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher, device: str
-) -> list[list]:
+) -> tuple[list[tuple[int, int]], dict[int, int], int]:
+    # Single source of truth for cross-window merges: scores every cross-window
+    # cluster pair and returns the accepted merges as (global_a, global_b) edges,
+    # the per-window cluster-index offsets, and the total cluster count. Both the
+    # cluster decoder and the diagnostics consume these same edges so the reported
+    # edge precision/recall can never diverge from what the model actually merges.
     windows = sorted(per_window.keys())
-    # union-find over (win_id, local_cluster_idx) pairs
-    # assign each cluster a unique global id
     win_offsets: dict[int, int] = {}
     total = 0
     for w in windows:
         win_offsets[w] = total
         total += len(per_window[w]["clusters"])
-    parent = list(range(total))
+    edges: list[tuple[int, int]] = []
     with torch.inference_mode():
         ctx_all, bge_all = d["ctx_vecs"], d["mention_bge"]
         for i in range(len(windows)):
@@ -947,15 +1000,26 @@ def _predict_full_doc_clusters(
                     continue
                 ctx_i, bge_i = ctx_all[wi["global_idx"]], bge_all[wi["global_idx"]]
                 ctx_j, bge_j = ctx_all[wj["global_idx"]], bge_all[wj["global_idx"]]
-                left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
+                left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
                 right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
                 scores = cluster_matcher(left, right).float().cpu().numpy()
                 pairs = decode_cluster_matches(scores, float(cluster_matcher.null_bias.item()))
                 lo, ro = win_offsets[windows[i]], win_offsets[windows[j]]
                 for li, ri in pairs:
-                    a, b = _uf_find(parent, lo + li), _uf_find(parent, ro + ri)
-                    if a != b:
-                        parent[a] = b
+                    edges.append((lo + li, ro + ri))
+    return edges, win_offsets, total
+
+
+def _predict_full_doc_clusters(
+    d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher, device: str
+) -> list[list]:
+    windows = sorted(per_window.keys())
+    edges, win_offsets, total = _stage_b_merge_edges(d, per_window, cluster_matcher, device)
+    parent = list(range(total))
+    for a, b in edges:
+        ra, rb = _uf_find(parent, a), _uf_find(parent, b)
+        if ra != rb:
+            parent[ra] = rb
     groups: dict[int, list[int]] = {}
     for i in range(total):
         groups.setdefault(_uf_find(parent, i), []).append(i)
@@ -991,7 +1055,9 @@ def eval_stage_b(
         if not per_window:
             continue
         key_docs.append((d["name"], d["sentences"], _key_clusters(d)))
-        resp_docs.append((d["name"], d["sentences"], _predict_full_doc_clusters(d, per_window, cluster_matcher, device)))
+        resp_docs.append(
+            (d["name"], d["sentences"], _predict_full_doc_clusters(d, per_window, cluster_matcher, device))
+        )
     key_path = MODELS_DIR / f"stageb_{tag}_key.conll"
     resp_path = MODELS_DIR / f"stageb_{tag}_resp.conll"
     write_conll(key_path, key_docs)
@@ -1002,6 +1068,228 @@ def eval_stage_b(
     return result
 
 
+def _score_one_doc(name: str, sentences, key_clusters, resp_clusters) -> float:
+    kp = MODELS_DIR / "_diag_doc_key.conll"
+    rp = MODELS_DIR / "_diag_doc_resp.conll"
+    write_conll(kp, [(name, sentences, key_clusters)])
+    write_conll(rp, [(name, sentences, resp_clusters)])
+    return conll_f1(kp, rp)["CoNLL"]
+
+
+def _nearest_ante_dists(tok_pos: np.ndarray, cid: np.ndarray) -> list[int]:
+    # subtoken distance from each mention to its nearest earlier same-entity mention
+    dists = []
+    for i in range(len(cid)):
+        for j in range(i - 1, -1, -1):
+            if cid[j] == cid[i]:
+                dists.append(int(tok_pos[i] - tok_pos[j]))
+                break
+    return dists
+
+
+def _stage_a_purity(per_window: dict, cid: np.ndarray) -> tuple[int, int]:
+    # (pure, total): a Stage A cluster is pure if all its members share one gold entity
+    pure = total = 0
+    for w in per_window:
+        gi = per_window[w]["global_idx"]
+        for cl in per_window[w]["clusters"]:
+            total += 1
+            if len({int(cid[gi[x]]) for x in cl}) == 1:
+                pure += 1
+    return pure, total
+
+
+def write_diagnostics(
+    test_docs: list,
+    test_clusters: list,
+    scorer: AntecedentScorer,
+    cluster_matcher: ClusterMatcher,
+    device: str,
+    dataset: str,
+    split: str,
+) -> None:
+    # Emitted from the validated eval path for one dataset; appends a summary row keyed
+    # by (K=CONTENT, dataset) and writes a per-doc CSV. Tracks every claim-relevant
+    # metric: quotient compression, locality (nearest-antecedent within K), Stage A
+    # purity, Stage B edge precision/recall + recall by window gap, and per-doc
+    # runtime/VRAM scaling for Model C (windowed) vs Model B (all-pairs).
+    rows, tp, fp = [], 0, 0
+    gap_tot: dict[int, int] = {}
+    gap_ok: dict[int, int] = {}
+    key_all, resp_ab_all, resp_a_all = [], [], []
+    for d, per_window in zip(test_docs, test_clusters):
+        if not per_window:
+            continue
+        cid = d["cluster_id"]
+        windows = sorted(per_window.keys())
+        gold, cwin, total = [], [], 0
+        for w in windows:
+            for cl in per_window[w]["clusters"]:
+                gold.append(_cluster_gold_cids([per_window[w]["global_idx"][x] for x in cl], cid))
+                cwin.append(w)
+                total += 1
+        edges, _, _ = _stage_b_merge_edges(d, per_window, cluster_matcher, device)
+        parent = list(range(total))
+        for a, b in edges:
+            if gold[a] == gold[b]:
+                tp += 1
+            else:
+                fp += 1
+            ra, rb = _uf_find(parent, a), _uf_find(parent, b)
+            if ra != rb:
+                parent[ra] = rb
+        # Stage B recall over cross-window gold cluster pairs (same-window pairs are
+        # unreachable), bucketed by window gap to test whether all-pairs window
+        # comparison (vs adjacent-only) is what recovers long-range links
+        for a in range(total):
+            for b in range(a + 1, total):
+                if gold[a] == gold[b] and cwin[a] != cwin[b]:
+                    g = abs(cwin[a] - cwin[b])
+                    gap_tot[g] = gap_tot.get(g, 0) + 1
+                    if _uf_find(parent, a) == _uf_find(parent, b):
+                        gap_ok[g] = gap_ok.get(g, 0) + 1
+        key = _key_clusters(d)
+        resp_ab = _predict_full_doc_clusters(d, per_window, cluster_matcher, device)
+        resp_a = [
+            [d["spans"][per_window[w]["global_idx"][li]] for li in cl]
+            for w in windows
+            for cl in per_window[w]["clusters"]
+            if len(cl) >= 2
+        ]
+        key_all.append((d["name"], d["sentences"], key))
+        resp_ab_all.append((d["name"], d["sentences"], resp_ab))
+        resp_a_all.append((d["name"], d["sentences"], resp_a))
+
+        tok_pos = np.asarray(d["tok_pos"])
+        dists = _nearest_ante_dists(tok_pos, cid)
+        within = sum(1 for x in dists if x <= CONTENT)
+        occ = np.bincount(tok_pos // CONTENT)
+        occ = occ[occ > 0]
+        pure, ctot = _stage_a_purity(per_window, cid)
+        n_sub, m = len(d["content_ids"]), len(cid)
+
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            _predict_full_doc_clusters(d, _stage_a_clusters_for_doc(d, scorer, device), cluster_matcher, device)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        rt_c = (time.perf_counter() - t0) * 1000
+        vr_c = torch.cuda.max_memory_allocated(device) / 1e6 if device == "cuda" else 0.0
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()
+            bge = torch.from_numpy(d["mention_bge"]).to(device).float()
+            sb, mb = scorer(ctx, bge)
+            decode_antecedents(sb.float().cpu().numpy(), mb.cpu().numpy(), float(scorer.null_bias.item()))
+        if device == "cuda":
+            torch.cuda.synchronize()
+        rt_b = (time.perf_counter() - t0) * 1000
+        vr_b = torch.cuda.max_memory_allocated(device) / 1e6 if device == "cuda" else 0.0
+
+        rows.append(
+            {
+                "doc": d["name"],
+                "subtokens": n_sub,
+                "mentions": m,
+                "stageA_clusters": total,
+                "gold_entities": len(set(int(c) for c in cid)),
+                "density_M_over_N": round(m / n_sub, 4),
+                "max_win_occ": int(occ.max()) if len(occ) else 0,
+                "mean_win_occ": round(float(occ.mean()), 2) if len(occ) else 0.0,
+                "median_ante_dist": int(np.median(dists)) if dists else 0,
+                "frac_ante_within_K": round(within / len(dists), 4) if dists else 0.0,
+                "stageA_purity": round(pure / ctot, 4) if ctot else 0.0,
+                "conll_AB": round(_score_one_doc(d["name"], d["sentences"], key, resp_ab), 4),
+                "conll_Aalone": round(_score_one_doc(d["name"], d["sentences"], key, resp_a), 4),
+                "runtime_C_ms": round(rt_c, 3),
+                "runtime_B_ms": round(rt_b, 3),
+                "vram_C_mb": round(vr_c, 1),
+                "vram_B_mb": round(vr_b, 1),
+            }
+        )
+
+    n = len(rows)
+    n_mentions = sum(r["mentions"] for r in rows)
+    n_clusters = sum(r["stageA_clusters"] for r in rows)
+    n_entities = sum(r["gold_entities"] for r in rows)
+    n_subtokens = sum(r["subtokens"] for r in rows)
+    # corpus-level (micro) CoNLL F1 — the canonical aggregation the paper reports,
+    # scored once over all docs (not the per-doc macro mean, which over-weights small docs)
+    corpus_key = MODELS_DIR / "_diag_corpus_key.conll"
+    corpus_resp = MODELS_DIR / "_diag_corpus_resp.conll"
+    write_conll(corpus_key, key_all)
+    write_conll(corpus_resp, resp_ab_all)
+    f_ab = conll_f1(corpus_key, corpus_resp)["CoNLL"]
+    write_conll(corpus_resp, resp_a_all)
+    f_a = conll_f1(corpus_key, corpus_resp)["CoNLL"]
+
+    p_trained = sum(p.numel() for p in scorer.parameters()) + sum(p.numel() for p in cluster_matcher.parameters())
+
+    pd_path = MODELS_DIR / f"per_doc_k{CONTENT}_{dataset}.csv"
+    with pd_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    gap3_tot = sum(v for g, v in gap_tot.items() if g >= 3)
+    summary = {
+        "K": CONTENT,
+        "dataset": dataset,
+        "split": split,
+        "n_docs": n,
+        "mean_mentions": round(n_mentions / n, 2),
+        "mean_subtokens": round(n_subtokens / n, 1),
+        "mean_clusters": round(n_clusters / n, 2),
+        "mean_entities": round(n_entities / n, 2),
+        "compression_M_over_C": round(n_mentions / n_clusters, 3),
+        "fragments_C_over_E": round(n_clusters / n_entities, 3),
+        "mention_density": round(n_mentions / n_subtokens, 4),
+        "frac_ante_within_K": round(sum(r["frac_ante_within_K"] for r in rows) / n, 4),
+        "stageA_purity": round(sum(r["stageA_purity"] for r in rows) / n, 4),
+        "conll_AB": round(f_ab, 4),
+        "conll_Aalone": round(f_a, 4),
+        "stageB_gain": round(f_ab - f_a, 4),
+        "edge_precision": round(tp / max(tp + fp, 1), 4),
+        "edge_recall": round(sum(gap_ok.values()) / max(sum(gap_tot.values()), 1), 4),
+        "recall_gap_1": round(gap_ok.get(1, 0) / gap_tot[1], 4) if gap_tot.get(1) else 0.0,
+        "recall_gap_2": round(gap_ok.get(2, 0) / gap_tot[2], 4) if gap_tot.get(2) else 0.0,
+        "recall_gap_ge3": round(sum(v for g, v in gap_ok.items() if g >= 3) / gap3_tot, 4) if gap3_tot else 0.0,
+        "runtime_C_ms_total": round(sum(r["runtime_C_ms"] for r in rows), 1),
+        "runtime_B_ms_total": round(sum(r["runtime_B_ms"] for r in rows), 1),
+        "peak_vram_C_mb": round(max(r["vram_C_mb"] for r in rows), 1),
+        "peak_vram_B_mb": round(max(r["vram_B_mb"] for r in rows), 1),
+        "trained_params": p_trained,
+    }
+    sum_path = MODELS_DIR / "summary_by_window.csv"
+    existing = []
+    if sum_path.exists():
+        with sum_path.open(newline="") as f:
+            existing = [r for r in csv.DictReader(f) if not (int(r["K"]) == CONTENT and r["dataset"] == dataset)]
+    with sum_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
+        writer.writeheader()
+        for r in existing:
+            writer.writerow(r)
+        writer.writerow(summary)
+    print(f"\n✓ Diagnostics K={CONTENT} {dataset}/{split} ({n} docs) → {pd_path.name}")
+    print(f"  conll_AB {summary['conll_AB']} A-alone {summary['conll_Aalone']} | "
+          f"edgeP {summary['edge_precision']} edgeR {summary['edge_recall']} | "
+          f"within-K {summary['frac_ante_within_K']} purity {summary['stageA_purity']}")
+
+
+def _diagnostic_eval_sets(docs: list, all_stage_a: list) -> list[tuple[str, str, list, list]]:
+    # conll/litbank have test splits; preco/corefud only have validation
+    plan = [("conll2012", "test"), ("litbank", "test"), ("preco", "validation"), ("corefud", "validation")]
+    sets = []
+    for ds, split in plan:
+        idx = [i for i, d in enumerate(docs) if d["split"] == split and d["name"].startswith(ds + "/")]
+        if idx:
+            sets.append((ds, split, [docs[i] for i in idx], [all_stage_a[i] for i in idx]))
+    return sets
 
 
 def train_stage_b(
@@ -1010,6 +1298,7 @@ def train_stage_b(
     patience: int = 5,
     doc_bs: int = 8,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    eval_only: bool = False,
 ) -> None:
     print("\nTraining Stage B cluster matcher...")
     docs = build_docs(device=device)
@@ -1018,7 +1307,7 @@ def train_stage_b(
             d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
 
     stage_a = AntecedentScorer().to(device)
-    stage_a.load_state_dict(torch.load(MODELS_DIR / "stage2_frozen_head.pt", map_location=device)["scorer"])
+    stage_a.load_state_dict(torch.load(MODELS_DIR / f"{FROZEN_HEAD_BASE}.pt", map_location=device)["scorer"])
     for p in stage_a.parameters():
         p.requires_grad_(False)
     stage_a.eval()
@@ -1029,21 +1318,35 @@ def train_stage_b(
             d["ctx_vecs"] = np.load(p).astype(np.float32)
 
     train_docs = [d for d in docs if d["split"] == "train"]
-    val_docs   = [d for d in docs if d["split"] == "validation" and d["name"].startswith("conll2012/")]
-    test_docs  = [d for d in docs if d["split"] == "test"       and d["name"].startswith("conll2012/")]
+    val_docs = [d for d in docs if d["split"] == "validation" and d["name"].startswith("conll2012/")]
+    test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
 
     # precompute Stage A clusters once — avoids re-running Stage A every epoch
     all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device)
     train_clusters = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "train"]
-    val_clusters   = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")]
-    test_clusters  = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "test"       and d["name"].startswith("conll2012/")]
+    val_clusters = [
+        all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")
+    ]
+    test_clusters = [
+        all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")
+    ]
 
     all_train_pairs_count = sum(
-        len(per_window) * (len(per_window) - 1) // 2
-        for per_window in train_clusters if per_window
+        len(per_window) * (len(per_window) - 1) // 2 for per_window in train_clusters if per_window
     )
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     cluster_matcher = ClusterMatcher().to(device)
+    if eval_only:
+        cluster_matcher.load_state_dict(torch.load(MODELS_DIR / CKPT_B_NAME, map_location=device)["cluster_matcher"])
+        cluster_matcher.eval()
+        print("\n=== Stage B Test (eval only) ===")
+        test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
+        print(
+            f"Test CoNLL {test_scores['CoNLL']:.4f} MUC {test_scores['muc']:.4f} B3 {test_scores['bcub']:.4f} CEAFe {test_scores['ceafe']:.4f}"
+        )
+        for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
+            write_diagnostics(dd, dc, stage_a, cluster_matcher, device, ds, split)
+        return
     optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=0.1)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
     ckpt_path = MODELS_DIR / CKPT_B_NAME
@@ -1074,15 +1377,18 @@ def train_stage_b(
                     bge_i = bge_all[wi["global_idx"]]
                     ctx_j = ctx_all[wj["global_idx"]]
                     bge_j = bge_all[wj["global_idx"]]
-                    left  = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
+                    left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
                     right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
-                    left_cids  = [_cluster_gold_cids([wi["global_idx"][li] for li in cl], cid) for cl in lc]
+                    left_cids = [_cluster_gold_cids([wi["global_idx"][li] for li in cl], cid) for cl in lc]
                     right_cids = [_cluster_gold_cids([wj["global_idx"][li] for li in cl], cid) for cl in rc]
                     pending.append((left, right, left_cids, right_cids))
                     n_pairs += 1
             if len(pending) >= doc_bs:
                 optimizer.zero_grad()
-                losses = [cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending]
+                losses = [
+                    cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias)
+                    for l, r, lc, rc in pending
+                ]
                 torch.stack(losses).mean().backward()
                 torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
                 optimizer.step()
@@ -1090,7 +1396,9 @@ def train_stage_b(
                 pending = []
         if pending:
             optimizer.zero_grad()
-            losses = [cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending]
+            losses = [
+                cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending
+            ]
             torch.stack(losses).mean().backward()
             torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
             optimizer.step()
@@ -1100,21 +1408,42 @@ def train_stage_b(
 
         val_sets = {
             "conll2012": (val_docs, val_clusters),
-            "litbank":   ([d for d in docs if d["split"] == "validation" and d["name"].startswith("litbank/")],
-                          [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("litbank/")]),
-            "preco":     ([d for d in docs if d["split"] == "validation" and d["name"].startswith("preco/")],
-                          [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("preco/")]),
-            "corefud":   ([d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
-                          [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("corefud/")]),
+            "litbank": (
+                [d for d in docs if d["split"] == "validation" and d["name"].startswith("litbank/")],
+                [
+                    all_stage_a[i]
+                    for i, d in enumerate(docs)
+                    if d["split"] == "validation" and d["name"].startswith("litbank/")
+                ],
+            ),
+            "preco": (
+                [d for d in docs if d["split"] == "validation" and d["name"].startswith("preco/")],
+                [
+                    all_stage_a[i]
+                    for i, d in enumerate(docs)
+                    if d["split"] == "validation" and d["name"].startswith("preco/")
+                ],
+            ),
+            "corefud": (
+                [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
+                [
+                    all_stage_a[i]
+                    for i, d in enumerate(docs)
+                    if d["split"] == "validation" and d["name"].startswith("corefud/")
+                ],
+            ),
         }
         val_scores_all = {
-            ds: eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"val_{ds}_epoch{epoch+1}")
-            for ds, (vdocs, vclusters) in val_sets.items() if vdocs
+            ds: eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"val_{ds}_epoch{epoch + 1}")
+            for ds, (vdocs, vclusters) in val_sets.items()
+            if vdocs
         }
         val_scores = val_scores_all["conll2012"]
         print(f"Loss: {tr_loss:.6f}")
         for ds, sc in val_scores_all.items():
-            print(f"  {ds:10s} CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})")
+            print(
+                f"  {ds:10s} CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})"
+            )
 
         if val_scores["CoNLL"] > best_val_f1 + 1e-4:
             best_val_f1, patience_ctr = val_scores["CoNLL"], 0
@@ -1132,7 +1461,13 @@ def train_stage_b(
     cluster_matcher.eval()
     print("\n=== Stage B Test ===")
     test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
-    print(f"CoNLL {test_scores['CoNLL']:.4f} | MUC {test_scores['muc']:.4f} | B3 {test_scores['bcub']:.4f} | CEAFe {test_scores['ceafe']:.4f}")
+    print(
+        f"CoNLL {test_scores['CoNLL']:.4f} | MUC {test_scores['muc']:.4f} | B3 {test_scores['bcub']:.4f} | CEAFe {test_scores['ceafe']:.4f}"
+    )
+    for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
+        write_diagnostics(dd, dc, stage_a, cluster_matcher, device, ds, split)
     if "by_type" in test_scores:
         for bucket, sc in sorted(test_scores["by_type"].items()):
-            print(f"  {bucket:12s}  CoNLL {sc['CoNLL']:.4f}  MUC {sc['muc']:.4f}  B3 {sc['bcub']:.4f}  CEAFe {sc['ceafe']:.4f}")
+            print(
+                f"  {bucket:12s}  CoNLL {sc['CoNLL']:.4f}  MUC {sc['muc']:.4f}  B3 {sc['bcub']:.4f}  CEAFe {sc['ceafe']:.4f}"
+            )

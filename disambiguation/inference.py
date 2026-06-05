@@ -25,6 +25,10 @@ from disambiguation.stage2_context_encoder import (
 
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
 
+WIN_TAG = f"_k{CONTENT}"
+SPAN_CTX_CACHE = SPAN_CTX_CACHE.with_name(SPAN_CTX_CACHE.name + WIN_TAG)
+CKPT_B_NAME = f"stage2_cluster_matcher{WIN_TAG}.pt"
+
 
 def _load_models(device: str) -> tuple:
     tokenizer = load_tokenizer()
@@ -34,7 +38,7 @@ def _load_models(device: str) -> tuple:
         p.requires_grad_(False)
 
     stage_a = AntecedentScorer().to(device)
-    stage_a.load_state_dict(torch.load(MODELS_DIR / "stage2_frozen_head.pt", map_location=device)["scorer"])
+    stage_a.load_state_dict(torch.load(MODELS_DIR / f"stage2_frozen_head{WIN_TAG}.pt", map_location=device)["scorer"])
     stage_a.eval()
     for p in stage_a.parameters():
         p.requires_grad_(False)

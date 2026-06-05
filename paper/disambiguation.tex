@@ -33,15 +33,14 @@
 
 	Modern coreference systems perform entity resolution through direct mention-level interaction over the entire document. Whether implemented through pairwise scoring, mention ranking, or transformer self-attention, the dominant paradigm assumes that global entity structure must be inferred from a space in which individual mentions remain the primary objects of reasoning throughout inference.
 
-	This paper investigates a different hypothesis: global entity resolution may not require global mention-level reasoning. Instead, most entity structure may be recoverable through local resolution within bounded contexts, after which global consistency can be reconstructed through interactions between locally induced entity clusters. If true, the problem can be reformulated from global mention inference to hierarchical entity construction. The proposed system consists of three components:
+	This paper investigates a different hypothesis: global entity resolution may not require global mention-level reasoning. Instead, most entity structure may be recoverable through local resolution within bounded contexts, after which global consistency can be reconstructed through interactions between locally induced entity clusters. If true, the problem can be reformulated from global pair-wise mention comparison to local nominal resolution and matching predicted clusters. The proposed system consists of three components:
 	\begin{enumerate}
-		\item \textbf{Channel-separated representation:} Each mention is encoded using two frozen encoders that produce distinct semantic (surface-based) and contextual representations. These are kept separate throughout inference rather than collapsed into a single vector.
-
 		\item \textbf{Local window resolution:} The document is partitioned into fixed-length windows. Coreference links are first inferred independently within each window using a lightweight scoring model, producing local clusters via transitive closure.
-
+		
+		\item \textbf{Channel-separated representation:} Each mention is encoded using two frozen encoders that produce distinct semantic (surface-based) and contextual representations. These are kept separate throughout inference rather than collapsed into a single vector.
+		
 		\item \textbf{Cluster-level global matching:} Local clusters are treated as nodes in a quotient graph. Cross-window entity consistency is recovered by learning a matching function over cluster representations rather than directly comparing individual mentions. We empirically demonstrate that global reasoning over quotient-graph cluster representations outperforms direct global mention-level reasoning under identical frozen encoders and training conditions.
 	\end{enumerate}
-
 	This decomposition transforms global inference over $M$ mentions into a two-level process: local inference over bounded windows and global reasoning over a reduced set of cluster nodes. This structure allows the system to avoid full-document attention while still recovering long-range entity structure through hierarchical composition. The design is motivated by empirical observations that scalar similarity between contextual embeddings loses substantial discriminative information compared to full vector interactions, and that local resolution within bounded contexts captures a large fraction of coreference structure. We further observe that cluster-level aggregation provides a more stable interface for cross-window linking than direct mention-level comparison in frozen encoder settings.
 
 	The main contributions of this work are:
@@ -59,7 +58,6 @@
 
 	\section{Model Class Definition}
 	\label{sec:model_class}
-
 	We formalize the proposed system as a structured inference model over a partitioned mention space. The key property of the model class is the absence of any cross-partition mention-level interaction during local inference, followed by a single lifting step to a quotient space where global reasoning is performed exclusively over aggregated cluster representations. Let a document be represented as a sequence of tokens from which a set of mentions
 	\begin{align*}
 		\mathcal{M} = \{m_1, m_2, \dots, m_N\}
@@ -246,7 +244,7 @@
 	The contextual channel in \S\ref{sec:stage1} was a small learned transformer trained from scratch. This section replaces it with a frozen RoBERTa-large backbone, training only the composition head. The goal is to establish how much of the disambiguation signal is already present in a general-purpose pretrained encoder before any task-specific adaptation.
 
 	\subsection{Model}
-	Neither large model is fine-tuned. The only trained component is a 2.6M-parameter head. For each gold mention $i$, the contextual channel supplies the RoBERTa token vector at the span start $\mathbf{c}^{(s)}_i$ and end $\mathbf{c}^{(e)}_i$. Let $\mathbf{s}_i$ denote the BGE vector of the mention's surface text. Each channel is projected independently:
+	Neither large model is fine-tuned. The only trained component is an 8.4M-parameter head; both backbones (RoBERTa-large, 355M; BGE-large, 335M) remain frozen. For each gold mention $i$, the contextual channel supplies the RoBERTa token vector at the span start $\mathbf{c}^{(s)}_i$ and end $\mathbf{c}^{(e)}_i$. Let $\mathbf{s}_i$ denote the BGE vector of the mention's surface text. Each channel is projected independently:
 	\begin{align*}
 		g_i
 			& = [\,P_c([\mathbf{c}^{(s)}_i \;|\; \mathbf{c}^{(e)}_i]) \;|\; P_s(\mathbf{s}_i)\,] \in \mathbb{R}^{2048}
@@ -296,6 +294,7 @@
 			& \textbf{CoNLL} & \textbf{MUC} & \textbf{B$^3$} & \textbf{CEAFe} \\
 			\midrule
 			Stage A (window-split gold)         & 0.8974 & 0.9193 & 0.8932 & 0.8798 \\
+			Stage A only / Model A (full-doc gold) & 0.7428 & 0.8442 & 0.6896 & 0.6947 \\
 			\textbf{Stage A + B (full-doc gold)}& \textbf{0.8533} & \textbf{0.9194} & \textbf{0.8315} & \textbf{0.8090} \\
 			\midrule
 			\citet{dobrovolskii2021word}        & 0.818 & 0.857 & 0.800 & 0.797 \\
@@ -326,7 +325,7 @@
 		\caption{Stage A + B chronological type breakdown, CoNLL-2012 test.}
 		\label{tab:stageb_type}
 	\end{table}
-	Evaluated directly against full-document gold, Stage A suffers a substantial loss due to entity fragmentation at window boundaries. Stage B exists specifically to recover these missing global links. It is therefore not a post-processing heuristic but the mechanism that reconstructs the full-document entity partition from locally resolved components. Stage B recovers $\approx$0.06 CoNLL points over Stage A alone on full-document gold, bringing the two-stage system to 0.8533. PRON-only (0.664) remains the hardest bucket: pronouns carry an uninformative signature inside the semantic channel, forcing Stage B to rely entirely on context profiles which naturally decay across window gaps.
+	Evaluated directly against full-document gold, Stage A alone (Model A: every window-local cluster left unmerged) scores 0.7428, suffering a loss due to entity fragmentation at window boundaries. Stage B exists specifically to recover these missing global links. It is therefore not a post-processing heuristic but the mechanism that reconstructs the full-document entity partition from locally resolved components. Stage B recovers $+0.11$ CoNLL points over Stage A alone on full-document gold ($0.7428 \to 0.8533$). Two facts follow. First, local-only resolution already attains 87\% of the final F$_1$, confirming that the majority of coreference is decidable within a single bounded window with no global context. Second, the cross-window step is nonetheless substantial: the $+0.11$ gain is concentrated in the cluster-level metrics (B$^3$ $0.690 \to 0.832$, CEAFe $0.695 \to 0.809$) while MUC barely moves ($0.844 \to 0.919$) --- the precise signature of fragmented entities being rejoined rather than new links being invented. PRON-only (0.664) remains the hardest bucket: pronouns carry an uninformative signature inside the semantic channel, forcing Stage B to rely entirely on context profiles which naturally decay across window gaps. Treating each accepted Stage B merge as a quotient-graph edge, the cross-window matcher operates at 0.781 edge precision and 0.686 edge recall (over cross-window gold cluster pairs) against gold.
 
 	\section{Complexity Analysis}\label{sec:efficiency}
 	We analyze the computational complexity of the inference pipeline in terms of document length $N$, number of mentions $M$, window size $K$, and number of Stage A clusters $C$. The system consists of three components:
