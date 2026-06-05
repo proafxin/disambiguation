@@ -24,10 +24,11 @@ class ContextEncoder(nn.Module):
 
 
 def encode_document_ctx(
-    content_ids: np.ndarray, encoder: "ContextEncoder", cls_id: int, sep_id: int, device: str
+    content_ids: np.ndarray, encoder: "ContextEncoder", cls_id: int, sep_id: int, device: str,
+    window: int = CONTENT,
 ) -> torch.Tensor:
     n = len(content_ids)
-    spans = [(s, min(s + CONTENT, n)) for s in range(0, n, CONTENT)]
+    spans = [(s, min(s + window, n)) for s in range(0, n, window)]
     width = max(e - s for s, e in spans) + 2
     ids = np.ones((len(spans), width), dtype=np.int64)
     mask = np.zeros((len(spans), width), dtype=np.int64)

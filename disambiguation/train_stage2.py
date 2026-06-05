@@ -46,13 +46,15 @@ CONLL_SPLITS = ["train", "validation", "test"]
 PRECO_SUBSAMPLE = 8000  # RAM cap: (M,2,1024) ctx_vecs; 8000 docs fits comfortably in ~10 GB
 RANDOM_SEED = 42
 
-# All window-derived artifacts are tagged by the context window so K=128/256/512
-# never collide or silently reuse each other's caches/checkpoints.
-WIN_TAG = f"_k{CONTENT}"
-SPAN_CTX_CACHE = SPAN_CTX_CACHE.with_name(SPAN_CTX_CACHE.name + WIN_TAG)
-CKPT_B_NAME = f"stage2_cluster_matcher{WIN_TAG}.pt"
-FROZEN_HEAD_BASE = f"stage2_frozen_head{WIN_TAG}"
-STAGE_A_CLUSTERS_NAME = f"stage_a_clusters_cache{WIN_TAG}.pkl"
+def _win_names(window: int) -> tuple:
+    # window-tagged artifact names so K=128/256/512 never collide or reuse each other:
+    # (ctx cache dir, Stage A head base, Stage B matcher, Stage A clusters cache)
+    return (
+        SPAN_CTX_CACHE.with_name(SPAN_CTX_CACHE.name + f"_k{window}"),
+        f"stage2_frozen_head_k{window}",
+        f"stage2_cluster_matcher_k{window}.pt",
+        f"stage_a_clusters_cache_k{window}.pkl",
+    )
 
 
 def _doc_structure_conll(sample: dict, spacy_doc: spacy.tokens.Doc) -> tuple:
@@ -510,7 +512,7 @@ def _ctx_path(i: int, cache_dir: Path = SPAN_CTX_CACHE) -> Path:
     return cache_dir / f"{i:06d}.npy"
 
 
-def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path = SPAN_CTX_CACHE) -> None:
+def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path = SPAN_CTX_CACHE, window: int = CONTENT) -> None:
     # Writes each doc's (M, 2, CTX_DIM) float16 ctx_vecs (start, end) to an individual .npy file immediately.
     # Never accumulates more than one doc in RAM. Resumable: skips already-written files.
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -537,7 +539,7 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path =
                 d.pop("sent_sub_offsets", None)
                 d.pop("sent_sub_lengths", None)
                 continue
-            ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device).float().cpu().numpy()
+            ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device, window).float().cpu().numpy()
             ctx_vecs = gather_spans_np(ctx, d["span_sub"])
             np.save(p, ctx_vecs)
             d["ctx_vecs"] = ctx_vecs.astype(np.float32)
@@ -549,12 +551,13 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path =
 
 
 def doc_scores(
-    d: dict, encoder, scorer, cls_id, sep_id, device, all_pairs: bool = False, max_mentions: int | None = None
+    d: dict, encoder, scorer, cls_id, sep_id, device, all_pairs: bool = False, max_mentions: int | None = None,
+    window: int = CONTENT,
 ) -> list[tuple[torch.Tensor, torch.Tensor, np.ndarray]]:
     if encoder is None:
         ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()
     else:
-        ctx_doc = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device)
+        ctx_doc = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device, window)
         ctx = compute_mention_ctx_vecs(ctx_doc, d["span_sub"])
     bge = torch.from_numpy(d["mention_bge"]).to(device).float()
     # all_pairs: score every mention against every prior mention in the whole doc (one group);
@@ -565,7 +568,7 @@ def doc_scores(
     if all_pairs and (max_mentions is None or n_ment <= max_mentions):
         win_ids = np.zeros(n_ment, dtype=np.int64)
     else:
-        win_ids = d["tok_pos"] // CONTENT
+        win_ids = d["tok_pos"] // window
     results = []
     for w in np.unique(win_ids):
         idx = np.where(win_ids == w)[0]
@@ -587,6 +590,7 @@ def run_epoch(
     doc_bs,
     all_pairs: bool = False,
     max_mentions: int | None = None,
+    window: int = CONTENT,
 ) -> float:
     train = optimizer is not None
     total, ndoc = 0.0, 0
@@ -599,7 +603,7 @@ def run_epoch(
             for d in batch:
                 cluster_id = torch.from_numpy(d["cluster_id"]).to(device)
                 for w_scores, w_mask, idx in doc_scores(
-                    d, encoder, scorer, cls_id, sep_id, device, all_pairs, max_mentions
+                    d, encoder, scorer, cls_id, sep_id, device, all_pairs, max_mentions, window
                 ):
                     losses.append(mll_loss(w_scores, w_mask, cluster_id[idx], scorer.null_bias))
             if not losses:
@@ -617,9 +621,9 @@ def run_epoch(
     return total / max(ndoc, 1)
 
 
-def predict_clusters(d: dict, encoder, scorer, cls_id, sep_id, device, all_pairs: bool = False) -> list:
+def predict_clusters(d: dict, encoder, scorer, cls_id, sep_id, device, all_pairs: bool = False, window: int = CONTENT) -> list:
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-        windows = doc_scores(d, encoder, scorer, cls_id, sep_id, device, all_pairs)
+        windows = doc_scores(d, encoder, scorer, cls_id, sep_id, device, all_pairs, window=window)
     clusters = []
     null_bias = float(scorer.null_bias.item())
     for w_scores, w_mask, idx in windows:
@@ -667,7 +671,7 @@ def eval_conll(
         (
             d["name"],
             d["sentences"],
-            predict_clusters(d, encoder, scorer, cls_id, sep_id, device, all_pairs),
+            predict_clusters(d, encoder, scorer, cls_id, sep_id, device, all_pairs, window=window or CONTENT),
         )
         for d in tqdm(docs, desc=f"eval/{tag}")
     ]
@@ -688,9 +692,10 @@ def train_stage2(
     doc_bs: int | None = None,
     predicted: bool = False,
     all_pairs: bool = False,
+    window: int = CONTENT,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
-    print(f"\nBuilding Stage 2 nominal data... (finetune={finetune}, predicted={predicted})")
+    print(f"\nBuilding Stage 2 nominal data... (finetune={finetune}, predicted={predicted}, window={window})")
     if predicted:
         print("Evaluation setting: PREDICTED mentions (end-to-end), CoNLL only; KEY = true gold clusters")
     else:
@@ -719,7 +724,8 @@ def train_stage2(
             "corefud": [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
         }
 
-    frozen_name = FROZEN_HEAD_BASE
+    ctx_dir, frozen_base, _, _ = _win_names(window)
+    frozen_name = frozen_base
     if predicted:
         frozen_name += "_pred"
     if all_pairs:
@@ -749,7 +755,8 @@ def train_stage2(
         for p in encoder.parameters():
             p.requires_grad_(False)
         precompute_span_ctx(
-            encoder, docs, cls_id, sep_id, device, cache_dir=SPAN_CTX_CACHE_PRED if predicted else SPAN_CTX_CACHE
+            encoder, docs, cls_id, sep_id, device,
+            cache_dir=SPAN_CTX_CACHE_PRED if predicted else ctx_dir, window=window,
         )
         del encoder
         if device != "cpu":
@@ -782,14 +789,14 @@ def train_stage2(
         if enc_loop is not None:
             enc_loop.train()
         scorer.train()
-        tr_loss = run_epoch(enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap)
+        tr_loss = run_epoch(enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap, window)
         scheduler.step()
         if enc_loop is not None:
             enc_loop.eval()
         scorer.eval()
         with torch.inference_mode():
             val_losses = {
-                ds: run_epoch(enc_loop, scorer, vdocs, None, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap)
+                ds: run_epoch(enc_loop, scorer, vdocs, None, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap, window)
                 for ds, vdocs in val_sets.items()
                 if vdocs
             }
@@ -803,7 +810,7 @@ def train_stage2(
                 sep_id,
                 device,
                 f"{tag}_val_{ds}",
-                window=CONTENT,
+                window=window,
                 all_pairs=all_pairs,
             )
             for ds, vdocs in val_sets.items()
@@ -862,7 +869,7 @@ def train_stage2(
         device,
         f"{tag}_test",
         type_breakdown=True,
-        window=CONTENT,
+        window=window,
         all_pairs=all_pairs,
     )
     print(
@@ -888,7 +895,7 @@ def train_stage2(
             sep_id,
             device,
             f"{tag}_final_val_{ds}",
-            window=CONTENT,
+            window=window,
             all_pairs=all_pairs,
         )
         for ds, vdocs in val_sets.items()
@@ -903,18 +910,14 @@ def train_stage2(
         json.dump(metrics, f, indent=2)
 
 
-if __name__ == "__main__":
-    train_stage2()
-
-
-def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str) -> dict[int, dict]:
+def _stage_a_clusters_for_doc(d: dict, scorer: AntecedentScorer, device: str, window: int = CONTENT) -> dict[int, dict]:
     # Returns {win_id: {"clusters": list[list[int]],  # window-local indices
     #                   "global_idx": np.ndarray}}    # local->global mention index map
     # ctx/bge arrays are NOT stored — loaded from d at training time
     ctx_all = d["ctx_vecs"]
     bge_all = d["mention_bge"]
     tok_pos = d["tok_pos"]
-    win_ids = tok_pos // CONTENT
+    win_ids = tok_pos // window
     per_window: dict[int, dict] = {}
     with torch.inference_mode():
         for w in np.unique(win_ids):
@@ -954,8 +957,8 @@ def _cluster_gold_cids(cluster: list[int], cluster_id: np.ndarray) -> int:
     return int(np.bincount(cids).argmax())
 
 
-def _precompute_stage_a_clusters(docs: list, scorer: AntecedentScorer, device: str) -> list[dict[int, dict]]:
-    cache_path = MODELS_DIR / STAGE_A_CLUSTERS_NAME
+def _precompute_stage_a_clusters(docs: list, scorer: AntecedentScorer, device: str, window: int = CONTENT) -> list[dict[int, dict]]:
+    cache_path = MODELS_DIR / _win_names(window)[3]
     if cache_path.exists():
         print("Loading cached Stage A clusters...")
         with cache_path.open("rb") as f:
@@ -968,7 +971,7 @@ def _precompute_stage_a_clusters(docs: list, scorer: AntecedentScorer, device: s
             if "ctx_vecs" not in d:
                 result.append({})
                 continue
-            result.append(_stage_a_clusters_for_doc(d, scorer, device))
+            result.append(_stage_a_clusters_for_doc(d, scorer, device, window))
     with cache_path.open("wb") as f:
         pickle.dump(result, f)
     print(f"Cached Stage A clusters to {cache_path.name}")
@@ -1105,6 +1108,7 @@ def write_diagnostics(
     scorer: AntecedentScorer,
     cluster_matcher: ClusterMatcher,
     device: str,
+    window: int,
     dataset: str,
     split: str,
 ) -> None:
@@ -1162,8 +1166,8 @@ def write_diagnostics(
 
         tok_pos = np.asarray(d["tok_pos"])
         dists = _nearest_ante_dists(tok_pos, cid)
-        within = sum(1 for x in dists if x <= CONTENT)
-        occ = np.bincount(tok_pos // CONTENT)
+        within = sum(1 for x in dists if x <= window)
+        occ = np.bincount(tok_pos // window)
         occ = occ[occ > 0]
         pure, ctot = _stage_a_purity(per_window, cid)
         n_sub, m = len(d["content_ids"]), len(cid)
@@ -1172,7 +1176,7 @@ def write_diagnostics(
             torch.cuda.reset_peak_memory_stats(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
-            _predict_full_doc_clusters(d, _stage_a_clusters_for_doc(d, scorer, device), cluster_matcher, device)
+            _predict_full_doc_clusters(d, _stage_a_clusters_for_doc(d, scorer, device, window), cluster_matcher, device)
         if device == "cuda":
             torch.cuda.synchronize()
         rt_c = (time.perf_counter() - t0) * 1000
@@ -1229,7 +1233,7 @@ def write_diagnostics(
 
     p_trained = sum(p.numel() for p in scorer.parameters()) + sum(p.numel() for p in cluster_matcher.parameters())
 
-    pd_path = MODELS_DIR / f"per_doc_k{CONTENT}_{dataset}.csv"
+    pd_path = MODELS_DIR / f"per_doc_k{window}_{dataset}.csv"
     with pd_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -1237,7 +1241,7 @@ def write_diagnostics(
 
     gap3_tot = sum(v for g, v in gap_tot.items() if g >= 3)
     summary = {
-        "K": CONTENT,
+        "K": window,
         "dataset": dataset,
         "split": split,
         "n_docs": n,
@@ -1268,14 +1272,14 @@ def write_diagnostics(
     existing = []
     if sum_path.exists():
         with sum_path.open(newline="") as f:
-            existing = [r for r in csv.DictReader(f) if not (int(r["K"]) == CONTENT and r["dataset"] == dataset)]
+            existing = [r for r in csv.DictReader(f) if not (int(r["K"]) == window and r["dataset"] == dataset)]
     with sum_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
         writer.writeheader()
         for r in existing:
             writer.writerow(r)
         writer.writerow(summary)
-    print(f"\n✓ Diagnostics K={CONTENT} {dataset}/{split} ({n} docs) → {pd_path.name}")
+    print(f"\n✓ Diagnostics K={window} {dataset}/{split} ({n} docs) → {pd_path.name}")
     print(f"  conll_AB {summary['conll_AB']} A-alone {summary['conll_Aalone']} | "
           f"edgeP {summary['edge_precision']} edgeR {summary['edge_recall']} | "
           f"within-K {summary['frac_ante_within_K']} purity {summary['stageA_purity']}")
@@ -1297,23 +1301,25 @@ def train_stage_b(
     max_epochs: int = 30,
     patience: int = 5,
     doc_bs: int = 8,
+    window: int = CONTENT,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
 ) -> None:
-    print("\nTraining Stage B cluster matcher...")
+    print(f"\nTraining Stage B cluster matcher... (window={window})")
+    ctx_dir, frozen_base, ckpt_b, _ = _win_names(window)
     docs = build_docs(device=device)
     for d in docs:
         if "tok_pos" not in d:
             d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
 
     stage_a = AntecedentScorer().to(device)
-    stage_a.load_state_dict(torch.load(MODELS_DIR / f"{FROZEN_HEAD_BASE}.pt", map_location=device)["scorer"])
+    stage_a.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
     for p in stage_a.parameters():
         p.requires_grad_(False)
     stage_a.eval()
 
     for i, d in enumerate(docs):
-        p = SPAN_CTX_CACHE / f"{i:06d}.npy"
+        p = ctx_dir / f"{i:06d}.npy"
         if p.exists() and "ctx_vecs" not in d:
             d["ctx_vecs"] = np.load(p).astype(np.float32)
 
@@ -1322,7 +1328,7 @@ def train_stage_b(
     test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
 
     # precompute Stage A clusters once — avoids re-running Stage A every epoch
-    all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device)
+    all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device, window)
     train_clusters = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "train"]
     val_clusters = [
         all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")
@@ -1337,7 +1343,7 @@ def train_stage_b(
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     cluster_matcher = ClusterMatcher().to(device)
     if eval_only:
-        cluster_matcher.load_state_dict(torch.load(MODELS_DIR / CKPT_B_NAME, map_location=device)["cluster_matcher"])
+        cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
         cluster_matcher.eval()
         print("\n=== Stage B Test (eval only) ===")
         test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
@@ -1345,11 +1351,11 @@ def train_stage_b(
             f"Test CoNLL {test_scores['CoNLL']:.4f} MUC {test_scores['muc']:.4f} B3 {test_scores['bcub']:.4f} CEAFe {test_scores['ceafe']:.4f}"
         )
         for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
-            write_diagnostics(dd, dc, stage_a, cluster_matcher, device, ds, split)
+            write_diagnostics(dd, dc, stage_a, cluster_matcher, device, window, ds, split)
         return
     optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=0.1)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
-    ckpt_path = MODELS_DIR / CKPT_B_NAME
+    ckpt_path = MODELS_DIR / ckpt_b
     best_val_f1, patience_ctr = -1.0, 0
 
     for epoch in range(max_epochs):
@@ -1465,9 +1471,20 @@ def train_stage_b(
         f"CoNLL {test_scores['CoNLL']:.4f} | MUC {test_scores['muc']:.4f} | B3 {test_scores['bcub']:.4f} | CEAFe {test_scores['ceafe']:.4f}"
     )
     for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
-        write_diagnostics(dd, dc, stage_a, cluster_matcher, device, ds, split)
+        write_diagnostics(dd, dc, stage_a, cluster_matcher, device, window, ds, split)
     if "by_type" in test_scores:
         for bucket, sc in sorted(test_scores["by_type"].items()):
             print(
                 f"  {bucket:12s}  CoNLL {sc['CoNLL']:.4f}  MUC {sc['muc']:.4f}  B3 {sc['bcub']:.4f}  CEAFe {sc['ceafe']:.4f}"
             )
+
+
+if __name__ == "__main__":
+    import gc
+
+    for k in (128, 256, 512):
+        train_stage2(window=k)
+        train_stage_b(window=k)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

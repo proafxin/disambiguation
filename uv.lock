@@ -458,7 +458,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "datasets", specifier = ">=4.8.5" },
+    { name = "datasets", specifier = ">=5.0.0" },
     { name = "protobuf", specifier = ">=7.35.0" },
     { name = "sentence-transformers", specifier = ">=5.5.1" },
     { name = "sentencepiece", specifier = ">=0.2.1" },
@@ -466,7 +466,7 @@ requires-dist = [
     { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.12.0" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", specifier = ">=2.12.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "transformers", specifier = ">=5.9.0" },
+    { name = "transformers", specifier = ">=5.10.2" },
 ]
 
 [package.metadata.requires-dev]
