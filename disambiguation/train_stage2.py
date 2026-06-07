@@ -1,6 +1,7 @@
 import csv
 import datetime
 import json
+import math
 import pickle
 import random
 import time
@@ -1250,7 +1251,12 @@ def _stage_b_merge_edges(
                 ctx_j, bge_j = ctx_all[wj["global_idx"]], bge_all[wj["global_idx"]]
                 left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
                 right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
-                scores = cluster_matcher(left, right).float().cpu().numpy()
+                if hasattr(cluster_matcher, "lex"):
+                    lex = _lex_for_pair(d, int(wi["global_idx"][0]), int(wj["global_idx"][0]), lc, rc,
+                                        wi["global_idx"], wj["global_idx"], device)
+                    scores = cluster_matcher(left, right, lex).float().cpu().numpy()
+                else:
+                    scores = cluster_matcher(left, right).float().cpu().numpy()
                 pairs = decode_cluster_matches(scores, float(cluster_matcher.null_bias.item()))
                 lo, ro = win_offsets[windows[i]], win_offsets[windows[j]]
                 for li, ri in pairs:
@@ -1574,15 +1580,90 @@ def _diagnostic_eval_sets(docs: list, all_stage_a: list) -> list[tuple[str, str,
     return sets
 
 
+_PRONOUNS = frozenset({
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+    "my", "your", "his", "its", "our", "their", "mine", "yours", "hers", "ours", "theirs",
+    "myself", "yourself", "himself", "herself", "itself", "ourselves", "yourselves", "themselves",
+    "this", "that", "these", "those", "who", "whom", "whose", "which", "what", "there", "here",
+})
+
+
+def _build_lexical(docs: list) -> None:
+    # per-mention lowercased token tuples + doc-local IDF, reconstructed from sentences+spans
+    # (spans are (sent_idx, start, end)). Independent lexical-identity channel for Stage B.
+    for d in docs:
+        if "mention_tokens" in d:
+            continue
+        sents = d["sentences"]
+        toks = [tuple(w.lower() for w in sents[si][s:e]) for (si, s, e) in d["spans"]]
+        df: dict = {}
+        for m in toks:
+            for t in set(m):
+                df[t] = df.get(t, 0) + 1
+        n = max(len(toks), 1)
+        d["mention_tokens"] = toks
+        d["mention_idf"] = {t: math.log(n / (1 + c)) + 1.0 for t, c in df.items()}
+
+
+def _is_subseq(a: tuple, b: tuple) -> bool:
+    if not a or len(a) > len(b):
+        return False
+    return any(b[k : k + len(a)] == a for k in range(len(b) - len(a) + 1))
+
+
+def _content(m: tuple) -> bool:
+    # a content mention surface (not a bare pronoun) for exact-match / containment features
+    return not (len(m) == 1 and m[0] in _PRONOUNS)
+
+
+def _lex_matrix(lc: list, rc: list, lgi, rgi, mention_tokens: list, idf: dict) -> np.ndarray:
+    # (L, R, 3) cluster-pair lexical features: [IDF-weighted token Jaccard, substring containment, exact match]
+    lsurf = [[mention_tokens[lgi[i]] for i in cl] for cl in lc]
+    rsurf = [[mention_tokens[rgi[i]] for i in cl] for cl in rc]
+    lset = [{t for m in s for t in m} for s in lsurf]
+    rset = [{t for m in s for t in m} for s in rsurf]
+    lmass = [sum(idf.get(t, 0.0) for t in s) for s in lset]
+    rmass = [sum(idf.get(t, 0.0) for t in s) for s in rset]
+    lcont = [[m for m in s if _content(m)] for s in lsurf]
+    rcont = [[m for m in s if _content(m)] for s in rsurf]
+    out = np.zeros((len(lc), len(rc), 3), dtype=np.float32)
+    for i in range(len(lc)):
+        ci = set(lcont[i])
+        for j in range(len(rc)):
+            inter = lset[i] & rset[j]
+            im = sum(idf.get(t, 0.0) for t in inter)
+            um = lmass[i] + rmass[j] - im
+            out[i, j, 0] = im / um if um > 0 else 0.0
+            out[i, j, 2] = 1.0 if ci & set(rcont[j]) else 0.0
+            cont = any(_is_subseq(a, b) or _is_subseq(b, a) for a in lcont[i] for b in rcont[j])
+            out[i, j, 1] = 1.0 if cont else 0.0
+    return out
+
+
+def _lex_for_pair(d: dict, ki: int, kj: int, lc: list, rc: list, lgi, rgi, device: str) -> torch.Tensor:
+    # memoized per (window-pair) — lexical features are constant across epochs
+    if "mention_tokens" not in d:
+        _build_lexical([d])
+    cache = d.setdefault("_lex", {})
+    key = (ki, kj)
+    if key not in cache:
+        cache[key] = _lex_matrix(lc, rc, lgi, rgi, d["mention_tokens"], d["mention_idf"])
+    return torch.from_numpy(cache[key]).to(device)
+
+
 def _stage_b_losses(cluster_matcher, pending: list) -> list:
-    # batch all window-pairs in one forward when the head supports it (mention head), else per-pair
+    # pending items: (left, right, left_cids, right_cids, lex). batch all window-pairs in one
+    # forward when the head supports it (mention head), else per-pair; lex is None for pooled.
     if hasattr(cluster_matcher, "forward_many"):
-        mats = cluster_matcher.forward_many([(l, r) for l, r, _, _ in pending])
+        lex_list = [p[4] for p in pending]
+        if all(x is None for x in lex_list):
+            lex_list = None
+        mats = cluster_matcher.forward_many([(p[0], p[1]) for p in pending], lex_list)
         return [
-            cluster_match_loss(m, lc, rc, cluster_matcher.null_bias)
-            for m, (_, _, lc, rc) in zip(mats, pending, strict=True)
+            cluster_match_loss(m, p[2], p[3], cluster_matcher.null_bias)
+            for m, p in zip(mats, pending, strict=True)
         ]
-    return [cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending]
+    return [cluster_match_loss(cluster_matcher(p[0], p[1]), p[2], p[3], cluster_matcher.null_bias) for p in pending]
 
 
 def _meta_hardness(meta: tuple, bge_all: np.ndarray) -> float:
@@ -1630,6 +1711,8 @@ def train_stage_b(
     for d in docs:
         if "tok_pos" not in d:
             d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
+    if head == "mention":
+        _build_lexical(docs)  # independent lexical-identity channel (§4.5/§8); mention head only
 
     stage_a = AntecedentScorer().to(device)
     stage_a.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
@@ -1732,7 +1815,12 @@ def train_stage_b(
                 ctx_j, bge_j = ctx_all[wj["global_idx"]], bge_all[wj["global_idx"]]
                 left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
                 right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
-                pending.append((left, right, left_cids, right_cids))
+                lex = (
+                    _lex_for_pair(d, int(wi["global_idx"][0]), int(wj["global_idx"][0]), lc, rc,
+                                  wi["global_idx"], wj["global_idx"], device)
+                    if head == "mention" else None
+                )
+                pending.append((left, right, left_cids, right_cids, lex))
                 pending_pairs += sum(c.shape[0] for c, _ in left) * sum(c.shape[0] for c, _ in right)
                 n_pairs += 1
                 if len(pending) >= doc_bs or pending_pairs >= pair_budget:

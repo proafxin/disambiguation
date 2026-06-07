@@ -235,13 +235,18 @@ class MentionMatcher(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
+        # independent lexical-identity channel: additive term over [IDF-Jaccard, containment, exact],
+        # kept separate from the neural score (not concatenated onto mention vectors). Zero-init so it
+        # starts neutral and learns its weights. Active only when lexical features are supplied.
+        self.lex = nn.Linear(3, 1, bias=False)
+        nn.init.zeros_(self.lex.weight)
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def _vecs(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
         # (M, 2, CTX_DIM), (M, BGE_DIM) -> (M, 2*proj_dim)
         return torch.cat([self.P_ctx(self.drop(ctx.flatten(1))), self.P_bge(self.drop(bge))], dim=-1)
 
-    def forward_many(self, pairs: list[tuple[list, list]]) -> list[torch.Tensor]:
+    def forward_many(self, pairs: list[tuple[list, list]], lex_list: list | None = None) -> list[torch.Tensor]:
         # Batch every window-pair's mention-pair scoring into ONE chunked FFNN + ONE segmented
         # reduction. For each window-pair p we enumerate its within-pair (Lm_p x Rm_p) mention
         # pairs and tag each with a flat cluster-pair bucket id; all pairs' features are scored
@@ -274,8 +279,11 @@ class MentionMatcher(nn.Module):
         counts = torch.zeros(off, device=feat.device, dtype=torch.float32).index_add(0, bucket, torch.ones_like(e))
         flat = gmax.float() + torch.log(sums) - torch.log(counts)  # log-mean-exp (size-bias removed)
         out, o = [], 0
-        for lp, rp in shapes:
-            out.append(flat[o : o + lp * rp].reshape(lp, rp))
+        for p, (lp, rp) in enumerate(shapes):
+            s = flat[o : o + lp * rp].reshape(lp, rp)
+            if lex_list is not None:
+                s = s + self.lex(lex_list[p].to(s.dtype)).squeeze(-1)  # additive lexical channel
+            out.append(s)
             o += lp * rp
         return out
 
@@ -283,8 +291,9 @@ class MentionMatcher(nn.Module):
         self,
         left: list[tuple[torch.Tensor, torch.Tensor]],
         right: list[tuple[torch.Tensor, torch.Tensor]],
+        lex: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.forward_many([(left, right)])[0]  # (L, R)
+        return self.forward_many([(left, right)], None if lex is None else [lex])[0]  # (L, R)
 
 
 def cluster_match_loss(
