@@ -21,16 +21,19 @@ from disambiguation.paths import (
     DATA_DIR,
     MODELS_DIR,
     NOM_CACHE,
+    NOM_CACHE_CP8K,
     SPACY_TRF_DIR,
     SPAN_CTX_CACHE,
+    SPAN_CTX_CP8K,
     TENSORBOARD_DIR,
 )
 from disambiguation.stage2_context_encoder import (
-    CKPT_B_NAME,
     CONTENT,
+    CTX_DIM,
     AntecedentScorer,
     ClusterMatcher,
     ContextEncoder,
+    MentionMatcher,
     _uf_find,
     cluster_match_loss,
     compute_mention_ctx_vecs,
@@ -43,17 +46,65 @@ from disambiguation.stage2_context_encoder import (
 
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
 CONLL_SPLITS = ["train", "validation", "test"]
-PRECO_SUBSAMPLE = 8000  # RAM cap: (M,2,1024) ctx_vecs; 8000 docs fits comfortably in ~10 GB
+PRECO_SUBSAMPLE = 8000  # ctx_vecs held as float16 in RAM; conll+preco@8k fits ~4.4 GB fully resident
 RANDOM_SEED = 42
 
-def _win_names(window: int) -> tuple:
+
+_SUBSET_TAG = {"all": "", "conll": "_conllonly", "nopreco": "_nopreco", "cp8k": "_cp8k", "all8k": "_all8k"}
+_PRECO_CAP = {"cp8k": 8000, "all8k": 8000}  # cap preco *training* docs (cache may hold more)
+
+
+def _data_cfg(subset: str) -> tuple:
+    # (nom_cache, datasets, preco_n, single_ctx) for building/loading this subset's data.
+    # cp8k is a self-contained build (conll+preco only) with one single-file ctx. all8k reuses
+    # the existing all-4 per-doc cache (10k preco) and caps training to 8k preco (no rebuild).
+    if subset == "cp8k":
+        return (NOM_CACHE_CP8K, ("conll2012", "preco"), PRECO_SUBSAMPLE, True)
+    return (NOM_CACHE, ("conll2012", "litbank", "preco", "corefud"), 10000, False)
+
+
+def _train_idx(docs: list, subset: str) -> list:
+    # indices of training docs honoring subset rules: drop preco for nopreco; cap preco docs
+    # for cp8k/all8k. Keeps the master list (and thus ctx positions) intact.
+    cap = _PRECO_CAP.get(subset)
+    out, preco = [], 0
+    for i, d in enumerate(docs):
+        if d["split"] != "train":
+            continue
+        name = d["name"]
+        if subset == "nopreco" and name.startswith("preco/"):
+            continue
+        if cap is not None and name.startswith("preco/"):
+            if preco >= cap:
+                continue
+            preco += 1
+        out.append(i)
+    return out
+
+
+def _filter_docs(docs: list, subset: str) -> list:
+    # Only prefix subsets may physically shrink the master list: conll is the cache's
+    # leading block, so dropping the rest keeps positions 0..n_conll aligned with the
+    # ctx .npy files. nopreco removes an *interior* block (order is conll,litbank,preco,
+    # corefud), so the master list is left intact to preserve ctx alignment and preco is
+    # excluded from training instead (see _train_idx).
+    if subset == "conll":
+        return [d for d in docs if d["name"].startswith("conll2012/")]
+    return docs
+
+
+def _win_names(window: int, subset: str = "all") -> tuple:
     # window-tagged artifact names so K=128/256/512 never collide or reuse each other:
-    # (ctx cache dir, Stage A head base, Stage B matcher, Stage A clusters cache)
+    # (ctx cache dir, Stage A head base, Stage B matcher, Stage A clusters cache).
+    # ctx dir is NOT subset-tagged: conll docs are the cache's stable prefix, so a
+    # subset run reuses the same ctx files. Heads/matchers/clusters get the subset tag.
+    t = f"_k{window}" + _SUBSET_TAG[subset]
+    ctx = SPAN_CTX_CP8K if subset == "cp8k" else SPAN_CTX_CACHE
     return (
-        SPAN_CTX_CACHE.with_name(SPAN_CTX_CACHE.name + f"_k{window}"),
-        f"stage2_frozen_head_k{window}",
-        f"stage2_cluster_matcher_k{window}.pt",
-        f"stage_a_clusters_cache_k{window}.pkl",
+        ctx.with_name(ctx.name + f"_k{window}"),
+        f"stage2_frozen_head{t}",
+        f"stage2_cluster_matcher{t}.pt",
+        f"stage_a_clusters_cache{t}.pkl",
     )
 
 
@@ -376,9 +427,14 @@ def build_conll_predicted_docs(device: str = "cuda" if torch.cuda.is_available()
     return _assemble_docs(raw, device, NOM_CACHE_PRED)
 
 
-def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> list:
-    if NOM_CACHE.exists():
-        with NOM_CACHE.open("rb") as f:
+def build_docs(
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    datasets: tuple = ("conll2012", "litbank", "preco", "corefud"),
+    nom_cache: Path = NOM_CACHE,
+    preco_n: int = PRECO_SUBSAMPLE,
+) -> list:
+    if nom_cache.exists():
+        with nom_cache.open("rb") as f:
             docs = pickle.load(f)
         for d in docs:
             d["mention_bge"] = d["mention_bge"].astype(np.float32)
@@ -410,35 +466,36 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
                 raw.append(rec)
 
     # --- LitBank (train/validation/test) ---
-    for split in ("train", "validation", "test"):
-        ds = load_from_disk(str(DATA_DIR / "litbank"))[split]
-        for sample in tqdm(ds, desc=f"litbank/{split}"):
-            sents = sample["sentences"]
-            clusters = _clusters_litbank(sample)
-            sents_list = [list(s) if not isinstance(s, list) else s for s in sents]
-            sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_generic(
-                sents_list, clusters
-            )
-            rec = _raw_from_doc(
-                f"litbank/{sample['doc_name']}#{len(raw)}",
-                split,
-                sents_str,
-                offsets,
-                spans,
-                cluster_id,
-                mention_surfaces,
-                head_lex,
-                tokenizer,
-            )
-            if rec:
-                raw.append(rec)
+    if "litbank" in datasets:
+        for split in ("train", "validation", "test"):
+            ds = load_from_disk(str(DATA_DIR / "litbank"))[split]
+            for sample in tqdm(ds, desc=f"litbank/{split}"):
+                sents = sample["sentences"]
+                clusters = _clusters_litbank(sample)
+                sents_list = [list(s) if not isinstance(s, list) else s for s in sents]
+                sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_generic(
+                    sents_list, clusters
+                )
+                rec = _raw_from_doc(
+                    f"litbank/{sample['doc_name']}#{len(raw)}",
+                    split,
+                    sents_str,
+                    offsets,
+                    spans,
+                    cluster_id,
+                    mention_surfaces,
+                    head_lex,
+                    tokenizer,
+                )
+                if rec:
+                    raw.append(rec)
 
     # --- PreCo (train subsampled, validation) ---
     preco_ds = load_from_disk(str(DATA_DIR / "preco"))
     preco_train = list(preco_ds["train"])
     random.seed(RANDOM_SEED)
     random.shuffle(preco_train)
-    for sample in tqdm(preco_train[:PRECO_SUBSAMPLE], desc="preco/train"):
+    for sample in tqdm(preco_train[:preco_n], desc="preco/train"):
         sents = sample["sentences"]
         clusters = _clusters_preco(sample)
         sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_generic(sents, clusters)
@@ -474,28 +531,31 @@ def build_docs(device: str = "cuda" if torch.cuda.is_available() else "cpu") -> 
             raw.append(rec)
 
     # --- CorefUD (train/validation) ---
-    for split in ("train", "validation"):
-        ds = load_from_disk(str(DATA_DIR / "corefud"))[split]
-        for sample in tqdm(ds, desc=f"corefud/{split}"):
-            sents = [[t["form"] for t in sent["tokens"]] for sent in sample["sentences"]]
-            clusters = _clusters_corefud(sample)
-            sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_generic(sents, clusters)
-            rec = _raw_from_doc(
-                f"corefud/{sample['doc_id']}#{len(raw)}",
-                split,
-                sents_str,
-                offsets,
-                spans,
-                cluster_id,
-                mention_surfaces,
-                head_lex,
-                tokenizer,
-            )
-            if rec:
-                raw.append(rec)
+    if "corefud" in datasets:
+        for split in ("train", "validation"):
+            ds = load_from_disk(str(DATA_DIR / "corefud"))[split]
+            for sample in tqdm(ds, desc=f"corefud/{split}"):
+                sents = [[t["form"] for t in sent["tokens"]] for sent in sample["sentences"]]
+                clusters = _clusters_corefud(sample)
+                sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_generic(
+                    sents, clusters
+                )
+                rec = _raw_from_doc(
+                    f"corefud/{sample['doc_id']}#{len(raw)}",
+                    split,
+                    sents_str,
+                    offsets,
+                    spans,
+                    cluster_id,
+                    mention_surfaces,
+                    head_lex,
+                    tokenizer,
+                )
+                if rec:
+                    raw.append(rec)
 
     # --- Encode all unique mention surfaces with BGE ---
-    return _assemble_docs(raw, device, NOM_CACHE)
+    return _assemble_docs(raw, device, nom_cache)
 
 
 def gather_spans_np(ctx: np.ndarray, span_sub: np.ndarray) -> np.ndarray:
@@ -512,14 +572,72 @@ def _ctx_path(i: int, cache_dir: Path = SPAN_CTX_CACHE) -> Path:
     return cache_dir / f"{i:06d}.npy"
 
 
-def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path = SPAN_CTX_CACHE, window: int = CONTENT) -> None:
+def _single_ctx_paths(base: Path) -> tuple:
+    # one concatenated (sum_M, 2, CTX_DIM) float16 array + an (n_docs+1,) int64 offset index
+    return base.with_name(base.name + ".npy"), base.with_name(base.name + "_off.npy")
+
+
+def _pop_built(d: dict) -> None:
+    for k in ("content_ids", "span_sub", "sent_sub_offsets", "sent_sub_lengths"):
+        d.pop(k, None)
+
+
+def _precompute_span_ctx_single(encoder, docs, cls_id, sep_id, device, base: Path, window: int) -> None:
+    # Single-file variant: all docs' span ctx packed into one .npy (+ offset index), held fully in RAM.
+    big_p, off_p = _single_ctx_paths(base)
+    if big_p.exists() and off_p.exists():
+        big = np.load(big_p)  # fully resident in RAM; per-doc slices are views into it
+        off = np.load(off_p)
+        for i, d in enumerate(docs):
+            d["ctx_vecs"] = big[off[i] : off[i + 1]]
+            _pop_built(d)
+        print(f"Loaded cached span ctx (single file): {len(docs)} docs, {big.shape[0]} mentions")
+        return
+    base.parent.mkdir(parents=True, exist_ok=True)
+    total = sum(len(d["span_sub"]) for d in docs)
+    big = np.zeros((total, 2, CTX_DIM), dtype=np.float16)
+    off = np.zeros(len(docs) + 1, dtype=np.int64)
+    encoder.eval()
+    pos = 0
+    with torch.inference_mode():
+        for i, d in enumerate(tqdm(docs, desc="span ctx (single)")):
+            ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device, window).float().cpu().numpy()
+            cv = gather_spans_np(ctx, d["span_sub"])
+            big[pos : pos + cv.shape[0]] = cv
+            off[i] = pos
+            pos += cv.shape[0]
+            d["ctx_vecs"] = cv
+            _pop_built(d)
+    off[len(docs)] = pos
+    np.save(big_p, big)
+    np.save(off_p, off)
+    print(f"Cached span ctx (single file) → {big_p.name}: {pos} mentions, {big.nbytes / 1e9:.2f} GB")
+
+
+def load_span_ctx_single(docs: list, base: Path) -> None:
+    # populate d["ctx_vecs"] from the single-file cache (used by Stage B, which re-loads from disk)
+    big_p, off_p = _single_ctx_paths(base)
+    big = np.load(big_p)  # fully resident in RAM; per-doc slices are views into it
+    off = np.load(off_p)
+    for i, d in enumerate(docs):
+        if "ctx_vecs" not in d:
+            d["ctx_vecs"] = big[off[i] : off[i + 1]]
+
+
+def precompute_span_ctx(
+    encoder, docs, cls_id, sep_id, device, cache_dir: Path = SPAN_CTX_CACHE, window: int = CONTENT, single: bool = False
+) -> None:
     # Writes each doc's (M, 2, CTX_DIM) float16 ctx_vecs (start, end) to an individual .npy file immediately.
     # Never accumulates more than one doc in RAM. Resumable: skips already-written files.
+    # single=True packs everything into one .npy instead (see _precompute_span_ctx_single).
+    if single:
+        _precompute_span_ctx_single(encoder, docs, cls_id, sep_id, device, cache_dir, window)
+        return
     cache_dir.mkdir(parents=True, exist_ok=True)
     n_existing = sum(1 for i in range(len(docs)) if _ctx_path(i, cache_dir).exists())
     if n_existing == len(docs):
         for i, d in enumerate(docs):
-            d["ctx_vecs"] = np.load(_ctx_path(i, cache_dir)).astype(np.float32)
+            d["ctx_vecs"] = np.load(_ctx_path(i, cache_dir)).astype(np.float16)
             d.pop("content_ids", None)
             d.pop("span_sub", None)
             d.pop("sent_sub_offsets", None)
@@ -533,7 +651,7 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path =
         for i, d in enumerate(tqdm(docs, desc="span ctx precompute")):
             p = _ctx_path(i, cache_dir)
             if p.exists():
-                d["ctx_vecs"] = np.load(p).astype(np.float32)
+                d["ctx_vecs"] = np.load(p).astype(np.float16)
                 d.pop("content_ids", None)
                 d.pop("span_sub", None)
                 d.pop("sent_sub_offsets", None)
@@ -542,7 +660,7 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path =
             ctx = encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device, window).float().cpu().numpy()
             ctx_vecs = gather_spans_np(ctx, d["span_sub"])
             np.save(p, ctx_vecs)
-            d["ctx_vecs"] = ctx_vecs.astype(np.float32)
+            d["ctx_vecs"] = ctx_vecs.astype(np.float16)
             d.pop("content_ids", None)
             d.pop("span_sub", None)
             d.pop("sent_sub_offsets", None)
@@ -551,7 +669,14 @@ def precompute_span_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path =
 
 
 def doc_scores(
-    d: dict, encoder, scorer, cls_id, sep_id, device, all_pairs: bool = False, max_mentions: int | None = None,
+    d: dict,
+    encoder,
+    scorer,
+    cls_id,
+    sep_id,
+    device,
+    all_pairs: bool = False,
+    max_mentions: int | None = None,
     window: int = CONTENT,
 ) -> list[tuple[torch.Tensor, torch.Tensor, np.ndarray]]:
     if encoder is None:
@@ -579,6 +704,78 @@ def doc_scores(
     return results
 
 
+def stage_a_batched_loss(scorer, windows: list, device: str) -> torch.Tensor:
+    # windows: list of (ctx (M,2,CTX), bge (M,BGE), cid (M,) long, weight float), all M>=2.
+    # One mention_rep + one chunked FFNN over the global within-window pair list, then a
+    # vectorized MLL over a padded (B, maxM, maxM) score tensor. Equivalent to looping
+    # mll_loss per window (window-level mean), but batched so the GPU isn't fed one window
+    # at a time. Window losses are combined as a dataset-weighted mean.
+    sizes = [w[0].shape[0] for w in windows]
+    b, max_m = len(windows), max(sizes)
+    g = scorer.mention_rep(torch.cat([w[0] for w in windows], 0), torch.cat([w[1] for w in windows], 0))
+    gi, gj, li, lj, wid, dist = [], [], [], [], [], []
+    off = 0
+    for w, m in enumerate(sizes):
+        idx = torch.arange(m, device=device)
+        ii, jj = (idx.unsqueeze(0) < idx.unsqueeze(1)).nonzero(as_tuple=True)  # ii>jj (antecedent jj)
+        gi.append(ii + off)
+        gj.append(jj + off)
+        li.append(ii)
+        lj.append(jj)
+        wid.append(torch.full_like(ii, w))
+        dist.append(ii - jj)
+        off += m
+    gi, gj, li, lj, wid, dist = (torch.cat(t) for t in (gi, gj, li, lj, wid, dist))
+    pair = torch.empty(gi.shape[0], device=device, dtype=g.dtype)
+    for s0 in range(0, gi.shape[0], scorer.chunk):
+        sl = slice(s0, s0 + scorer.chunk)
+        bucket = torch.bucketize(dist[sl].clamp(min=0), scorer.dist_bounds, right=True)
+        feat = torch.cat([g[gi[sl]], g[gj[sl]], scorer.dist_emb(bucket)], dim=-1)
+        pair[sl] = scorer.ffnn(feat).squeeze(-1).to(g.dtype)
+
+    neg = torch.finfo(g.dtype).min
+    scores = torch.zeros(b, max_m, max_m, device=device, dtype=g.dtype)
+    scores[wid, li, lj] = pair
+    ar = torch.arange(max_m, device=device)
+    size_t = torch.tensor(sizes, device=device)
+    valid = ar.unsqueeze(0) < size_t.unsqueeze(1)  # (B, maxM)
+    ante = (ar.unsqueeze(1) > ar.unsqueeze(0)).unsqueeze(0) & valid.unsqueeze(1) & valid.unsqueeze(2)  # [b,i,j]: j<i
+    cid = torch.full((b, max_m), -1, device=device, dtype=torch.long)
+    for w, win in enumerate(windows):
+        cid[w, : sizes[w]] = win[2]
+    null = scorer.null_bias
+    null_col = null.view(1, 1, 1).expand(b, max_m, 1)
+    denom = torch.logsumexp(torch.cat([null_col, scores.masked_fill(~ante, neg)], dim=2), dim=2)  # (B, maxM)
+    gold = (cid.unsqueeze(2) == cid.unsqueeze(1)) & ante  # [b,i,j]: same cluster, j<i
+    has_gold = gold.any(dim=2)
+    num = torch.where(has_gold, torch.logsumexp(scores.masked_fill(~gold, neg), dim=2), null.squeeze().expand(b, max_m))
+    per_ment = denom - num  # (B, maxM)
+    loss_mask = valid & (ar.unsqueeze(0) >= 1)
+    w_loss = (per_ment * loss_mask).sum(1) / loss_mask.sum(1).clamp(min=1)  # (B,) per-window mean
+    wt = torch.tensor([w[3] for w in windows], device=device, dtype=w_loss.dtype)
+    return (w_loss * wt).sum() / wt.sum()
+
+
+def _collect_windows(batch: list, device: str, all_pairs: bool, max_mentions, window: int, loss_weights) -> list:
+    # frozen path: turn a batch of docs into a flat list of (ctx, bge, cid, weight) windows
+    windows = []
+    for d in batch:
+        ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()
+        bge = torch.from_numpy(d["mention_bge"]).to(device).float()
+        cid = torch.from_numpy(d["cluster_id"]).to(device)
+        n_ment = len(d["tok_pos"])
+        if all_pairs and (max_mentions is None or n_ment <= max_mentions):
+            win_ids = np.zeros(n_ment, dtype=np.int64)
+        else:
+            win_ids = d["tok_pos"] // window
+        wt = 1.0 if loss_weights is None else float(loss_weights.get(d["name"].split("/")[0], 1.0))
+        for w in np.unique(win_ids):
+            idx = np.where(win_ids == w)[0]
+            if len(idx) >= 2:
+                windows.append((ctx[idx], bge[idx], cid[idx], wt))
+    return windows
+
+
 def run_epoch(
     encoder,
     scorer,
@@ -591,6 +788,7 @@ def run_epoch(
     all_pairs: bool = False,
     max_mentions: int | None = None,
     window: int = CONTENT,
+    loss_weights: dict | None = None,
 ) -> float:
     train = optimizer is not None
     total, ndoc = 0.0, 0
@@ -599,16 +797,22 @@ def run_epoch(
         if train:
             optimizer.zero_grad()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-            losses = []
-            for d in batch:
-                cluster_id = torch.from_numpy(d["cluster_id"]).to(device)
-                for w_scores, w_mask, idx in doc_scores(
-                    d, encoder, scorer, cls_id, sep_id, device, all_pairs, max_mentions, window
-                ):
-                    losses.append(mll_loss(w_scores, w_mask, cluster_id[idx], scorer.null_bias))
-            if not losses:
-                continue
-            loss = torch.stack(losses).mean()
+            if encoder is None:
+                windows = _collect_windows(batch, device, all_pairs, max_mentions, window, loss_weights)
+                if not windows:
+                    continue
+                loss = stage_a_batched_loss(scorer, windows, device)
+            else:
+                losses = []
+                for d in batch:
+                    cluster_id = torch.from_numpy(d["cluster_id"]).to(device)
+                    for w_scores, w_mask, idx in doc_scores(
+                        d, encoder, scorer, cls_id, sep_id, device, all_pairs, max_mentions, window
+                    ):
+                        losses.append(mll_loss(w_scores, w_mask, cluster_id[idx], scorer.null_bias))
+                if not losses:
+                    continue
+                loss = torch.stack(losses).mean()
         if train:
             loss.backward()
             params = list(scorer.parameters())
@@ -621,7 +825,9 @@ def run_epoch(
     return total / max(ndoc, 1)
 
 
-def predict_clusters(d: dict, encoder, scorer, cls_id, sep_id, device, all_pairs: bool = False, window: int = CONTENT) -> list:
+def predict_clusters(
+    d: dict, encoder, scorer, cls_id, sep_id, device, all_pairs: bool = False, window: int = CONTENT
+) -> list:
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
         windows = doc_scores(d, encoder, scorer, cls_id, sep_id, device, all_pairs, window=window)
     clusters = []
@@ -693,9 +899,15 @@ def train_stage2(
     predicted: bool = False,
     all_pairs: bool = False,
     window: int = CONTENT,
+    subset: str = "all",
+    dropout: float = 0.3,
+    weight_decay: float = 0.1,
+    loss_weights: dict | None = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
-    print(f"\nBuilding Stage 2 nominal data... (finetune={finetune}, predicted={predicted}, window={window})")
+    print(
+        f"\nBuilding Stage 2 nominal data... (finetune={finetune}, predicted={predicted}, window={window}, subset={subset})"
+    )
     if predicted:
         print("Evaluation setting: PREDICTED mentions (end-to-end), CoNLL only; KEY = true gold clusters")
     else:
@@ -705,7 +917,13 @@ def train_stage2(
     torch.manual_seed(RANDOM_SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
-    docs = build_conll_predicted_docs(device=device) if predicted else build_docs(device=device)
+    nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
+    docs = (
+        build_conll_predicted_docs(device=device)
+        if predicted
+        else build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n)
+    )
+    docs = _filter_docs(docs, subset)
     for d in docs:  # retain mention subtoken start positions before precompute drops span_sub
         d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
     tokenizer = load_tokenizer()
@@ -713,7 +931,7 @@ def train_stage2(
 
     conll_val_docs = [d for d in docs if d["split"] == "validation" and d["name"].startswith("conll2012/")]
     conll_test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
-    train_docs = [d for d in docs if d["split"] == "train"]
+    train_docs = [docs[i] for i in _train_idx(docs, subset)]
     if predicted:
         val_sets = {"conll2012": conll_val_docs}
     else:
@@ -724,13 +942,13 @@ def train_stage2(
             "corefud": [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
         }
 
-    ctx_dir, frozen_base, _, _ = _win_names(window)
+    ctx_dir, frozen_base, _, _ = _win_names(window, subset)
     frozen_name = frozen_base
     if predicted:
         frozen_name += "_pred"
     if all_pairs:
         frozen_name += "_ap"
-    scorer = AntecedentScorer().to(device)
+    scorer = AntecedentScorer(dropout=dropout).to(device)
     encoder = ContextEncoder().to(device)
     if finetune:
         # Head warmup: start fine-tuning from the trained frozen head, not a random one — joint
@@ -748,21 +966,27 @@ def train_stage2(
                 {"params": encoder.parameters(), "lr": roberta_lr},
                 {"params": list(scorer.parameters()), "lr": head_lr},
             ],
-            weight_decay=0.1,
+            weight_decay=weight_decay,
         )
         enc_loop, ckpt_path, tag = encoder, MODELS_DIR / f"{frozen_name}_ft.pt", "finetune"
     else:
         for p in encoder.parameters():
             p.requires_grad_(False)
         precompute_span_ctx(
-            encoder, docs, cls_id, sep_id, device,
-            cache_dir=SPAN_CTX_CACHE_PRED if predicted else ctx_dir, window=window,
+            encoder,
+            docs,
+            cls_id,
+            sep_id,
+            device,
+            cache_dir=SPAN_CTX_CACHE_PRED if predicted else ctx_dir,
+            window=window,
+            single=single_ctx,
         )
         del encoder
         if device != "cpu":
             torch.cuda.empty_cache()
         max_epochs, patience, doc_bs = max_epochs or 60, patience or 8, doc_bs or 8
-        optimizer = optim.AdamW(list(scorer.parameters()), lr=head_lr, weight_decay=0.1)
+        optimizer = optim.AdamW(list(scorer.parameters()), lr=head_lr, weight_decay=weight_decay)
         enc_loop, ckpt_path, tag = None, MODELS_DIR / f"{frozen_name}.pt", "frozen"
     head_params = sum(p.numel() for p in scorer.parameters())
     print(f"head params: {head_params:,} | doc_bs={doc_bs} epochs={max_epochs}")
@@ -778,18 +1002,31 @@ def train_stage2(
         if enc_loop is not None and "encoder" in ckpt:
             enc_loop.load_state_dict(ckpt["encoder"])
         disk_best_f1 = ckpt.get("best_val_f1", -1.0)
-        print(f"Warm-started from {ckpt_path.name} (best_val_f1 {disk_best_f1:.4f}); training fresh from epoch 0")
+        print(f"Warm-started from {ckpt_path.name} (best_val_f1 {disk_best_f1 * 100:.2f}); training fresh from epoch 0")
 
     # During fine-tune training the live encoder's activations co-reside with all-pairs scoring;
     # cap the all-pairs group so the rare long docs (M up to ~660) window instead of OOM. Eval is uncapped.
     ft_cap = 160 if finetune else None
     for epoch in range(max_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{max_epochs} ===")
+        print(f"\n=== Stage A (K={window}) Epoch {epoch + 1}/{max_epochs} ===")
         random.shuffle(train_docs)
         if enc_loop is not None:
             enc_loop.train()
         scorer.train()
-        tr_loss = run_epoch(enc_loop, scorer, train_docs, optimizer, cls_id, sep_id, device, doc_bs, all_pairs, ft_cap, window)
+        tr_loss = run_epoch(
+            enc_loop,
+            scorer,
+            train_docs,
+            optimizer,
+            cls_id,
+            sep_id,
+            device,
+            doc_bs,
+            all_pairs,
+            ft_cap,
+            window,
+            loss_weights,
+        )
         scheduler.step()
         if enc_loop is not None:
             enc_loop.eval()
@@ -820,7 +1057,8 @@ def train_stage2(
         print(f"Loss: {tr_loss:.6f} | Val loss: {val_loss:.6f}")
         for ds, sc in val_scores.items():
             print(
-                f"  {ds:10s} loss {val_losses[ds]:.4f}  CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})"
+                f"  {ds:10s} loss {val_losses[ds]:.4f}  CoNLL {sc['CoNLL'] * 100:.2f} "
+                f"(MUC {sc['muc'] * 100:.2f} B3 {sc['bcub'] * 100:.2f} CEAFe {sc['ceafe'] * 100:.2f})"
             )
         tb.add_scalar("loss/train", tr_loss, epoch + 1)
         tb.add_scalar("loss/val", val_loss, epoch + 1)
@@ -841,14 +1079,16 @@ def train_stage2(
                 if enc_loop is not None:
                     state["encoder"] = enc_loop.state_dict()
                 torch.save(state, ckpt_path)
-                print(f"✓ Best model saved (val CoNLL F1 {disk_best_f1:.4f})")
+                print(f"✓ Best model saved (val CoNLL F1 {disk_best_f1 * 100:.2f})")
             else:
-                print(f"Improved this run to {best_f1:.4f} (all-time best {disk_best_f1:.4f}; not overwriting)")
+                print(
+                    f"Improved this run to {best_f1 * 100:.2f} (all-time best {disk_best_f1 * 100:.2f}; not overwriting)"
+                )
         else:
             patience_ctr += 1
             print(f"No improvement. Patience: {patience_ctr}/{patience}")
             if patience_ctr >= patience:
-                print(f"\n⊘ Early stopping. Best val CoNLL F1 {best_f1:.4f}")
+                print(f"\n⊘ Early stopping. Best val CoNLL F1 {best_f1 * 100:.2f}")
                 break
 
     print("\n✓ Training complete")
@@ -873,13 +1113,15 @@ def train_stage2(
         all_pairs=all_pairs,
     )
     print(
-        f"CoNLL {metrics['CoNLL']:.4f} | MUC {metrics['muc']:.4f} | B3 {metrics['bcub']:.4f} | CEAFe {metrics['ceafe']:.4f}"
+        f"CoNLL {metrics['CoNLL'] * 100:.2f} | MUC {metrics['muc'] * 100:.2f} | "
+        f"B3 {metrics['bcub'] * 100:.2f} | CEAFe {metrics['ceafe'] * 100:.2f}"
     )
     if "by_type" in metrics:
         print("\nType breakdown (official CoNLL F1 on cluster subsets):")
         for bucket, sc in sorted(metrics["by_type"].items()):
             print(
-                f"  {bucket:12s}  CoNLL {sc['CoNLL']:.4f}  MUC {sc['muc']:.4f}  B3 {sc['bcub']:.4f}  CEAFe {sc['ceafe']:.4f}"
+                f"  {bucket:12s}  CoNLL {sc['CoNLL'] * 100:.2f}  MUC {sc['muc'] * 100:.2f}  "
+                f"B3 {sc['bcub'] * 100:.2f}  CEAFe {sc['ceafe'] * 100:.2f}"
             )
     metrics["best_val_f1"] = best_f1
     metrics["setting"] = "gold_mentions"
@@ -903,7 +1145,8 @@ def train_stage2(
     }
     for ds, sc in final_val_scores.items():
         print(
-            f"  val/{ds:10s} CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})"
+            f"  val/{ds:10s} CoNLL {sc['CoNLL'] * 100:.2f} "
+            f"(MUC {sc['muc'] * 100:.2f} B3 {sc['bcub'] * 100:.2f} CEAFe {sc['ceafe'] * 100:.2f})"
         )
         metrics[f"val_{ds}"] = sc
     with (MODELS_DIR / f"stage2_eval_metrics_{tag}.json").open("w", encoding="utf-8") as f:
@@ -957,8 +1200,10 @@ def _cluster_gold_cids(cluster: list[int], cluster_id: np.ndarray) -> int:
     return int(np.bincount(cids).argmax())
 
 
-def _precompute_stage_a_clusters(docs: list, scorer: AntecedentScorer, device: str, window: int = CONTENT) -> list[dict[int, dict]]:
-    cache_path = MODELS_DIR / _win_names(window)[3]
+def _precompute_stage_a_clusters(
+    docs: list, scorer: AntecedentScorer, device: str, window: int = CONTENT, subset: str = "all"
+) -> list[dict[int, dict]]:
+    cache_path = MODELS_DIR / _win_names(window, subset)[3]
     if cache_path.exists():
         print("Loading cached Stage A clusters...")
         with cache_path.open("rb") as f:
@@ -1100,6 +1345,37 @@ def _stage_a_purity(per_window: dict, cid: np.ndarray) -> tuple[int, int]:
             if len({int(cid[gi[x]]) for x in cl}) == 1:
                 pure += 1
     return pure, total
+
+
+def decode_threshold_sweep(
+    docs: list,
+    clusters: list,
+    cluster_matcher: ClusterMatcher,
+    device: str,
+    offsets=(-0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4),
+) -> tuple[float, float, dict]:
+    # Post-hoc (no retraining): sweep the Stage B decode threshold (null_bias + offset)
+    # and score corpus CoNLL F1 each. Lowering the threshold merges more (recovers recall).
+    base = float(cluster_matcher.null_bias.item())
+    orig = cluster_matcher.null_bias.data.clone()
+    results: dict[float, float] = {}
+    for off in offsets:
+        cluster_matcher.null_bias.data.fill_(base + off)
+        key_docs, resp_docs = [], []
+        for d, per_window in zip(docs, clusters):
+            if not per_window:
+                continue
+            key_docs.append((d["name"], d["sentences"], _key_clusters(d)))
+            resp_docs.append(
+                (d["name"], d["sentences"], _predict_full_doc_clusters(d, per_window, cluster_matcher, device))
+            )
+        kp, rp = MODELS_DIR / "_thr_key.conll", MODELS_DIR / "_thr_resp.conll"
+        write_conll(kp, key_docs)
+        write_conll(rp, resp_docs)
+        results[round(base + off, 3)] = conll_f1(kp, rp)["CoNLL"]
+    cluster_matcher.null_bias.data.copy_(orig)
+    best_thr = max(results, key=results.get)
+    return best_thr, results[best_thr], results
 
 
 def write_diagnostics(
@@ -1280,9 +1556,11 @@ def write_diagnostics(
             writer.writerow(r)
         writer.writerow(summary)
     print(f"\n✓ Diagnostics K={window} {dataset}/{split} ({n} docs) → {pd_path.name}")
-    print(f"  conll_AB {summary['conll_AB']} A-alone {summary['conll_Aalone']} | "
-          f"edgeP {summary['edge_precision']} edgeR {summary['edge_recall']} | "
-          f"within-K {summary['frac_ante_within_K']} purity {summary['stageA_purity']}")
+    print(
+        f"  conll_AB {summary['conll_AB'] * 100:.2f} A-alone {summary['conll_Aalone'] * 100:.2f} | "
+        f"edgeP {summary['edge_precision'] * 100:.2f} edgeR {summary['edge_recall'] * 100:.2f} | "
+        f"within-K {summary['frac_ante_within_K'] * 100:.2f} purity {summary['stageA_purity'] * 100:.2f}"
+    )
 
 
 def _diagnostic_eval_sets(docs: list, all_stage_a: list) -> list[tuple[str, str, list, list]]:
@@ -1296,18 +1574,59 @@ def _diagnostic_eval_sets(docs: list, all_stage_a: list) -> list[tuple[str, str,
     return sets
 
 
+def _stage_b_losses(cluster_matcher, pending: list) -> list:
+    # batch all window-pairs in one forward when the head supports it (mention head), else per-pair
+    if hasattr(cluster_matcher, "forward_many"):
+        mats = cluster_matcher.forward_many([(l, r) for l, r, _, _ in pending])
+        return [
+            cluster_match_loss(m, lc, rc, cluster_matcher.null_bias)
+            for m, (_, _, lc, rc) in zip(mats, pending, strict=True)
+        ]
+    return [cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending]
+
+
+def _meta_hardness(meta: tuple, bge_all: np.ndarray) -> float:
+    # confusability of a null window-pair: max cosine between any left/right cluster's
+    # mean BGE. High = semantically similar but non-coreferent = a hard negative worth keeping.
+    wi, wj, lc, rc = meta[0], meta[1], meta[2], meta[3]
+
+    def norm_means(w: dict, clusters: list) -> np.ndarray | None:
+        out = []
+        for cl in clusters:
+            v = bge_all[[w["global_idx"][li] for li in cl]].mean(0)
+            out.append(v / (np.linalg.norm(v) + 1e-8))
+        return np.stack(out) if out else None
+
+    left, right = norm_means(wi, lc), norm_means(wj, rc)
+    if left is None or right is None:
+        return 0.0
+    return float((left @ right.T).max())
+
+
 def train_stage_b(
     head_lr: float = 1e-3,
     max_epochs: int = 30,
     patience: int = 5,
     doc_bs: int = 8,
     window: int = CONTENT,
+    neg_ratio: float | None = None,
+    subset: str = "all",
+    dropout: float = 0.3,
+    weight_decay: float = 0.1,
+    head: str = "cluster",
+    hard_neg: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
 ) -> None:
-    print(f"\nTraining Stage B cluster matcher... (window={window})")
-    ctx_dir, frozen_base, ckpt_b, _ = _win_names(window)
-    docs = build_docs(device=device)
+    print(f"\nTraining Stage B matcher... (window={window}, subset={subset}, head={head}, hard_neg={hard_neg})")
+    ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset)
+    if head == "mention":
+        ckpt_b = ckpt_b.replace(".pt", "_ment.pt")
+    if hard_neg:
+        ckpt_b = ckpt_b.replace(".pt", "_hn.pt")
+    nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
+    docs = build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n)
+    docs = _filter_docs(docs, subset)
     for d in docs:
         if "tok_pos" not in d:
             d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
@@ -1318,18 +1637,22 @@ def train_stage_b(
         p.requires_grad_(False)
     stage_a.eval()
 
-    for i, d in enumerate(docs):
-        p = ctx_dir / f"{i:06d}.npy"
-        if p.exists() and "ctx_vecs" not in d:
-            d["ctx_vecs"] = np.load(p).astype(np.float32)
+    if single_ctx:
+        load_span_ctx_single(docs, ctx_dir)
+    else:
+        for i, d in enumerate(docs):
+            p = ctx_dir / f"{i:06d}.npy"
+            if p.exists() and "ctx_vecs" not in d:
+                d["ctx_vecs"] = np.load(p).astype(np.float16)
 
-    train_docs = [d for d in docs if d["split"] == "train"]
+    train_idx = _train_idx(docs, subset)
+    train_docs = [docs[i] for i in train_idx]
     val_docs = [d for d in docs if d["split"] == "validation" and d["name"].startswith("conll2012/")]
     test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
 
     # precompute Stage A clusters once — avoids re-running Stage A every epoch
-    all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device, window)
-    train_clusters = [all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "train"]
+    all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device, window, subset)
+    train_clusters = [all_stage_a[i] for i in train_idx]
     val_clusters = [
         all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")
     ]
@@ -1341,31 +1664,38 @@ def train_stage_b(
         len(per_window) * (len(per_window) - 1) // 2 for per_window in train_clusters if per_window
     )
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
-    cluster_matcher = ClusterMatcher().to(device)
+    cluster_matcher = (MentionMatcher(dropout=dropout) if head == "mention" else ClusterMatcher(dropout=dropout)).to(
+        device
+    )
     if eval_only:
         cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
         cluster_matcher.eval()
         print("\n=== Stage B Test (eval only) ===")
         test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
         print(
-            f"Test CoNLL {test_scores['CoNLL']:.4f} MUC {test_scores['muc']:.4f} B3 {test_scores['bcub']:.4f} CEAFe {test_scores['ceafe']:.4f}"
+            f"Test CoNLL {test_scores['CoNLL'] * 100:.2f} MUC {test_scores['muc'] * 100:.2f} "
+            f"B3 {test_scores['bcub'] * 100:.2f} CEAFe {test_scores['ceafe'] * 100:.2f}"
         )
         for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
             write_diagnostics(dd, dc, stage_a, cluster_matcher, device, window, ds, split)
         return
-    optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=0.1)
+    optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
     ckpt_path = MODELS_DIR / ckpt_b
     best_val_f1, patience_ctr = -1.0, 0
 
     for epoch in range(max_epochs):
-        print(f"\n=== Stage B Epoch {epoch + 1}/{max_epochs} ===")
+        print(f"\n=== Stage B (K={window}) Epoch {epoch + 1}/{max_epochs} ===")
         order = list(range(len(train_docs)))
         random.shuffle(order)
         cluster_matcher.train()
         total, n_pairs = 0.0, 0
-        # accumulate (left_clusters, right_clusters, left_cids, right_cids) across docs
+        # accumulate (left_clusters, right_clusters, left_cids, right_cids) across docs;
+        # the mention head materializes an Lm*Rm grid per pair, so cap a batch by accumulated
+        # mention-pair count (not just window-pair count) to bound peak VRAM on dense windows.
         pending: list[tuple] = []
+        pending_pairs = 0
+        pair_budget = 40000 if head == "mention" else 10**12
         for bi in tqdm(order, desc="train_b"):
             d = train_docs[bi]
             per_window = train_clusters[bi]
@@ -1373,38 +1703,49 @@ def train_stage_b(
                 continue
             ctx_all, bge_all, cid = d["ctx_vecs"], d["mention_bge"], d["cluster_id"]
             windows = sorted(per_window.keys())
+            # cheap pass: classify each window pair as positive (some left cluster has a
+            # gold match in the right window) or null, so nulls can be subsampled
+            metas = []
             for i in range(len(windows)):
                 for j in range(i + 1, len(windows)):
                     wi, wj = per_window[windows[i]], per_window[windows[j]]
                     lc, rc = wi["clusters"], wj["clusters"]
                     if not lc or not rc:
                         continue
-                    ctx_i = ctx_all[wi["global_idx"]]
-                    bge_i = bge_all[wi["global_idx"]]
-                    ctx_j = ctx_all[wj["global_idx"]]
-                    bge_j = bge_all[wj["global_idx"]]
-                    left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
-                    right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
                     left_cids = [_cluster_gold_cids([wi["global_idx"][li] for li in cl], cid) for cl in lc]
                     right_cids = [_cluster_gold_cids([wj["global_idx"][li] for li in cl], cid) for cl in rc]
-                    pending.append((left, right, left_cids, right_cids))
-                    n_pairs += 1
-            if len(pending) >= doc_bs:
-                optimizer.zero_grad()
-                losses = [
-                    cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias)
-                    for l, r, lc, rc in pending
-                ]
-                torch.stack(losses).mean().backward()
-                torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
-                optimizer.step()
-                total += sum(lo.item() for lo in losses)
-                pending = []
+                    rset = set(right_cids)
+                    is_pos = any(lcid in rset for lcid in left_cids)
+                    metas.append((wi, wj, lc, rc, left_cids, right_cids, is_pos))
+            if neg_ratio is not None and metas:
+                pos = [m for m in metas if m[6]]
+                neg = [m for m in metas if not m[6]]
+                cap = int(neg_ratio * len(pos)) if pos else min(len(neg), 1)
+                if len(neg) > cap:
+                    if hard_neg:
+                        neg = sorted(neg, key=lambda m: _meta_hardness(m, bge_all), reverse=True)[:cap]
+                    else:
+                        neg = random.sample(neg, cap)
+                metas = pos + neg
+            for wi, wj, lc, rc, left_cids, right_cids, _ in metas:
+                ctx_i, bge_i = ctx_all[wi["global_idx"]], bge_all[wi["global_idx"]]
+                ctx_j, bge_j = ctx_all[wj["global_idx"]], bge_all[wj["global_idx"]]
+                left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
+                right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
+                pending.append((left, right, left_cids, right_cids))
+                pending_pairs += sum(c.shape[0] for c, _ in left) * sum(c.shape[0] for c, _ in right)
+                n_pairs += 1
+                if len(pending) >= doc_bs or pending_pairs >= pair_budget:
+                    optimizer.zero_grad()
+                    losses = _stage_b_losses(cluster_matcher, pending)
+                    torch.stack(losses).mean().backward()
+                    torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
+                    optimizer.step()
+                    total += sum(lo.item() for lo in losses)
+                    pending, pending_pairs = [], 0
         if pending:
             optimizer.zero_grad()
-            losses = [
-                cluster_match_loss(cluster_matcher(l, r), lc, rc, cluster_matcher.null_bias) for l, r, lc, rc in pending
-            ]
+            losses = _stage_b_losses(cluster_matcher, pending)
             torch.stack(losses).mean().backward()
             torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
             optimizer.step()
@@ -1448,18 +1789,19 @@ def train_stage_b(
         print(f"Loss: {tr_loss:.6f}")
         for ds, sc in val_scores_all.items():
             print(
-                f"  {ds:10s} CoNLL {sc['CoNLL']:.4f} (MUC {sc['muc']:.4f} B3 {sc['bcub']:.4f} CEAFe {sc['ceafe']:.4f})"
+                f"  {ds:10s} CoNLL {sc['CoNLL'] * 100:.2f} "
+                f"(MUC {sc['muc'] * 100:.2f} B3 {sc['bcub'] * 100:.2f} CEAFe {sc['ceafe'] * 100:.2f})"
             )
 
         if val_scores["CoNLL"] > best_val_f1 + 1e-4:
             best_val_f1, patience_ctr = val_scores["CoNLL"], 0
             torch.save({"cluster_matcher": cluster_matcher.state_dict(), "best_val_f1": best_val_f1}, ckpt_path)
-            print(f"✓ Best cluster matcher saved (val CoNLL F1 {best_val_f1:.4f})")
+            print(f"✓ Best cluster matcher saved (val CoNLL F1 {best_val_f1 * 100:.2f})")
         else:
             patience_ctr += 1
             print(f"No improvement. Patience: {patience_ctr}/{patience}")
             if patience_ctr >= patience:
-                print(f"\n⊘ Early stopping. Best val CoNLL F1 {best_val_f1:.4f}")
+                print(f"\n⊘ Early stopping. Best val CoNLL F1 {best_val_f1 * 100:.2f}")
                 break
 
     print("\n✓ Stage B training complete")
@@ -1468,23 +1810,19 @@ def train_stage_b(
     print("\n=== Stage B Test ===")
     test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
     print(
-        f"CoNLL {test_scores['CoNLL']:.4f} | MUC {test_scores['muc']:.4f} | B3 {test_scores['bcub']:.4f} | CEAFe {test_scores['ceafe']:.4f}"
+        f"CoNLL {test_scores['CoNLL'] * 100:.2f} | MUC {test_scores['muc'] * 100:.2f} | "
+        f"B3 {test_scores['bcub'] * 100:.2f} | CEAFe {test_scores['ceafe'] * 100:.2f}"
     )
     for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
         write_diagnostics(dd, dc, stage_a, cluster_matcher, device, window, ds, split)
     if "by_type" in test_scores:
         for bucket, sc in sorted(test_scores["by_type"].items()):
             print(
-                f"  {bucket:12s}  CoNLL {sc['CoNLL']:.4f}  MUC {sc['muc']:.4f}  B3 {sc['bcub']:.4f}  CEAFe {sc['ceafe']:.4f}"
+                f"  {bucket:12s}  CoNLL {sc['CoNLL'] * 100:.2f}  MUC {sc['muc'] * 100:.2f}  "
+                f"B3 {sc['bcub'] * 100:.2f}  CEAFe {sc['ceafe'] * 100:.2f}"
             )
 
 
 if __name__ == "__main__":
-    import gc
-
-    for k in (128, 256, 512):
-        train_stage2(window=k)
-        train_stage_b(window=k)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    # mention-level Stage B (no subsampling) on the all8k Stage A head
+    train_stage_b(window=256, subset="all8k", head="mention", dropout=0.2)

@@ -213,6 +213,80 @@ class ClusterMatcher(nn.Module):
         return self.ffnn(torch.cat([gi, gj], dim=-1)).squeeze(-1)  # (L, R)
 
 
+class MentionMatcher(nn.Module):
+    # Mention-level Stage B: instead of collapsing each cluster to one attention-pooled
+    # vector, score a cluster pair by aggregating over the full mention-pair interaction
+    # matrix (logsumexp ~ soft-max). Preserves per-mention evidence — the strongest single
+    # mention pair (e.g. a shared proper noun) can drive the merge, which the pooled head
+    # smears away. Drop-in for ClusterMatcher: same forward(left, right) -> (L, R) + null_bias.
+    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096):
+        super().__init__()
+        self.chunk = chunk
+        self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
+        self.P_bge = nn.Linear(BGE_DIM, proj_dim)
+        self.drop = nn.Dropout(dropout)
+        g = 2 * proj_dim
+        self.pair = nn.Sequential(
+            nn.Linear(4 * g, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self.null_bias = nn.Parameter(torch.zeros(1))
+
+    def _vecs(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
+        # (M, 2, CTX_DIM), (M, BGE_DIM) -> (M, 2*proj_dim)
+        return torch.cat([self.P_ctx(self.drop(ctx.flatten(1))), self.P_bge(self.drop(bge))], dim=-1)
+
+    def forward_many(self, pairs: list[tuple[list, list]]) -> list[torch.Tensor]:
+        # Batch every window-pair's mention-pair scoring into ONE chunked FFNN + ONE segmented
+        # reduction. For each window-pair p we enumerate its within-pair (Lm_p x Rm_p) mention
+        # pairs and tag each with a flat cluster-pair bucket id; all pairs' features are scored
+        # together, then reduced per bucket via LOG-MEAN-EXP (logsumexp - log N) and split back
+        # into per-pair (L_p, R_p) matrices. log-mean-exp keeps "strongest pair dominates" but
+        # removes the cluster-size bias of plain logsumexp (which over-merges large clusters).
+        feats, buckets, shapes = [], [], []
+        off = 0
+        for left, right in pairs:
+            lv = torch.cat([self._vecs(c, b) for c, b in left], 0)  # (Lm_p, g)
+            rv = torch.cat([self._vecs(c, b) for c, b in right], 0)  # (Rm_p, g)
+            dev = lv.device
+            li = torch.cat([torch.full((c.shape[0],), i, device=dev, dtype=torch.long) for i, (c, _) in enumerate(left)])
+            rj = torch.cat([torch.full((c.shape[0],), j, device=dev, dtype=torch.long) for j, (c, _) in enumerate(right)])
+            lp, rp, lm, rm = len(left), len(right), lv.shape[0], rv.shape[0]
+            ai = lv.unsqueeze(1).expand(lm, rm, -1)
+            bj = rv.unsqueeze(0).expand(lm, rm, -1)
+            feats.append(torch.cat([ai, bj, ai * bj, (ai - bj).abs()], dim=-1).reshape(lm * rm, -1))
+            buckets.append((li.unsqueeze(1) * rp + rj.unsqueeze(0)).reshape(-1) + off)
+            shapes.append((lp, rp))
+            off += lp * rp
+        feat = torch.cat(feats, 0)  # (total_mention_pairs, 4g)
+        bucket = torch.cat(buckets, 0)
+        score = torch.empty(feat.shape[0], device=feat.device, dtype=feat.dtype)
+        for s0 in range(0, feat.shape[0], self.chunk):
+            score[s0 : s0 + self.chunk] = self.pair(feat[s0 : s0 + self.chunk]).squeeze(-1)
+        gmax = score.max()
+        e = torch.exp((score - gmax).float())
+        sums = torch.zeros(off, device=feat.device, dtype=torch.float32).index_add(0, bucket, e)
+        counts = torch.zeros(off, device=feat.device, dtype=torch.float32).index_add(0, bucket, torch.ones_like(e))
+        flat = gmax.float() + torch.log(sums) - torch.log(counts)  # log-mean-exp (size-bias removed)
+        out, o = [], 0
+        for lp, rp in shapes:
+            out.append(flat[o : o + lp * rp].reshape(lp, rp))
+            o += lp * rp
+        return out
+
+    def forward(
+        self,
+        left: list[tuple[torch.Tensor, torch.Tensor]],
+        right: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        return self.forward_many([(left, right)])[0]  # (L, R)
+
+
 def cluster_match_loss(
     scores: torch.Tensor,
     left_cids: list[int],
