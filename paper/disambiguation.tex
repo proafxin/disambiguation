@@ -21,17 +21,16 @@
 	\maketitle
 	
 	\begin{abstract}
-		This paper demonstrates that global entity resolution does not require full-document quadratic self-attention mechanisms. Instead, we show that the coreference relation can be factorized into local window-based clustering and transitivity-driven inference over an induced quotient graph. Furthermore, we challenge the paradigm of monolithic universal language models for coreference by decomposing the required signal space into independent, frozen specialist encoders whose vector outputs act as a basis for a learned composition head. Our two-stage pipeline performs quadratic attention strictly within small, localized windows (Stage A) and projects the resulting local clusters into a quotient space for cross-window matching (Stage B). With all underlying encoders completely frozen, this architecture achieves a definitive CoNLL F$_1$ score of 0.8556 on the CoNLL-2012 benchmark using gold mentions, while providing substantial computational and memory improvements over traditional full-document architectures.
+		Modern coreference systems typically assume that document-level entity resolution requires global quadratic attention over the entire text. We challenge this assumption by showing that most coreference decisions can be resolved locally and that long-range entity structure can be recovered through structured inference over compressed cluster representations. We introduce a two-stage architecture that first performs mention linking within fixed-size local windows and then merges partial entity clusters across windows using lightweight matching modules. The model employs frozen semantic and contextual encoders throughout, training only small task-specific components. Evaluated on the CoNLL-2012 benchmark with gold mentions, the proposed approach achieves a CoNLL F$_1$ score of 0.8556 while substantially reducing memory usage and computational requirements relative to full-document architectures. These results suggest that entities can be resolved globally from localized reasoning and structured aggregation, without requiring full document-scale attention.
 	\end{abstract}
+	
 	
 	\begin{keywords}
 		coreference resolution, representation factorization, quotient graph, frozen language models, window-based inference, transitive closure, efficient inference
 	\end{keywords}
 	
 	\section{Introduction}\label{sec:intro}
-	Coreference resolution aims to recover an equivalence relation over a set of nominal mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ in a document, where $m_i \sim m_j$ indicates that two mentions refer to the same underlying entity. The induced partition $\mathcal{E} = \{E_1, \ldots, E_k\}$ defines the entity structure of the document.
-	
-	Modern state-of-the-art systems execute coreference resolution by running full-document self-attention over thousands of subtokens jointly. This incurs an $O(N^2)$ computational cost, driven by the assumption that a monolithic universal model must process the entire context to disentangle overlapping semantic and contextual signals. 
+	Coreference resolution aims to recover an equivalence relation over a set of nominal mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ in a document, where $m_i \sim m_j$ indicates that two mentions refer to the same underlying entity. The induced partition $\mathcal{E} = \{E_1, \ldots, E_k\}$ defines the entity structure of the document. Modern state-of-the-art systems execute coreference resolution by running full-document self-attention over thousands of subtokens jointly. This incurs an $O(N^2)$ computational cost, driven by the assumption that a monolithic universal model must process the entire context to disentangle overlapping semantic and contextual signals. 
 	
 	This paper demonstrates that this quadratic overhead is unnecessary, guiding the design via two core hypotheses. First, Coreference exhibits local edge locality but global transitive structure. The overwhelming majority of informational dependencies are satisfied within short text spans, and long-range connections can be mathematically reconstructed via transitive closure. Consequently, quadratic attention is only required within small, localized windows. Second, a monolithic model is not required to observe the entire document if the necessary signal dimensions are pre-separated into independent channels. By utilizing frozen, specialized models whose representations function like an informational basis across a vector space, a lightweight linear head can resolve entities without global cross-attention.
 	
@@ -43,38 +42,25 @@
 	\begin{enumerate}
 		\item \textbf{Decoupled Encoding Stream:} The document's nominal mentions are mapped once to raw semantic vectors (via a frozen text encoder) and localized context vectors (via a frozen language model). These representations are kept distinct and never fused inside a monolithic layer.
 		\item \textbf{Stage A (Intra-Window Clustering):} Suppose a document of length N is partitioned into $w$ windows of lengths $l_1,\ldots,l_w$ satisfying
-		\[
-		\sum_{i=1}^{w} l_i = N.
-		\]
-		
+		\[\sum_{i=1}^{w} l_i = N\]
 		The total self-attention cost is
-		
-		\[
-		\sum_{i=1}^{w} O(l_i^2).
-		\]
-		
+		\[\sum_{i=1}^{w} O(l_i^2)\]
 		By Cauchy-Schwarz,
-		
 		\[
 		\left(\sum_{i=1}^{w} l_i\right)^2
 		\le
-		w\sum_{i=1}^{w} l_i^2.
+		w\sum_{i=1}^{w} l_i^2
 		\]
-		
 		Therefore
-		
 		\[
 		\sum_{i=1}^{w} l_i^2
 		\ge
-		\frac{N^2}{w}.
+		\frac{N^2}{w}
 		\]
-		
 		Equality holds iff
-		
 		\[
-		l_1=l_2=\cdots=l_w=\frac{N}{w}.
+		l_1=l_2=\cdots=l_w=\frac{N}{w}
 		\]
-		
 		Thus equal-sized windows minimize the total quadratic attention cost among all partitions with w windows. Full quadratic self-attention and pairwise mention scoring run exclusively within these local boundaries. A local union-find execution connects matching mentions, collapsing each window's sub-chains into a set of discrete, local entity clusters. 
 		\item \textbf{Quotient Graph Transformation:} The system lifts the problem space from individual mentions to the cluster level. The newly resolved local clusters are treated as atomic nodes in a highly compressed quotient graph.
 		\item \textbf{Stage B (Cross-Window Quotient Matching):} Cross-window entity consistency is recovered by evaluating edges across the quotient nodes. Rather than re-comparing individual mentions across long distances, a size-invariant interaction head evaluates cluster-level compatibility augmented with an additive, independent lexical channel. Global transitive closure over these accepted cluster edges outputs the final document-level entity partition. The point here is that while quadratic reasoning is still there, it is transferred onto a compressed state space which requires a heavily reduced number of computation rendering the effective complexity feasible.
