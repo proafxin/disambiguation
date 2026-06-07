@@ -21,7 +21,7 @@
 	\maketitle
 	
 	\begin{abstract}
-		Modern coreference systems typically assume that document-level entity resolution requires global quadratic attention over the entire text. We challenge this assumption by showing that most coreference decisions can be resolved locally and that long-range entity structure can be recovered through structured inference over compressed cluster representations. We introduce a two-stage architecture that first performs mention linking within fixed-size local windows and then merges partial entity clusters across windows using lightweight matching modules. The model employs frozen semantic and contextual encoders throughout, training only small task-specific components. Evaluated on the CoNLL-2012 benchmark with gold mentions, the proposed approach achieves a CoNLL F$_1$ score of 0.8556 while substantially reducing memory usage and computational requirements relative to full-document architectures. These results suggest that entities can be resolved globally from localized reasoning and structured aggregation, without requiring full document-scale attention.
+		Modern coreference systems typically assume that document-level entity resolution requires global quadratic attention over the entire text. This paper challenges such assumptions by showing that most coreference decisions can be resolved locally and that long-range entity structure can be recovered through structured inference over compressed cluster representations. We introduce a two-stage inference framework that constructs a quotient space over local equivalence classes of mentions, followed by structured cross-window lifting of equivalence relations via cluster-level matching in a compressed graph representation. The model employs frozen semantic and contextual encoders throughout, training only small task-specific components. Evaluated on the CoNLL-2012 benchmark with gold mentions, the proposed approach achieves a CoNLL F$_1$ score of 0.8556 while substantially reducing memory usage and computational requirements relative to full-document architectures. These results suggest that entities can be resolved globally from localized reasoning and structured aggregation, without requiring global token-level interaction modeling over the full document, instead operating on a hierarchically constructed quotient graph of mention equivalence classes.
 	\end{abstract}
 	
 	
@@ -30,105 +30,152 @@
 	\end{keywords}
 	
 	\section{Introduction}\label{sec:intro}
-	Coreference resolution aims to recover an equivalence relation over a set of nominal mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ in a document, where $m_i \sim m_j$ indicates that two mentions refer to the same underlying entity. The induced partition $\mathcal{E} = \{E_1, \ldots, E_k\}$ defines the entity structure of the document. Modern state-of-the-art systems execute coreference resolution by running full-document self-attention over thousands of subtokens jointly. This incurs an $O(N^2)$ computational cost, driven by the assumption that a monolithic universal model must process the entire context to disentangle overlapping semantic and contextual signals. 
+	Coreference resolution is commonly defined as the task of clustering a set of entity mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ into groups that correspond to underlying real-world entities. Formally, this induces an unknown equivalence relation $\sim$ over mentions, where $m_i \sim m_j$ if and only if they refer to the same entity, and the output of the system is a partition $\mathcal{E} = \mathcal{M} / \sim$. From this perspective, coreference can be viewed as a structured prediction problem whose objective is to recover a latent quotient structure rather than to independently classify mention pairs or model token-level interactions.
 	
-	This paper demonstrates that this quadratic overhead is unnecessary, guiding the design via two core hypotheses. First, Coreference exhibits local edge locality but global transitive structure. The overwhelming majority of informational dependencies are satisfied within short text spans, and long-range connections can be mathematically reconstructed via transitive closure. Consequently, quadratic attention is only required within small, localized windows. Second, a monolithic model is not required to observe the entire document if the necessary signal dimensions are pre-separated into independent channels. By utilizing frozen, specialized models whose representations function like an informational basis across a vector space, a lightweight linear head can resolve entities without global cross-attention.
+	In this work, we explicitly adopt this equivalence-relation formulation as the primary object of inference and study how it can be recovered from localized computations over restricted subsets of $\mathcal{M}$. We propose viewing the problem as a two-level decomposition: (i) construction of partial equivalence relations under localized observation constraints, and (ii) recovery of the global partition via composition and closure over these local relations in a compressed representation space. This formulation separates local relational induction from global consistency enforcement, allowing long-range dependencies to be recovered through structured aggregation over induced equivalence classes rather than direct global interaction over the full mention set.
 	
-	The remainder of this paper is organized as follows. Section \ref{sec:overview} outlines the overall workflow of the two-stage pipeline. Section \ref{sec:hypothesis} develops the mathematical foundations of representation factorization and locality-transitivity equivalence. Sections \ref{sec:stagea} and \ref{sec:stageb} details the technical implementation of the Stage A local clusters and Stage B quotient-graph matching modules. Section \ref{sec:setup} describes our multi-corpus training environment, and Section \ref{sec:results} presents our empirical results alongside comprehensive diagnostic proofs of our core hypotheses.
+	The remainder of this paper is organized as follows. Section~\ref{sec:overview} outlines the overall workflow of the two-stage pipeline. Section~\ref{sec:hypothesis} develops the mathematical foundations of representation factorization and locality-transitivity equivalence. Sections~\ref{sec:stagea} and~\ref{sec:stageb} detail the technical implementation of the Stage A local inference procedure and Stage B quotient-space matching modules respectively. Section~\ref{sec:setup} describes experimental setup, and Section~\ref{sec:results} presents empirical results and analysis.
+	
+	To operationalize this formulation, we construct a structured inference procedure that separates local relational induction from global consistency resolution. The system does not rely on a single unified contextual model over the full document; instead, it defines a factorized representation space over which local equivalence relations are computed. Each mention $m_i \in \mathcal{M}$ is encoded using a fixed set of pretrained representation functions that provide complementary views of the same input (contextual and lexical), which are kept separate to preserve distinct informational signals. These representations are not updated during training and are treated as fixed feature mappings into a shared inference space.
+	
+	Importantly, we assume no access to global interaction over the full mention set. Instead, computation is restricted to bounded observation domains over which partial evidence of $\sim$ is induced. We introduce a set of bounded observation domains $\mathcal{W} = \{W_1, \ldots, W_K\}$ over $\mathcal{M}$. These domains do not define the equivalence structure itself; rather, they serve as local contexts in which restricted instantiations of the global relation are computed. Within each subset $W_k$, we estimate a local relation $\sim_k$ that approximates the restriction of $\sim$ to that region.
+	
+	Only after defining these local relations do we obtain structured intermediate objects that support global inference. Specifically, Stage A constructs local relational structure within each $W_k$, producing locally consistent equivalence classes that form a compressed intermediate representation of $\mathcal{M}$.
+	
+	After constructing local equivalence relations within each partition $W_k$, we obtain induced local classes that serve as the basis for global reasoning. These induced structures are not yet globally consistent, but they define a reduced representation space over which cross-region inference is performed.
+	
+	Stage B is therefore formulated as a quotient-space completion problem, where the goal is to recover global consistency of the induced equivalence relation by operating over the set of local equivalence classes rather than individual mentions. Instead of defining interactions over $\mathcal{M}$, we define a lifted interaction space over $\mathcal{C}$, in which each element corresponds to an entire local equivalence class. Relations between these elements are computed using aggregate compatibility over their constituent members, but are interpreted as relations between equivalence classes in the quotient space rather than as pairwise mention alignments.
+	
+	The resulting structure defines a higher-level relation $\approx$ over $\mathcal{C}$, which approximates the quotient of the unknown global equivalence relation induced on $\mathcal{M}$. Global coreference resolution is obtained by computing the transitive closure of $\approx$, yielding a consistent refinement of the initial local partitions. In this view, Stage B is not a post-hoc clustering step over mention groups, but a lifting operator that completes a partially specified equivalence relation in the quotient space induced by Stage A.
 	
 	\section{Solution Overview}\label{sec:overview}
-	To bypass global quadratic text attention entirely, the framework processes an incoming document through a decoupled, two-stage hierarchy that transforms a dense mention pool into a series of sparse, cluster-level operations over a quotient graph.
+	
+	To bypass global quadratic text attention, the framework processes an incoming document through a two-stage hierarchical inference pipeline that operates first on bounded local context and then on a compressed quotient representation of induced entities.
 	
 	\begin{enumerate}
-		\item \textbf{Decoupled Encoding Stream:} The document's nominal mentions are mapped once to raw semantic vectors (via a frozen text encoder) and localized context vectors (via a frozen language model). These representations are kept distinct and never fused inside a monolithic layer.
-		\item \textbf{Stage A (Intra-Window Clustering):} Suppose a document of length N is partitioned into $w$ windows of lengths $l_1,\ldots,l_w$ satisfying
-		\[\sum_{i=1}^{w} l_i = N\]
-		The total self-attention cost is
-		\[\sum_{i=1}^{w} O(l_i^2)\]
-		By Cauchy-Schwarz,
-		\[
-		\left(\sum_{i=1}^{w} l_i\right)^2
-		\le
-		w\sum_{i=1}^{w} l_i^2
-		\]
-		Therefore
-		\[
-		\sum_{i=1}^{w} l_i^2
-		\ge
-		\frac{N^2}{w}
-		\]
-		Equality holds iff
-		\[
-		l_1=l_2=\cdots=l_w=\frac{N}{w}
-		\]
-		Thus equal-sized windows minimize the total quadratic attention cost among all partitions with w windows. Full quadratic self-attention and pairwise mention scoring run exclusively within these local boundaries. A local union-find execution connects matching mentions, collapsing each window's sub-chains into a set of discrete, local entity clusters. 
-		\item \textbf{Quotient Graph Transformation:} The system lifts the problem space from individual mentions to the cluster level. The newly resolved local clusters are treated as atomic nodes in a highly compressed quotient graph.
-		\item \textbf{Stage B (Cross-Window Quotient Matching):} Cross-window entity consistency is recovered by evaluating edges across the quotient nodes. Rather than re-comparing individual mentions across long distances, a size-invariant interaction head evaluates cluster-level compatibility augmented with an additive, independent lexical channel. Global transitive closure over these accepted cluster edges outputs the final document-level entity partition. The point here is that while quadratic reasoning is still there, it is transferred onto a compressed state space which requires a heavily reduced number of computation rendering the effective complexity feasible.
+		\item \textbf{Decoupled Encoding Stream:} 
+		Each mention is mapped into two fixed, pretrained representation spaces capturing complementary semantic and contextual information. These encoders are frozen throughout training, and their outputs are never fused into a single joint representation at the token level. All subsequent reasoning is performed over these fixed feature views.
+		
+		\item \textbf{Stage A (Intra-Window Relational Construction):} 
+		The document is partitioned into a set of non-overlapping windows of fixed size. Within each window, all pairwise mention interactions are computed using a local scoring function over the frozen representations.
+		
+		A transitive inference procedure (union-find) is then applied strictly within each window, producing a set of locally consistent equivalence structures. These structures define the first level of inferred entity groupings and constitute the initial compressed representation of the document.
+		
+		\item \textbf{Quotient Representation Induction:} 
+		The output of Stage A is a collection of locally inferred equivalence groups, each representing a collapsed subset of mentions. These groups are treated as atomic units for all subsequent computation, inducing a reduced representation space in which reasoning operates over clusters rather than raw mentions.
+		
+		\item \textbf{Stage B (Cross-Window Quotient Matching):} 
+		Global entity consistency is recovered by evaluating interactions between the induced clusters rather than individual mentions. A size-invariant compatibility function computes relational evidence between clusters using aggregated mention-level interactions combined with auxiliary lexical signals.
+		
+		Edges exceeding a learned threshold define cross-window equivalences between clusters. Final document-level entities are obtained by computing the transitive closure over this cluster-level graph, yielding a globally consistent partition of mentions.
 	\end{enumerate}
-	
 	\section{Theoretical Foundation and Design Principles}\label{sec:hypothesis}
 	
 	\subsection{The Representation Factorization Hypothesis}
-	Monolithic language models incur extreme computational costs because they are forced to end-to-end ingest whole-document sequences to implicitly separate intersecting semantic, contextual, and discourse dependencies. We argue that this universal parameter updates can be completely bypassed if the broader relational task can be structurally transformed into localized sub-problems mapped to a global quotient graph. Under this factorization, a universal model is no longer required to learn overlapping dimensions on its own. Instead, we propose a more general informational framing:
+	
+	Monolithic language models rely on end-to-end contextualization over full-document sequences to implicitly disentangle semantic, discourse, and referential dependencies. This couples representation learning with relational inference and induces unnecessary computational cost. We instead hypothesize that coreference can be reformulated as a structured inference problem over localized observations combined through a compressed global reasoning space. Under this view, global entity structure does not require direct token-level interaction, but can be recovered from compositions of locally induced relational evidence. This motivates a factorization of inference into independent information channels that preserve complementary signals for downstream relational reconstruction.
 	
 	\begin{hypothesis}[Low-Redundancy Information Basis Hypothesis]
-		Let the complete decision space $\mathcal{V}$ required to unify local relational partitions into a global equivalence graph be spanned by $d$ distinct feature channels. If a global task can be decomposed into independent local window assignments and aggregated via a macro quotient space, the information space can be factorized into discrete, separate channels: $\mathcal{V} = \mathcal{V}_1 \times \mathcal{V}_2 \times \dots \times \mathcal{V}_d$. Crucially, these channels must remain as close to linearly independent as possible. 
+		Let $\mathcal{V}$ denote the decision space required to recover global entity structure. We assume it can be decomposed into $d$ partially independent feature channels:
+		\[
+		\mathcal{V} = \mathcal{V}_1 \times \mathcal{V}_2 \times \dots \times \mathcal{V}_d.
+		\]
+		Each channel is assumed to contain non-redundant information useful for relational reconstruction.
 	\end{hypothesis}
-	The channels need not be mathematically orthogonal. Instead, each channel must contribute information that cannot be reconstructed from the others. Empirically, introducing channels that are largely recoverable from existing channels provides little or no improvement and may introduce optimization noise. The objective is therefore not orthogonality but maximal marginal information gain. A diagnostic experiment illustrates this effect. For mention pairs with different surface lemmas, the raw cosine similarity of the underlying axis vectors achieves only AUC ≈ 0.57. Using the same vectors as independent inputs to a learned linear probe achieves AUC = 0.91. The signal is therefore already present in the basis coordinates. Collapsing them to a scalar similarity destroys most of the discriminative information.
+	
+	Independence here refers to functional non-redundancy rather than orthogonality: features are valuable insofar as they cannot be reconstructed from other channels without loss of task-relevant information.
+	
+	Empirically, this is supported by a diagnostic comparison in which scalar similarity over embedding axes yields weak separability (AUC ≈ 0.57), while a learned linear probe over separated representation channels achieves substantially higher performance (AUC = 0.91).
+	
 	\subsection{Locality-Transitivity Equivalence}
-	The necessity for full-document quadratic attention rests on the assumption that long-range mention interactions must be explicitly modeled at the token level. We replace this with a local graph formulation:
+	
+	We further hypothesize that long-range coreference does not require direct interaction modeling, but can be reconstructed via transitive propagation over locally observable relational chains.
 	
 	\begin{hypothesis}[Transitive Link Reconstruction]
-		Let $\sim$ be the global coreference equivalence relation over a document. For any two distant mentions $u, v \in \mathcal{M}$ belonging to the same entity, there exists a finite chain of intermediate references $m_1, m_2, \dots, m_r$ such that $u \sim m_1 \sim \dots \sim m_r \sim v$, where each adjacent pair in the chain is co-located within a local window partition: $\pi(m_j) = \pi(m_{j+1})$. 
+		Global entity identity can be decomposed into chains of locally observable mention-level relations such that any two coreferent mentions are connected via a finite sequence of intermediate mentions, each co-located within some shared observation context.
 	\end{hypothesis}
 	
-	\begin{theorem}[Quotient Reconstruction]
-		Assume Hypothesis 2 holds and that Stage B correctly identifies all cross-window cluster correspondences. Then the connected components of the quotient graph coincide exactly with the global entity partition $\mathcal E$.
+	\begin{theorem}[Quotient Reconstruction Principle]
+		If local relational structure is correctly identified within bounded contexts and cross-context correspondences are correctly recovered, then global entity structure can be reconstructed exactly via transitive closure over the induced relational graph.
 	\end{theorem}
-	\begin{proof}
-		Stage A defines an equivalence relation $\sim_A$ restricted to local windows $W_k$. If $u$ and $v$ are coreferent and reside in different windows, Hypothesis 2 guarantees a path of local links connects them. Stage B computes cross-window mapping edges between local equivalence classes. Since the union of these local relations and cross-window matches forms an equivalence relation, its connected components over the quotient nodes coincide exactly with the global entity partition $\mathcal{E}$.
-	\end{proof}
 	
-	This structural choice is supported by the geometric decay of similarity bounds over long token spans. For three mention vectors where $\cos(\mathbf{u}, \mathbf{v}) \ge c$ and $\cos(\mathbf{v}, \mathbf{w}) \ge c$, the strict mathematical lower bound on the endpoints degrades to:
-	\begin{align*}
-		\cos(\mathbf{u}, \mathbf{w})
-		& \ge 2c^2 - 1
-	\end{align*}
-	Under this constraint, two adjacent links at $c = 0.80$ bound the endpoints to a minimum similarity of just $0.28$. Direct mention comparison across distant windows quickly approaches a zero-signal floor. Transitive closure over discrete quotient components (union-find) is therefore required to propagate entity chains without signal decay.
+	This implies that global quadratic attention is not strictly required for entity recovery, but can be replaced by structured inference over localized relational graphs.
+	\section{Stage A: Local Intra-Window Resolution}
+	\label{sec:stagea}
+	Let a document be represented as a set of mentions
+	\[
+	\mathcal{M} = \{m_1, \dots, m_N\}.
+	\]
 	
-	\section{Model Class Definition}
-	\label{sec:model_class}
-	We formalize the system as a structured inference model over a partitioned mention space. Let a document be represented as a sequence of tokens from which a set of mentions $\mathcal{M} = \{m_1, m_2, \dots, m_N\}$ is extracted. The document is partitioned into a collection of disjoint, non-overlapping windows $\mathcal{W} = \{W_1, W_2, \dots, W_K\}$ such that $W_i \cap W_j = \emptyset\ \forall i \neq j$ and $\bigcup_{i=1}^{K} W_i = \mathcal{M}$. Each mention belongs to exactly one window via a deterministic assignment function $\pi: \mathcal{M} \rightarrow \mathcal{W}$. 
+	We define a deterministic partition into disjoint observation windows:
+	\[
+	\mathcal{W} = \{W_1, \dots, W_K\}, \quad
+	W_i \cap W_j = \emptyset, \quad
+	\bigcup_{k=1}^{K} W_k = \mathcal{M}.
+	\]
 	
-	Let $\mathbf{h}_i = \left[ f_{\theta_1}(m_i) \parallel f_{\theta_2}(m_i) \right]$ denote a factorized mention representation produced by independent frozen specialist encoders. Within each window $W_k$, a local coreference relation $\sim_k \subseteq W_k \times W_k$ is computed via a localized scoring function $s_\theta$. Two mentions are linked if $m_i \sim_k m_j$ if and only if $s_\theta(\mathbf{h}_i, \mathbf{h}_j) > \tau$. Let $\sim_k^*$ denote the transitive closure of this local relation, inducing a partition $\mathcal{C}_k= W_k / \sim_k^*$. Stage A produces a collection of disjoint local clusters $\mathcal{C} = \bigcup_{k=1}^{K} \mathcal{C}_k$. We define a quotient mapping $q: \mathcal{M} \rightarrow \mathcal{C}$ inducing the quotient space $\mathcal{Q} = \mathcal{C}$. Each cluster $C \in \mathcal{Q}$ is treated as an atomic node in subsequent inference, restricting all cross-window reasoning strictly to the quotient space $\mathcal{Q}$ rather than the raw mention pool $\mathcal{M}$.
+	Each mention is assigned to exactly one window via:
+	\[
+	\pi: \mathcal{M} \rightarrow \mathcal{W}.
+	\]
 	
-	\section{Stage A: Local Intra-Window Resolution}\label{sec:stagea}
-	The document is partitioned into fixed non-overlapping windows of size $K = 256$ subtokens. Neither encoder backbone is fine-tuned; RoBERTa-large (355M parameters) and BGE-large (335M parameters) remain completely frozen. For each mention $i$, the contextual channel supplies the RoBERTa token vectors at the span start $\mathbf{c}^{(s)}_i$ and end $\mathbf{c}^{(e)}_i$, while $\mathbf{s}_i$ denotes the BGE vector of the surface text. Each channel is projected independently:
-	\begin{align*}
-		g_i & = [\,P_c([\mathbf{c}^{(s)}_i \;|\; \mathbf{c}^{(e)}_i]) \;|\; P_s(\mathbf{s}_i)\,] \in \mathbb{R}^{2048}
-	\end{align*}
-	where $P_c \in \mathbb{R}^{1024 \times 2048}$ and $P_s \in \mathbb{R}^{1024 \times 1024}$ are learned linear layers. Pairwise link scoring within a local window is modeled via a multi-layer perceptron:
-	\begin{align*}
-		s(i,j) & = \mathrm{MLP}_{p}\left([\,g_i \;|\; g_j \;|\; \mathbf{d}_{ij}\,]\right)
-	\end{align*}
-	where $\mathbf{d}_{ij} \in \mathbb{R}^{32}$ is a learned distance embedding. Training optimizes a Mention-ranking Marginal Log-Likelihood (MLL) over the window partitions, where each mention $i$ softmaxes over $\{\varepsilon\} \cup \{j < i\}$, with $\varepsilon$ serving as a learned null antecedent:
-	\begin{align*}
-		\mathcal{L}_i
-		& = -\log \sum_{j \in \text{Gold}(i)} \frac{\exp(s(i, j))}{\sum_{k \in \{\varepsilon\} \cup \{j < i\}} \exp(s(i, k))}
-	\end{align*}
-	Transitive closure is applied via union-find within the window boundaries to generate the initial quotient cluster space $\mathcal{C}$.
+	Each mention is represented using a fixed factorized encoder:
+	\[
+	\mathbf{h}_i = \left[ f_{\theta_1}(m_i) \parallel f_{\theta_2}(m_i) \right],
+	\]
+	where both encoders are frozen.
+	
+	Within each window $W_k$, we define a local relation:
+	\[
+	m_i \sim_k m_j \iff s_\theta(\mathbf{h}_i, \mathbf{h}_j) > \tau.
+	\]
+	
+	Let $\sim_k^*$ denote its transitive closure, inducing local clusters:
+	\[
+	\mathcal{C}_k = W_k / \sim_k^*.
+	\]
+	
+	We define the full set of local clusters:
+	\[
+	\mathcal{C} = \bigcup_{k=1}^{K} \mathcal{C}_k.
+	\]
+	
+	Each cluster $C \in \mathcal{C}$ is treated as an atomic unit for subsequent inference. Stage A computes the local equivalence structure defined in Section~\ref{sec:model_class}. Each window $W_k \in \mathcal{W}$ is processed independently. For each pair of mentions $(m_i, m_j) \in W_k \times W_k$, a compatibility score is computed:
+	\[
+	s_\theta(\mathbf{h}_i, \mathbf{h}_j).
+	\]
+	
+	A local relation is induced via thresholding:
+	\[
+	m_i \sim_k m_j \iff s_\theta(\mathbf{h}_i, \mathbf{h}_j) > \tau.
+	\]
+	
+	Transitive closure over $\sim_k$ yields:
+	\[
+	\mathcal{C}_k = W_k / \sim_k^*.
+	\]
+	
+	This induces the set of local clusters:
+	\[
+	\mathcal{C} = \bigcup_{k=1}^{K} \mathcal{C}_k,
+	\quad \mathcal{Q} \equiv \mathcal{C}.
+	\]
+	
+	These clusters form the atomic units used in Stage B.
 	
 	\section{Stage B: Cross-Window Quotient Matching}\label{sec:stageb}
 	Stage B reconciles entity fragments across window pairs, operating entirely over the quotient graph nodes produced by Stage A. It scores cluster pairs directly over their full cross-cluster mention grid via an architecture optimized for fine-grained interaction (\texttt{MentionMatcher}).
 	
-	\subsection{Size-Invariant Log-Mean-Exp Interactivity}
-	Collapsing clusters into a single vector via attention pooling can introduce an informational smearing effect, where highly specific local evidence—such as a shared unique proper noun—is averaged out across a cluster's pronoun embeddings. To preserve localized mention-pair evidence while preventing large clusters from artificially inflating connection scores, the \texttt{MentionMatcher} aggregates the full interaction grid via a size-invariant log-mean-exp operator:
-	\begin{align*}
-		\text{score}(A,B)
-		& = \log \sum_{m \in A, n \in B} \exp\left(f(\mathbf{m}, \mathbf{n})\right) - \log(|A| \cdot |B|)
-	\end{align*}
-	where $f(\mathbf{m}, \mathbf{n}) = \text{MLP}([\mathbf{m} \mid \mathbf{n} \mid \mathbf{m} \odot \mathbf{n} \mid |\mathbf{m}-\mathbf{n}|])$, processing the member channel streams projected during Stage A. Subtracting $\log(|A| \cdot |B|)$ penalizes cluster-size scaling artifacts, ensuring that a single high-confidence mention-pair activation can safely anchor the cross-window bridge without being suppressed by cluster scale.
+	To enable consistent reasoning over the quotient space, we define a lifted compatibility operator over local equivalence classes that preserves the structure induced by mention-level relations. Let $A, B \in \mathcal{C}$ denote two equivalence classes produced by Stage A. Since each class aggregates multiple mentions, relations between $A$ and $B$ must be defined in a way that is invariant to internal class cardinality and robust to heterogeneous mention composition.
 	
+	We define a quotient-compatible interaction operator $\sigma : \mathcal{C} \times \mathcal{C} \rightarrow \mathbb{R}$ that aggregates fine-grained mention-level interactions into a single class-level relational quantity while respecting permutation invariance within each class. Rather than collapsing each class into a single vector representation, we define the interaction directly over the full bipartite structure induced by their constituent mentions:
+		\begin{align*}
+			\sigma(A,B)
+				& = \log\sum_{m\in A}\sum_{n\in B}\exp\left(f(m,n)\right)-\log(|A|\cdot|B|)
+		\end{align*}
+	where $f(m,n)$ is a local compatibility functional defined over the fixed representations of mentions. This formulation can be interpreted as a log-partition lifting operator that maps pairwise mention interactions into a stable class-level relation in the quotient space, while explicitly normalizing for class size to avoid structural bias toward larger equivalence classes.
+	
+	In this view, $\sigma(A,B)$ is not a similarity score between embeddings, but a measure of relational support between equivalence classes induced by aggregated evidence over their member mentions. The use of a log-sum-exp aggregation ensures that strong local alignments between any pair of mentions can dominate the class-level relation when supported consistently, while still allowing distributed weaker evidence to contribute additively. This defines a stable lifting of mention-level relations into the quotient space $\mathcal{C}$, enabling global equivalence completion via transitive closure over class-level interactions.
 	\subsection{Lexical Features}
 	To assist the frozen contextual spaces across deep token spans, the interaction head is augmented with an additive combination of localized, discrete string-identity features:
 	\begin{align*}
