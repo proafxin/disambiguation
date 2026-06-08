@@ -73,14 +73,18 @@ class AntecedentScorer(nn.Module):
         hidden: int = 1024,
         dropout: float = 0.3,
         chunk: int = 8192,
+        channel: str = "both",
     ):
         super().__init__()
         self.chunk = chunk
-        self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
-        self.P_bge = nn.Linear(BGE_DIM, proj_dim)
+        self.channel = channel
+        if channel in ("both", "ctx"):
+            self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
+        if channel in ("both", "bge"):
+            self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
         self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
-        g = 2 * proj_dim
+        g = (2 if channel == "both" else 1) * proj_dim
         self.ffnn = nn.Sequential(
             nn.Linear(2 * g + 32, hidden),
             nn.ReLU(),
@@ -94,10 +98,13 @@ class AntecedentScorer(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def mention_rep(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # (M, 2*proj_dim)
-        c = self.P_ctx(self.drop(ctx.flatten(1)))
-        s = self.P_bge(self.drop(bge))
-        return torch.cat([c, s], dim=-1)
+        # (M, g) where g = 2*proj_dim (both) or proj_dim (single channel)
+        parts = []
+        if self.channel in ("both", "ctx"):
+            parts.append(self.P_ctx(self.drop(ctx.flatten(1))))
+        if self.channel in ("both", "bge"):
+            parts.append(self.P_bge(self.drop(bge)))
+        return torch.cat(parts, dim=-1)
 
     def forward(
         self, ctx: torch.Tensor, bge: torch.Tensor
@@ -278,14 +285,17 @@ class MentionMatcher(nn.Module):
     # matrix (logsumexp ~ soft-max). Preserves per-mention evidence — the strongest single
     # mention pair (e.g. a shared proper noun) can drive the merge, which the pooled head
     # smears away. Drop-in for ClusterMatcher: same forward(left, right) -> (L, R) + null_bias.
-    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096, iterative: bool = False):
+    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096, iterative: bool = False, channel: str = "both"):
         super().__init__()
         self.chunk = chunk
         self.iterative = iterative
-        self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
-        self.P_bge = nn.Linear(BGE_DIM, proj_dim)
+        self.channel = channel
+        if channel in ("both", "ctx"):
+            self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
+        if channel in ("both", "bge"):
+            self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.drop = nn.Dropout(dropout)
-        g = 2 * proj_dim
+        g = (2 if channel == "both" else 1) * proj_dim
         self.pair = nn.Sequential(
             nn.Linear(4 * g, hidden),
             nn.ReLU(),
@@ -303,8 +313,13 @@ class MentionMatcher(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def _vecs(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # (M, 2, CTX_DIM), (M, BGE_DIM) -> (M, 2*proj_dim)
-        return torch.cat([self.P_ctx(self.drop(ctx.flatten(1))), self.P_bge(self.drop(bge))], dim=-1)
+        # (M, 2, CTX_DIM), (M, BGE_DIM) -> (M, g); g = 2*proj_dim (both) or proj_dim (single channel)
+        parts = []
+        if self.channel in ("both", "ctx"):
+            parts.append(self.P_ctx(self.drop(ctx.flatten(1))))
+        if self.channel in ("both", "bge"):
+            parts.append(self.P_bge(self.drop(bge)))
+        return torch.cat(parts, dim=-1)
 
     def forward_many(self, pairs: list[tuple[list, list]], lex_list: list | None = None) -> list[torch.Tensor]:
         # Batch every window-pair's mention-pair scoring into ONE chunked FFNN + ONE segmented

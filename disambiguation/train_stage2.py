@@ -94,12 +94,14 @@ def _filter_docs(docs: list, subset: str) -> list:
     return docs
 
 
-def _win_names(window: int, subset: str = "all") -> tuple:
+def _win_names(window: int, subset: str = "all", channel: str = "both") -> tuple:
     # window-tagged artifact names so K=128/256/512 never collide or reuse each other:
     # (ctx cache dir, Stage A head base, Stage B matcher, Stage A clusters cache).
     # ctx dir is NOT subset-tagged: conll docs are the cache's stable prefix, so a
     # subset run reuses the same ctx files. Heads/matchers/clusters get the subset tag.
-    t = f"_k{window}" + _SUBSET_TAG[subset]
+    # channel (bge/ctx) tags single-channel ablations so they never collide with the
+    # both-channels artifacts; ctx dir is channel-agnostic (same cached features either way).
+    t = f"_k{window}" + _SUBSET_TAG[subset] + ("" if channel == "both" else f"_{channel}")
     ctx = SPAN_CTX_CP8K if subset == "cp8k" else SPAN_CTX_CACHE
     return (
         ctx.with_name(ctx.name + f"_k{window}"),
@@ -904,10 +906,12 @@ def train_stage2(
     dropout: float = 0.3,
     weight_decay: float = 0.1,
     loss_weights: dict | None = None,
+    channel: str = "both",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
     print(
-        f"\nBuilding Stage 2 nominal data... (finetune={finetune}, predicted={predicted}, window={window}, subset={subset})"
+        f"\nBuilding Stage 2 nominal data... (finetune={finetune}, predicted={predicted}, "
+        f"window={window}, subset={subset}, channel={channel})"
     )
     if predicted:
         print("Evaluation setting: PREDICTED mentions (end-to-end), CoNLL only; KEY = true gold clusters")
@@ -943,13 +947,13 @@ def train_stage2(
             "corefud": [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
         }
 
-    ctx_dir, frozen_base, _, _ = _win_names(window, subset)
+    ctx_dir, frozen_base, _, _ = _win_names(window, subset, channel)
     frozen_name = frozen_base
     if predicted:
         frozen_name += "_pred"
     if all_pairs:
         frozen_name += "_ap"
-    scorer = AntecedentScorer(dropout=dropout).to(device)
+    scorer = AntecedentScorer(dropout=dropout, channel=channel).to(device)
     encoder = ContextEncoder().to(device)
     if finetune:
         # Head warmup: start fine-tuning from the trained frozen head, not a random one — joint
@@ -1202,9 +1206,9 @@ def _cluster_gold_cids(cluster: list[int], cluster_id: np.ndarray) -> int:
 
 
 def _precompute_stage_a_clusters(
-    docs: list, scorer: AntecedentScorer, device: str, window: int = CONTENT, subset: str = "all"
+    docs: list, scorer: AntecedentScorer, device: str, window: int = CONTENT, subset: str = "all", channel: str = "both"
 ) -> list[dict[int, dict]]:
-    cache_path = MODELS_DIR / _win_names(window, subset)[3]
+    cache_path = MODELS_DIR / _win_names(window, subset, channel)[3]
     if cache_path.exists():
         print("Loading cached Stage A clusters...")
         with cache_path.open("rb") as f:
@@ -1225,7 +1229,11 @@ def _precompute_stage_a_clusters(
 
 
 def _stage_b_merge_edges(
-    d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher | MentionMatcher, device: str, allow_lex_cache: bool = True
+    d: dict,
+    per_window: dict[int, dict],
+    cluster_matcher: ClusterMatcher | MentionMatcher,
+    device: str,
+    allow_lex_cache: bool = True,
 ) -> tuple[list[tuple[int, int]], dict[int, int], int]:
     # Single source of truth for cross-window merges: scores every cross-window
     # cluster pair and returns the accepted merges as (global_a, global_b) edges,
@@ -1253,8 +1261,17 @@ def _stage_b_merge_edges(
                 left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
                 right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
                 if hasattr(cluster_matcher, "lex"):
-                    lex = _lex_for_pair(d, int(wi["global_idx"][0]), int(wj["global_idx"][0]), lc, rc,
-                                        wi["global_idx"], wj["global_idx"], device, allow_cache=allow_lex_cache)
+                    lex = _lex_for_pair(
+                        d,
+                        int(wi["global_idx"][0]),
+                        int(wj["global_idx"][0]),
+                        lc,
+                        rc,
+                        wi["global_idx"],
+                        wj["global_idx"],
+                        device,
+                        allow_cache=allow_lex_cache,
+                    )
                     scores = cluster_matcher(left, right, lex).float().cpu().numpy()
                 else:
                     scores = cluster_matcher(left, right).float().cpu().numpy()
@@ -1269,11 +1286,11 @@ def _predict_full_doc_clusters(
     d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher | MentionMatcher, device: str
 ) -> list[list]:
     windows = sorted(per_window.keys())
-    
+
     # Iterative cascade: refine predictions over multiple passes
     if hasattr(cluster_matcher, "iterative") and cluster_matcher.iterative:
         return _predict_iterative_cascade(d, per_window, cluster_matcher, device, num_passes=3)
-    
+
     edges, win_offsets, total = _stage_b_merge_edges(d, per_window, cluster_matcher, device)
     parent = list(range(total))
     for a, b in edges:
@@ -1310,31 +1327,33 @@ def _predict_iterative_cascade(
     # Lexical caching disabled to handle changing cluster structures between passes.
     windows = sorted(per_window.keys())
     current_per_window = per_window
-    
+
     for pass_idx in range(num_passes):
         # Disable lexical caching during iterative cascade (cluster structure changes)
-        edges, win_offsets, total = _stage_b_merge_edges(d, current_per_window, cluster_matcher, device, allow_lex_cache=False)
+        edges, win_offsets, total = _stage_b_merge_edges(
+            d, current_per_window, cluster_matcher, device, allow_lex_cache=False
+        )
         parent = list(range(total))
         for a, b in edges:
             ra, rb = _uf_find(parent, a), _uf_find(parent, b)
             if ra != rb:
                 parent[ra] = rb
-        
+
         # Early exit if no merges happened
         if not edges:
             break
-        
+
         # Build new clusters for next pass: flatten merged clusters into new per-window structure
         if pass_idx < num_passes - 1:
             groups: dict[int, list[int]] = {}
             for i in range(total):
                 groups.setdefault(_uf_find(parent, i), []).append(i)
-            
+
             # Reconstruct per-window clusters from merged groups
             next_per_window: dict[int, dict] = {}
             for w in windows:
                 next_per_window[w] = {"clusters": [], "global_idx": current_per_window[w]["global_idx"]}
-            
+
             for root, members in groups.items():
                 # Distribute merged cluster back to windows it spans
                 win_mentions: dict[int, list[int]] = {}
@@ -1347,13 +1366,13 @@ def _predict_iterative_cascade(
                             for li in local_cluster:
                                 win_mentions.setdefault(w, []).append(li)
                             break
-                
+
                 # Add refined clusters to each window
                 for w, local_indices in win_mentions.items():
                     next_per_window[w]["clusters"].append(sorted(set(local_indices)))
-            
+
             current_per_window = next_per_window
-    
+
     # Final result extraction
     groups: dict[int, list[int]] = {}
     for i in range(total):
@@ -1552,7 +1571,7 @@ def write_diagnostics(
             vr_c_total_rsv = torch.cuda.memory_reserved(device) / 1e6
         else:
             vr_c_incr_alloc = vr_c_incr_rsv = vr_c_total_rsv = 0.0
-            
+
         if device == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
@@ -1686,12 +1705,52 @@ def _diagnostic_eval_sets(docs: list, all_stage_a: list) -> list[tuple[str, str,
     return sets
 
 
-_PRONOUNS = frozenset({
-    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
-    "my", "your", "his", "its", "our", "their", "mine", "yours", "hers", "ours", "theirs",
-    "myself", "yourself", "himself", "herself", "itself", "ourselves", "yourselves", "themselves",
-    "this", "that", "these", "those", "who", "whom", "whose", "which", "what", "there", "here",
-})
+_PRONOUNS = frozenset(
+    {
+        "i",
+        "you",
+        "he",
+        "she",
+        "it",
+        "we",
+        "they",
+        "me",
+        "him",
+        "her",
+        "us",
+        "them",
+        "my",
+        "your",
+        "his",
+        "its",
+        "our",
+        "their",
+        "mine",
+        "yours",
+        "hers",
+        "ours",
+        "theirs",
+        "myself",
+        "yourself",
+        "himself",
+        "herself",
+        "itself",
+        "ourselves",
+        "yourselves",
+        "themselves",
+        "this",
+        "that",
+        "these",
+        "those",
+        "who",
+        "whom",
+        "whose",
+        "which",
+        "what",
+        "there",
+        "here",
+    }
+)
 
 
 def _build_lexical(docs: list) -> None:
@@ -1746,7 +1805,9 @@ def _lex_matrix(lc: list, rc: list, lgi, rgi, mention_tokens: list, idf: dict) -
     return out
 
 
-def _lex_for_pair(d: dict, ki: int, kj: int, lc: list, rc: list, lgi, rgi, device: str, allow_cache: bool = True) -> torch.Tensor:
+def _lex_for_pair(
+    d: dict, ki: int, kj: int, lc: list, rc: list, lgi, rgi, device: str, allow_cache: bool = True
+) -> torch.Tensor:
     # memoized per (window-pair) — lexical features are constant across epochs
     # allow_cache=False forces recomputation (needed for iterative cascade where cluster structure changes)
     if "mention_tokens" not in d:
@@ -1770,8 +1831,7 @@ def _stage_b_losses(cluster_matcher, pending: list) -> list:
             lex_list = None
         mats = cluster_matcher.forward_many([(p[0], p[1]) for p in pending], lex_list)
         return [
-            cluster_match_loss(m, p[2], p[3], cluster_matcher.null_bias)
-            for m, p in zip(mats, pending, strict=True)
+            cluster_match_loss(m, p[2], p[3], cluster_matcher.null_bias) for m, p in zip(mats, pending, strict=True)
         ]
     return [cluster_match_loss(cluster_matcher(p[0], p[1]), p[2], p[3], cluster_matcher.null_bias) for p in pending]
 
@@ -1806,14 +1866,17 @@ def train_stage_b(
     weight_decay: float = 0.1,
     head: str = "cluster",
     hard_neg: bool = False,
-    hard_neg_weight: float = 3.0,
     use_structured: bool = True,
     iterative: bool = False,
+    channel: str = "both",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
 ) -> None:
-    print(f"\nTraining Stage B matcher... (window={window}, subset={subset}, head={head}, iterative={iterative})")
-    ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset)
+    print(
+        f"\nTraining Stage B matcher... (window={window}, subset={subset}, head={head}, "
+        f"iterative={iterative}, channel={channel})"
+    )
+    ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset, channel)
     if head == "mention":
         ckpt_b = ckpt_b.replace(".pt", "_ment.pt")
     if iterative:
@@ -1827,7 +1890,7 @@ def train_stage_b(
     if head == "mention":
         _build_lexical(docs)  # independent lexical-identity channel (§4.5/§8); mention head only
 
-    stage_a = AntecedentScorer().to(device)
+    stage_a = AntecedentScorer(channel=channel).to(device)
     stage_a.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
     for p in stage_a.parameters():
         p.requires_grad_(False)
@@ -1847,7 +1910,7 @@ def train_stage_b(
     test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
 
     # precompute Stage A clusters once — avoids re-running Stage A every epoch
-    all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device, window, subset)
+    all_stage_a = _precompute_stage_a_clusters(docs, stage_a, device, window, subset, channel)
     train_clusters = [all_stage_a[i] for i in train_idx]
     val_clusters = [
         all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")
@@ -1861,8 +1924,10 @@ def train_stage_b(
     )
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     if head == "mention":
-        cluster_matcher = MentionMatcher(dropout=dropout, iterative=iterative).to(device)
+        cluster_matcher = MentionMatcher(dropout=dropout, iterative=iterative, channel=channel).to(device)
     else:
+        if channel != "both":
+            raise ValueError("single-channel ablation requires head='mention' (pooled head is not channel-aware)")
         cluster_matcher = ClusterMatcher(dropout=dropout, use_structured=use_structured).to(device)
     if eval_only:
         cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
@@ -1930,9 +1995,18 @@ def train_stage_b(
                 left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
                 right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
                 lex = (
-                    _lex_for_pair(d, int(wi["global_idx"][0]), int(wj["global_idx"][0]), lc, rc,
-                                  wi["global_idx"], wj["global_idx"], device)
-                    if head == "mention" else None
+                    _lex_for_pair(
+                        d,
+                        int(wi["global_idx"][0]),
+                        int(wj["global_idx"][0]),
+                        lc,
+                        rc,
+                        wi["global_idx"],
+                        wj["global_idx"],
+                        device,
+                    )
+                    if head == "mention"
+                    else None
                 )
                 pending.append((left, right, left_cids, right_cids, lex))
                 pending_pairs += sum(c.shape[0] for c, _ in left) * sum(c.shape[0] for c, _ in right)
@@ -2027,14 +2101,20 @@ def train_stage_b(
 
 
 if __name__ == "__main__":
-    # Mention-level Stage B: current best (85.56 F1 on test)
-    # Clean baseline without structured features, hard negatives, or iterative cascade
+    # Mention-level Stage B: current best (85.56 F1 on test, channel="both")
+    # channel ablation: "both" | "bge" | "ctx". Stage A must be trained for the same
+    # channel before Stage B (Stage B loads the channel-tagged frozen head).
+    channel = "ctx"
+    head_path = MODELS_DIR / f"{_win_names(256, 'all8k', channel)[1]}.pt"
+    if not head_path.exists():
+        train_stage2(window=256, subset="all8k", channel=channel)
     train_stage_b(
         window=256,
         subset="all8k",
         head="mention",
         dropout=0.2,
-        iterative=False,      # FAILED: 84.89 F1 (-0.67)
-        hard_neg=False,       # FAILED: no benefit, hurts recall
-        use_structured=False, # N/A for mention head
+        iterative=False,
+        hard_neg=False,
+        use_structured=False,
+        channel=channel,
     )
