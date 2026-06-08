@@ -63,15 +63,15 @@
 	
 	\begin{hypothesis}[Distinguishable Feature Representation Basis]
 		Let $\mathcal{V}$ denote the complete decision space required to resolve entity identity. We hypothesize that useful identity information can be represented across $d$ distinct, architecturally separated feature channels whose signals remain accessible to downstream inference when preserved separately:
-		\[
-		\mathcal{V} = \mathcal{V}_{\text{context}} \times \mathcal{V}_{\text{semantic}} \times \dots
-		\]
+		\begin{align*}
+			\mathcal{V} &= \mathcal{V}_{\text{context}} \times \mathcal{V}_{\text{semantic}} \times \dots
+		\end{align*}
 		where individual channels preserve specialized signals that are obscured when compressed into low-dimensional similarity measures or early aggregation operations.
 	\end{hypothesis}
 	
-	\begin{equation}
-		\mathbf{h}_i = \left[ P_{\text{ctx}}\left(f_{\text{RoBERTa}}(m_i)\right) \parallel P_{\text{bge}}\left(f_{\text{BGE}}(m_i)\right) \right] \in \mathbb{R}^{d_1 + d_2}
-	\end{equation}
+	\begin{align*}
+		\mathbf{h}_i &= \left[ P_{\text{ctx}}\left(f_{\text{RoBERTa}}(m_i)\right) \parallel P_{\text{bge}}\left(f_{\text{BGE}}(m_i)\right) \right] \in \mathbb{R}^{d_1 + d_2}
+	\end{align*}
 	where $P_{\text{ctx}}: \mathbb{R}^{2048} \rightarrow \mathbb{R}^{1024}$ and $P_{\text{bge}}: \mathbb{R}^{1024} \rightarrow \mathbb{R}^{1024}$ are learned linear projections mapping frozen activations into isolated coordinate paths. 
 	
 	The critical property of this system is not that the underlying encoders are independent, but that the decision information is supplied through separate coordinate systems whose signals remain explicitly distinguishable throughout inference. Frozen universal encoders provide one convenient realization of this condition. Any mechanism capable of producing comparably distinct channels would satisfy the same architectural requirement. The contribution of this work is therefore not the use of frozen models itself, but the demonstration that preserving factorized information channels can mitigate the reliance on global token-level attention within document-level coreference resolution.
@@ -88,13 +88,13 @@
 	The architectural viability of restricting token-level quadratic attention to isolated local windows is supported by the factorization established in Section~\ref{sec:factorization}. Because the coordinate representations retain un-collapsed channel signals, local relational boundaries preserve substantial identity information that can drop under conventional scalarized similarity spaces, mitigating the contextual degradation typically observed in naive windowed models. This allows us to apply a deterministic partition over the document into disjoint sequence windows $W_k$ of length $K=256$ tokens, such that each mention is assigned to exactly one window via a mapping function $\pi: \mathcal{M} \rightarrow \mathcal{W}$.
 	
 	For every pair of mentions co-located within $W_k$, an antecedent scoring head (\texttt{AntecedentScorer}) calculates local compatibility alongside bucketed distance tokens:
-	\begin{equation}
-		s(i, j) = \text{MLP}\left([\mathbf{h}_i \parallel \mathbf{h}_j \parallel \mathbf{e}_{\text{dist}(i-j)}]\right)
-	\end{equation}
+	\begin{align*}
+		s(i, j) &= \text{MLP}\left([\mathbf{h}_i \parallel \mathbf{h}_j \parallel \mathbf{e}_{\text{dist}(i-j)}]\right)
+	\end{align*}
 	A local equivalence relation $\sim_k$ is induced via thresholding against a learned null bias parameter $\tau$. Computing the transitive closure via a union-find algorithm strictly within each window boundaries yields a set of local equivalence classes:
-	\begin{equation}
-		\mathcal{C}_k = W_k / \sim_k^*
-	\end{equation}
+	\begin{align*}
+		\mathcal{C}_k &= W_k / \sim_k^*
+	\end{align*}
 	The union of these sub-clusters across all windows forms our complete intermediate entity space $\mathcal{C} = \bigcup_{k=1}^{W} \mathcal{C}_k$. It is important to note that elements of $\mathcal{C}$ constitute local connected components under localized constraints, rather than a final global quotient space. Each local cluster $C \in \mathcal{C}$ is subsequently treated as an atomic node in a quotient graph of locally induced equivalence classes for cross-window inference layers.
 	
 	Evaluating the isolated performance of Stage A against full-document gold targets (leaving each local cluster as its own unmerged entity) yields a baseline score of $0.7439$ F$_1$ on CoNLL-2012. This establishes that local tracking alone achieves 87\% of the final CoNLL score obtained by the complete system ($0.7439 / 0.8556$), supporting the hypothesis that dense coreference links are highly concentrated within bounded token ranges.
@@ -107,16 +107,16 @@
 	\end{proposition}
 	
 	To compute compliance between two macro-nodes $A, B \in \mathcal{C}$, we implement a size-invariant log-partition interaction operator (\texttt{MentionMatcher}) over the full bipartite structure induced by their constituent mentions:
-	\begin{equation}
-		\text{score}_{\text{neural}}(A,B) = \log\sum_{m\in A}\sum_{n\in B}\exp\left(f(m,n)\right)-\log(|A|\cdot|B|)
-	\end{equation}
+	\begin{align*}
+		\text{score}_{\text{neural}}(A,B) &= \log\sum_{m\in A}\sum_{n\in B}\exp\left(f(m,n)\right)-\log(|A|\cdot|B|)
+	\end{align*}
 	where $f(m,n)$ is a local neural compatibility functional parameterizing interaction over coordinate alignments. Log-mean-exp aggregation ensures that strong local alignments dominate when supported consistently, while distributed weaker evidence contributes additively, eliminating structural bias toward larger equivalence classes.
 	
 	\subsection{Lexical Features}
 	To assist the distinct contextual spaces across deep token spans, the interaction head is augmented with an additive combination of localized, discrete string-identity features:
-	\begin{equation}
-		\sigma(A, B) = \text{score}_{\text{neural}}(A, B) + \mathbf{w}^\top \mathbf{x}_{\text{lex}}
-	\end{equation}
+	\begin{align*}
+		\sigma(A, B) &= \text{score}_{\text{neural}}(A, B) + \mathbf{w}^\top \mathbf{x}_{\text{lex}}
+	\end{align*}
 	where $\mathbf{w}$ is a learned weight vector, and $\mathbf{x}_{\text{lex}} \in \mathbb{R}^3$ contains:
 	\begin{enumerate}
 		\item \textbf{IDF-weighted token Jaccard similarity:} $\sum_{t \in A \cap B} \text{idf}(t) / \sum_{t \in A \cup B} \text{idf}(t)$, where document-local $\text{idf}(t) = \log(M / (1 + \text{df}(t))) + 1$.
@@ -177,9 +177,9 @@
 	
 	\subsection{Complexity and Quotient Graph Analysis}
 	Since window size is fixed, $W=N/K$. Total sequence encoding complexity runs at $O(WK^2) = O(NK)$, avoiding full-sequence token quadratics. Within Stage A, localized mention scoring operates at $O(W \cdot (M/W)^2) = O(M^2K/N)$. Cross-window Stage B matching adds an $O(C^2)$ execution factor over the nodes of the graph. Total computation scales as:
-	\begin{equation}
-		\mathcal{O}\left(NK + \frac{M^2K}{N} + C^2\right)
-	\end{equation}
+	\begin{align*}
+		\text{Complexity} &\in \mathcal{O}\left(NK + \frac{M^2K}{N} + C^2\right)
+	\end{align*}
 	For standard compositions, the compressed node counts satisfy $C \ll M \ll N$, concentrating structural steps into highly reduced fields. Mean document metrics collected on CoNLL-2012 reveal average scales of $N = 617.4$ tokens, $M = 57.1$ mentions, and $C = 20.7$ macro-nodes. Stage A collapses the initial graph space down to $36.3\%$ of its raw entity volume, yielding a strong \textbf{2.76:1} compression profile before Stage B inference begins on the quotient graph.
 	
 	\begin{table}[ht]
