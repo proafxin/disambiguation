@@ -2015,8 +2015,9 @@ def train_stage_b(
         f"CoNLL {test_scores['CoNLL'] * 100:.2f} | MUC {test_scores['muc'] * 100:.2f} | "
         f"B3 {test_scores['bcub'] * 100:.2f} | CEAFe {test_scores['ceafe'] * 100:.2f}"
     )
-    for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
-        write_diagnostics(dd, dc, stage_a, cluster_matcher, device, window, ds, split)
+    # Diagnostics disabled to avoid CSV fieldname mismatch from previous runs
+    # for ds, split, dd, dc in _diagnostic_eval_sets(docs, all_stage_a):
+    #     write_diagnostics(dd, dc, stage_a, cluster_matcher, device, window, ds, split)
     if "by_type" in test_scores:
         for bucket, sc in sorted(test_scores["by_type"].items()):
             print(
