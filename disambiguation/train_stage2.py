@@ -1225,13 +1225,14 @@ def _precompute_stage_a_clusters(
 
 
 def _stage_b_merge_edges(
-    d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher, device: str
+    d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher | MentionMatcher, device: str, allow_lex_cache: bool = True
 ) -> tuple[list[tuple[int, int]], dict[int, int], int]:
     # Single source of truth for cross-window merges: scores every cross-window
     # cluster pair and returns the accepted merges as (global_a, global_b) edges,
     # the per-window cluster-index offsets, and the total cluster count. Both the
     # cluster decoder and the diagnostics consume these same edges so the reported
     # edge precision/recall can never diverge from what the model actually merges.
+    # allow_lex_cache: set False during iterative cascade to recompute lexical features
     windows = sorted(per_window.keys())
     win_offsets: dict[int, int] = {}
     total = 0
@@ -1253,7 +1254,7 @@ def _stage_b_merge_edges(
                 right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
                 if hasattr(cluster_matcher, "lex"):
                     lex = _lex_for_pair(d, int(wi["global_idx"][0]), int(wj["global_idx"][0]), lc, rc,
-                                        wi["global_idx"], wj["global_idx"], device)
+                                        wi["global_idx"], wj["global_idx"], device, allow_cache=allow_lex_cache)
                     scores = cluster_matcher(left, right, lex).float().cpu().numpy()
                 else:
                     scores = cluster_matcher(left, right).float().cpu().numpy()
@@ -1265,9 +1266,14 @@ def _stage_b_merge_edges(
 
 
 def _predict_full_doc_clusters(
-    d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher, device: str
+    d: dict, per_window: dict[int, dict], cluster_matcher: ClusterMatcher | MentionMatcher, device: str
 ) -> list[list]:
     windows = sorted(per_window.keys())
+    
+    # Iterative cascade: refine predictions over multiple passes
+    if hasattr(cluster_matcher, "iterative") and cluster_matcher.iterative:
+        return _predict_iterative_cascade(d, per_window, cluster_matcher, device, num_passes=3)
+    
     edges, win_offsets, total = _stage_b_merge_edges(d, per_window, cluster_matcher, device)
     parent = list(range(total))
     for a, b in edges:
@@ -1288,6 +1294,80 @@ def _predict_full_doc_clusters(
                 if lo <= ci < lo + len(lc):
                     local_cluster = lc[ci - lo]
                     global_idx = per_window[w]["global_idx"]
+                    spans.extend(d["spans"][global_idx[li]] for li in local_cluster)
+                    break
+        if len(spans) >= 2:
+            result.append(spans)
+    return result
+
+
+def _predict_iterative_cascade(
+    d: dict, per_window: dict[int, dict], cluster_matcher: MentionMatcher, device: str, num_passes: int = 3
+) -> list[list]:
+    # Iterative disambiguation: run multiple passes where each pass uses the previous
+    # pass's cluster predictions to refine the next round. Starts from Stage A clusters,
+    # performs Stage B merging, then re-clusters the merged results and repeats.
+    # Lexical caching disabled to handle changing cluster structures between passes.
+    windows = sorted(per_window.keys())
+    current_per_window = per_window
+    
+    for pass_idx in range(num_passes):
+        # Disable lexical caching during iterative cascade (cluster structure changes)
+        edges, win_offsets, total = _stage_b_merge_edges(d, current_per_window, cluster_matcher, device, allow_lex_cache=False)
+        parent = list(range(total))
+        for a, b in edges:
+            ra, rb = _uf_find(parent, a), _uf_find(parent, b)
+            if ra != rb:
+                parent[ra] = rb
+        
+        # Early exit if no merges happened
+        if not edges:
+            break
+        
+        # Build new clusters for next pass: flatten merged clusters into new per-window structure
+        if pass_idx < num_passes - 1:
+            groups: dict[int, list[int]] = {}
+            for i in range(total):
+                groups.setdefault(_uf_find(parent, i), []).append(i)
+            
+            # Reconstruct per-window clusters from merged groups
+            next_per_window: dict[int, dict] = {}
+            for w in windows:
+                next_per_window[w] = {"clusters": [], "global_idx": current_per_window[w]["global_idx"]}
+            
+            for root, members in groups.items():
+                # Distribute merged cluster back to windows it spans
+                win_mentions: dict[int, list[int]] = {}
+                for ci in members:
+                    for w in windows:
+                        lo = win_offsets[w]
+                        lc = current_per_window[w]["clusters"]
+                        if lo <= ci < lo + len(lc):
+                            local_cluster = lc[ci - lo]
+                            for li in local_cluster:
+                                win_mentions.setdefault(w, []).append(li)
+                            break
+                
+                # Add refined clusters to each window
+                for w, local_indices in win_mentions.items():
+                    next_per_window[w]["clusters"].append(sorted(set(local_indices)))
+            
+            current_per_window = next_per_window
+    
+    # Final result extraction
+    groups: dict[int, list[int]] = {}
+    for i in range(total):
+        groups.setdefault(_uf_find(parent, i), []).append(i)
+    result = []
+    for members in groups.values():
+        spans = []
+        for ci in members:
+            for w in windows:
+                lo = win_offsets[w]
+                lc = current_per_window[w]["clusters"]
+                if lo <= ci < lo + len(lc):
+                    local_cluster = lc[ci - lo]
+                    global_idx = current_per_window[w]["global_idx"]
                     spans.extend(d["spans"][global_idx[li]] for li in local_cluster)
                     break
         if len(spans) >= 2:
@@ -1454,17 +1534,30 @@ def write_diagnostics(
         pure, ctot = _stage_a_purity(per_window, cid)
         n_sub, m = len(d["content_ids"]), len(cid)
 
+        # Memory profiling: capture 4 different metrics for comprehensive reporting
         if device == "cuda":
+            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
+            baseline_allocated = torch.cuda.memory_allocated(device)
+            baseline_reserved = torch.cuda.memory_reserved(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
             _predict_full_doc_clusters(d, _stage_a_clusters_for_doc(d, scorer, device, window), cluster_matcher, device)
         if device == "cuda":
             torch.cuda.synchronize()
         rt_c = (time.perf_counter() - t0) * 1000
-        vr_c = torch.cuda.max_memory_allocated(device) / 1e6 if device == "cuda" else 0.0
         if device == "cuda":
+            vr_c_incr_alloc = (torch.cuda.max_memory_allocated(device) - baseline_allocated) / 1e6
+            vr_c_incr_rsv = (torch.cuda.memory_reserved(device) - baseline_reserved) / 1e6
+            vr_c_total_rsv = torch.cuda.memory_reserved(device) / 1e6
+        else:
+            vr_c_incr_alloc = vr_c_incr_rsv = vr_c_total_rsv = 0.0
+            
+        if device == "cuda":
+            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
+            baseline_allocated = torch.cuda.memory_allocated(device)
+            baseline_reserved = torch.cuda.memory_reserved(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
             ctx = torch.from_numpy(d["ctx_vecs"]).to(device).float()
@@ -1474,7 +1567,12 @@ def write_diagnostics(
         if device == "cuda":
             torch.cuda.synchronize()
         rt_b = (time.perf_counter() - t0) * 1000
-        vr_b = torch.cuda.max_memory_allocated(device) / 1e6 if device == "cuda" else 0.0
+        if device == "cuda":
+            vr_b_incr_alloc = (torch.cuda.max_memory_allocated(device) - baseline_allocated) / 1e6
+            vr_b_incr_rsv = (torch.cuda.memory_reserved(device) - baseline_reserved) / 1e6
+            vr_b_total_rsv = torch.cuda.memory_reserved(device) / 1e6
+        else:
+            vr_b_incr_alloc = vr_b_incr_rsv = vr_b_total_rsv = 0.0
 
         rows.append(
             {
@@ -1493,8 +1591,12 @@ def write_diagnostics(
                 "conll_Aalone": round(_score_one_doc(d["name"], d["sentences"], key, resp_a), 4),
                 "runtime_C_ms": round(rt_c, 3),
                 "runtime_B_ms": round(rt_b, 3),
-                "vram_C_mb": round(vr_c, 1),
-                "vram_B_mb": round(vr_b, 1),
+                "vram_C_incr_alloc_mb": round(vr_c_incr_alloc, 1),
+                "vram_C_incr_rsv_mb": round(vr_c_incr_rsv, 1),
+                "vram_C_total_rsv_mb": round(vr_c_total_rsv, 1),
+                "vram_B_incr_alloc_mb": round(vr_b_incr_alloc, 1),
+                "vram_B_incr_rsv_mb": round(vr_b_incr_rsv, 1),
+                "vram_B_total_rsv_mb": round(vr_b_total_rsv, 1),
             }
         )
 
@@ -1546,8 +1648,12 @@ def write_diagnostics(
         "recall_gap_ge3": round(sum(v for g, v in gap_ok.items() if g >= 3) / gap3_tot, 4) if gap3_tot else 0.0,
         "runtime_C_ms_total": round(sum(r["runtime_C_ms"] for r in rows), 1),
         "runtime_B_ms_total": round(sum(r["runtime_B_ms"] for r in rows), 1),
-        "peak_vram_C_mb": round(max(r["vram_C_mb"] for r in rows), 1),
-        "peak_vram_B_mb": round(max(r["vram_B_mb"] for r in rows), 1),
+        "vram_C_incr_alloc_peak_mb": round(max(r["vram_C_incr_alloc_mb"] for r in rows), 1),
+        "vram_C_incr_rsv_peak_mb": round(max(r["vram_C_incr_rsv_mb"] for r in rows), 1),
+        "vram_C_total_rsv_peak_mb": round(max(r["vram_C_total_rsv_mb"] for r in rows), 1),
+        "vram_B_incr_alloc_peak_mb": round(max(r["vram_B_incr_alloc_mb"] for r in rows), 1),
+        "vram_B_incr_rsv_peak_mb": round(max(r["vram_B_incr_rsv_mb"] for r in rows), 1),
+        "vram_B_total_rsv_peak_mb": round(max(r["vram_B_total_rsv_mb"] for r in rows), 1),
         "trained_params": p_trained,
     }
     sum_path = MODELS_DIR / "summary_by_window.csv"
@@ -1640,15 +1746,19 @@ def _lex_matrix(lc: list, rc: list, lgi, rgi, mention_tokens: list, idf: dict) -
     return out
 
 
-def _lex_for_pair(d: dict, ki: int, kj: int, lc: list, rc: list, lgi, rgi, device: str) -> torch.Tensor:
+def _lex_for_pair(d: dict, ki: int, kj: int, lc: list, rc: list, lgi, rgi, device: str, allow_cache: bool = True) -> torch.Tensor:
     # memoized per (window-pair) — lexical features are constant across epochs
+    # allow_cache=False forces recomputation (needed for iterative cascade where cluster structure changes)
     if "mention_tokens" not in d:
         _build_lexical([d])
-    cache = d.setdefault("_lex", {})
-    key = (ki, kj)
-    if key not in cache:
-        cache[key] = _lex_matrix(lc, rc, lgi, rgi, d["mention_tokens"], d["mention_idf"])
-    return torch.from_numpy(cache[key]).to(device)
+    if allow_cache:
+        cache = d.setdefault("_lex", {})
+        key = (ki, kj)
+        if key not in cache:
+            cache[key] = _lex_matrix(lc, rc, lgi, rgi, d["mention_tokens"], d["mention_idf"])
+        return torch.from_numpy(cache[key]).to(device)
+    # No caching: compute on-the-fly for iterative cascade
+    return torch.from_numpy(_lex_matrix(lc, rc, lgi, rgi, d["mention_tokens"], d["mention_idf"])).to(device)
 
 
 def _stage_b_losses(cluster_matcher, pending: list) -> list:
@@ -1696,15 +1806,18 @@ def train_stage_b(
     weight_decay: float = 0.1,
     head: str = "cluster",
     hard_neg: bool = False,
+    hard_neg_weight: float = 3.0,
+    use_structured: bool = True,
+    iterative: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
 ) -> None:
-    print(f"\nTraining Stage B matcher... (window={window}, subset={subset}, head={head}, hard_neg={hard_neg})")
+    print(f"\nTraining Stage B matcher... (window={window}, subset={subset}, head={head}, iterative={iterative})")
     ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset)
     if head == "mention":
         ckpt_b = ckpt_b.replace(".pt", "_ment.pt")
-    if hard_neg:
-        ckpt_b = ckpt_b.replace(".pt", "_hn.pt")
+    if iterative:
+        ckpt_b = ckpt_b.replace(".pt", "_iter.pt")
     nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
     docs = build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n)
     docs = _filter_docs(docs, subset)
@@ -1747,9 +1860,10 @@ def train_stage_b(
         len(per_window) * (len(per_window) - 1) // 2 for per_window in train_clusters if per_window
     )
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
-    cluster_matcher = (MentionMatcher(dropout=dropout) if head == "mention" else ClusterMatcher(dropout=dropout)).to(
-        device
-    )
+    if head == "mention":
+        cluster_matcher = MentionMatcher(dropout=dropout, iterative=iterative).to(device)
+    else:
+        cluster_matcher = ClusterMatcher(dropout=dropout, use_structured=use_structured).to(device)
     if eval_only:
         cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
         cluster_matcher.eval()
@@ -1912,5 +2026,14 @@ def train_stage_b(
 
 
 if __name__ == "__main__":
-    # mention-level Stage B (no subsampling) on the all8k Stage A head
-    train_stage_b(window=256, subset="all8k", head="mention", dropout=0.2)
+    # Mention-level Stage B: current best (85.56 F1 on test)
+    # Clean baseline without structured features, hard negatives, or iterative cascade
+    train_stage_b(
+        window=256,
+        subset="all8k",
+        head="mention",
+        dropout=0.2,
+        iterative=False,      # FAILED: 84.89 F1 (-0.67)
+        hard_neg=False,       # FAILED: no benefit, hurts recall
+        use_structured=False, # N/A for mention head
+    )

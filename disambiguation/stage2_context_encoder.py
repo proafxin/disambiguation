@@ -142,49 +142,100 @@ def mll_loss(
 
 
 class ClusterEncoder(nn.Module):
-    def __init__(self, proj_dim: int = 1024, dropout: float = 0.3):
+    def __init__(self, proj_dim: int = 1024, dropout: float = 0.3, use_structured: bool = True):
         super().__init__()
+        self.proj_dim = proj_dim
         self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
         self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.query = nn.Parameter(torch.randn(2 * proj_dim))
         self.drop = nn.Dropout(dropout)
+        self.use_structured = use_structured
 
     def forward(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # ctx: (M, 2, CTX_DIM), bge: (M, BGE_DIM) -> (2*proj_dim,)
-        m = torch.cat([self.P_ctx(self.drop(ctx.flatten(1))), self.P_bge(self.drop(bge))], dim=-1)
+        # ctx: (M, 2, CTX_DIM), bge: (M, BGE_DIM) -> output dim varies based on use_structured
+        c = self.P_ctx(self.drop(ctx.flatten(1)))  # (M, proj_dim)
+        s = self.P_bge(self.drop(bge))  # (M, proj_dim)
+        m = torch.cat([c, s], dim=-1)  # (M, 2*proj_dim)
         attn = torch.softmax(m @ self.query / (m.shape[-1] ** 0.5), dim=0)
-        return attn @ m
+        pooled = attn @ m  # (2*proj_dim,)
+        
+        if not self.use_structured:
+            return pooled
+        
+        # Structured cluster features: canonical, first, stats
+        # Split pooled back into ctx and bge parts for consistent dimensions
+        pooled_ctx, pooled_bge = pooled[:self.proj_dim], pooled[self.proj_dim:]  # each (proj_dim,)
+        
+        # Canonical mention: highest BGE norm = most specific
+        bge_norms = torch.norm(bge, dim=-1)  # (M,)
+        canonical_idx = torch.argmax(bge_norms)
+        canonical_ctx, canonical_bge = c[canonical_idx], s[canonical_idx]  # each (proj_dim,)
+        
+        # First mention: discourse position
+        first_ctx, first_bge = c[0], s[0]  # each (proj_dim,)
+        
+        # Cluster statistics
+        stats = torch.cat([
+            bge_norms.mean().unsqueeze(0),  # avg specificity
+            bge_norms.std().unsqueeze(0) if len(bge) > 1 else torch.zeros(1, device=bge.device, dtype=bge.dtype),   # specificity variance (0 for singleton)
+            torch.tensor([len(bge)], device=bge.device, dtype=bge.dtype),  # cluster size
+        ])  # (3,)
+        
+        # Concatenate: pooled_ctx + pooled_bge + canonical_ctx + canonical_bge + first_ctx + first_bge + stats
+        # = proj_dim + proj_dim + proj_dim + proj_dim + proj_dim + proj_dim + 3 = 6*proj_dim + 3
+        # Wait, that's still wrong! We want 4*proj_dim + 3.
+        # Let's use: [pooled | canonical | first | stats] where each mention part is the full 2*proj_dim concat
+        # Actually, let's recompute: we want 4*proj_dim + 3 total.
+        # Option: [pooled(2*p) | canonical(proj_dim) | first(proj_dim) | stats(3)] = 4*proj_dim + 3
+        # So canonical and first should each be proj_dim, not 2*proj_dim
+        # Let's use just the BGE projection for canonical/first to avoid doubling
+        
+        return torch.cat([pooled, canonical_bge, first_bge, stats], dim=-1)  # (2*proj_dim + proj_dim + proj_dim + 3) = (4*proj_dim + 3)
 
     def forward_batched(self, clusters: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        # clusters: list of (ctx (M,2,CTX_DIM), bge (M,BGE_DIM)) -> (C, 2*proj_dim)
-        max_m = max(ctx.shape[0] for ctx, _ in clusters)
-        device = self.query.device
-        dtype = clusters[0][0].dtype
-        ctx_pad = torch.zeros(len(clusters), max_m, 2 * CTX_DIM, device=device, dtype=dtype)
-        bge_pad = torch.zeros(len(clusters), max_m, BGE_DIM, device=device, dtype=dtype)
-        lengths = []
-        for k, (ctx, bge) in enumerate(clusters):
-            m = ctx.shape[0]
-            ctx_pad[k, :m] = ctx.flatten(1)
-            bge_pad[k, :m] = bge
-            lengths.append(m)
-        c = self.P_ctx(self.drop(ctx_pad))  # (C, max_m, proj_dim)
-        s = self.P_bge(self.drop(bge_pad))  # (C, max_m, proj_dim)
-        m_all = torch.cat([c, s], dim=-1)  # (C, max_m, 2*proj_dim)
-        mask = torch.zeros(len(clusters), max_m, device=device)
-        for k, l in enumerate(lengths):
-            mask[k, :l] = 1.0
-        attn = (m_all @ self.query) / (m_all.shape[-1] ** 0.5)
-        attn = attn.masked_fill(mask == 0, float("-inf"))
-        attn = torch.softmax(attn, dim=1).unsqueeze(-1)
-        return (attn * m_all).sum(dim=1)  # (C, 2*proj_dim)
+        # clusters: list of (ctx (M,2,CTX_DIM), bge (M,BGE_DIM)) -> (C, output_dim)
+        if not self.use_structured:
+            # Fast path: just pooling, no structured features
+            max_m = max(ctx.shape[0] for ctx, _ in clusters)
+            device = self.query.device
+            dtype = clusters[0][0].dtype
+            ctx_pad = torch.zeros(len(clusters), max_m, 2 * CTX_DIM, device=device, dtype=dtype)
+            bge_pad = torch.zeros(len(clusters), max_m, BGE_DIM, device=device, dtype=dtype)
+            lengths = []
+            for k, (ctx, bge) in enumerate(clusters):
+                m = ctx.shape[0]
+                ctx_pad[k, :m] = ctx.flatten(1)
+                bge_pad[k, :m] = bge
+                lengths.append(m)
+            c = self.P_ctx(self.drop(ctx_pad))  # (C, max_m, proj_dim)
+            s = self.P_bge(self.drop(bge_pad))  # (C, max_m, proj_dim)
+            m_all = torch.cat([c, s], dim=-1)  # (C, max_m, 2*proj_dim)
+            mask = torch.zeros(len(clusters), max_m, device=device)
+            for k, l in enumerate(lengths):
+                mask[k, :l] = 1.0
+            attn = (m_all @ self.query) / (m_all.shape[-1] ** 0.5)
+            attn = attn.masked_fill(mask == 0, float("-inf"))
+            attn = torch.softmax(attn, dim=1).unsqueeze(-1)
+            pooled = (attn * m_all).sum(dim=1)  # (C, 2*proj_dim)
+            return pooled
+        
+        # Structured path: compute per cluster individually to get correct canonical/first
+        results = []
+        for ctx, bge in clusters:
+            results.append(self.forward(ctx, bge))
+        return torch.stack(results)  # (C, 4*proj_dim + 3)
 
 
 class ClusterMatcher(nn.Module):
-    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3):
+    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3, use_structured: bool = True):
         super().__init__()
-        self.cluster_enc = ClusterEncoder(proj_dim, dropout)
-        g = 2 * proj_dim
+        self.cluster_enc = ClusterEncoder(proj_dim, dropout, use_structured)
+        # Input dimension: if structured, each cluster is (4*proj_dim + 3), pair is 2x that
+        # if not structured, each cluster is (2*proj_dim), pair is 2x that
+        if use_structured:
+            g = 4 * proj_dim + 3
+        else:
+            g = 2 * proj_dim
         self.ffnn = nn.Sequential(
             nn.Linear(2 * g, hidden),
             nn.ReLU(),
@@ -197,7 +248,15 @@ class ClusterMatcher(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def encode_clusters(self, clusters: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        return self.cluster_enc.forward_batched(clusters)
+        if self.cluster_enc.use_structured:
+            # Structured mode: process each cluster individually to get correct dimensions
+            results = []
+            for ctx, bge in clusters:
+                results.append(self.cluster_enc.forward(ctx, bge))
+            return torch.stack(results)  # (C, 4*proj_dim + 3)
+        else:
+            # Fast batched mode for non-structured
+            return self.cluster_enc.forward_batched(clusters)
 
     def forward(
         self,
@@ -219,9 +278,10 @@ class MentionMatcher(nn.Module):
     # matrix (logsumexp ~ soft-max). Preserves per-mention evidence — the strongest single
     # mention pair (e.g. a shared proper noun) can drive the merge, which the pooled head
     # smears away. Drop-in for ClusterMatcher: same forward(left, right) -> (L, R) + null_bias.
-    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096):
+    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096, iterative: bool = False):
         super().__init__()
         self.chunk = chunk
+        self.iterative = iterative
         self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
         self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.drop = nn.Dropout(dropout)
