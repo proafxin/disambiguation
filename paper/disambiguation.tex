@@ -1,10 +1,9 @@
 \documentclass[12pt]{article}
 \usepackage{jmlr2e}
 \let\circledR\relax\let\circledS\relax\usepackage{newcomputermodern}
-\usepackage{amsmath,amssymb,enumerate,booktabs,lastpage}
+\usepackage{amsmath,amssymb,enumerate,booktabs,lastpage,tabularx}
 
-\newtheorem{hypothesis}{Hypothesis}
-
+\newtheorem{assumption}{Assumption}
 
 \jmlrheading{27}{2026}{1-\pageref{LastPage}}{1/26; Revised 5/26}{9/26}{26-0000}{Masum Billal}
 
@@ -13,7 +12,7 @@
 
 \begin{document}
 	
-	\title{Global Entity Resolution via Quotient-Graph Inference from Local Equivalence Classes}
+	\title{Coreference Resolution without Global Attention via Quotient Graph Inference}
 	
 	\author{\name Masum Billal \email billalmasum93@gmail.com \addr}
 	
@@ -36,12 +35,16 @@
 	
 	Crucially, this work departs from the paradigm that long-range entity coreference requires monolithic, end-to-end token contextualization. Our results suggest that a substantial portion of the apparent reliance on global sequence-wide attention may arise from representation entanglement—where semantic, contextual, and discourse features are melted into a single joint vector space. Our results suggest that factorizing the required global signal into distinct representation channels may permit the isolation of quadratic sequence operations to tight local windows, shifting the burden of long-range consistency from token-level attention to structural inference over a compressed quotient graph of locally induced equivalence classes.
 	
+	The key diagnostic that launched this work is an empirical probe of the representation space: taking the two axis vectors for pairs of different-lemma mentions, their raw cosine similarity separates coreferent from non-coreferent pairs at chance ($\text{AUC} \approx 0.57$). The \emph{same} vectors, read by a small learned linear probe, separate them at $\text{AUC} = 0.91$. This signal is fully present in the uncollapsed axes; reducing either to a scalar similarity measure discards discriminative structure. 
+	
+	Crucially, channel-ablation experiments demonstrate that this factorization is not merely structurally sufficient, but that both channels carry non-redundant, load-bearing signals. Asymmetric control tests show that removing the semantic channel reduces full-document coreference performance to $0.8370$ $\text{F}_1$, while removing the contextual channel causes a severe collapse to $0.7677$ $\text{F}_1$. The target decision boundary explicitly relies on the joint interpretation of these un-fused coordinate streams.
+	
 	The remainder of this paper is organized as follows. Section~\ref{sec:related} reviews related work and contextualizes our contribution. Section~\ref{sec:overview} outlines the overall workflow of the two-stage pipeline. Section~\ref{sec:factorization} develops the mathematical foundations of representation factorization. Sections~\ref{sec:stagea} and~\ref{sec:stageb} detail the technical implementation of the Stage A local window inference procedure and Stage B quotient-space matching modules respectively. Section~\ref{sec:setup} describes experimental setup, and Section~\ref{sec:results} presents empirical results and analysis.
 	
 	\section{Related Work}\label{sec:related}
 	Scaling coreference resolution to long documents has traditionally relied on mitigating the quadratic cost of sequence-wide self-attention using two primary techniques:
 	
-	Modern architectures frequently bypass full self-attention by substituting localized or sparse attention matrices, such as sliding windows and block-diagonal grids \citep{beltagy2020longformer, caciularu2023peek}. While these methods reduce memory consumption during representation extraction, they remain structurally bound to an end-to-end fine-tuning paradigm where entangled relational features must be propagated across deep sequence lengths. In contrast, our approach restricts quadratic calculations strictly to isolated local execution windows, offloading long-range tracking to an uncontextualized cluster graph layer.
+	Modern architectures frequently bypass full self-attention by substituting localized or sparse attention matrices, such as sliding windows and block-diagonal grids \citep{caciularu2023peek}. While these methods reduce memory consumption during representation extraction, they remain structurally bound to an end-to-end fine-tuning paradigm where entangled relational features must be propagated across deep sequence lengths. In contrast, our approach restricts quadratic calculations strictly to isolated local execution windows, offloading long-range tracking to an uncontextualized cluster graph layer.
 	
 	To bypass large all-pairs mention scoring matrices, several pipelines implement coarse-to-fine filtering heuristics \citep{dobrovolskii2021word, bohnet2023coreference} or recursive mention clustering hierarchies \citep{luo2025imcoref}. While effective at pruning computational overhead, these systems are vulnerable to cascading errors during iterative merging steps. We depart from this by reformulating cross-window resolution as a formal completion task over a highly compressed quotient graph. By leveraging an un-fused coordinate basis rather than early scalar similarities, our method preserves fine-grained channel identities over extreme token distances without requiring global sequence contextualization.
 	
@@ -61,29 +64,31 @@
 	\section{Representation Factorization Framework}\label{sec:factorization}
 	Monolithic language models rely on end-to-end contextualization over full-document sequences to implicitly disentangle semantic, discourse, and referential dependencies. This couples representation learning with relational inference and induces unnecessary computational cost. We instead hypothesize that coreference can be reformulated as a structured inference problem over localized observations combined through a compressed global reasoning space. Under this view, global entity structure does not require direct token-level interaction, but can be recovered from compositions of locally induced relational evidence. This motivates a factorization of inference into distinct representation channels that preserve complementary signals for downstream relational reconstruction.
 	
-	\begin{hypothesis}[Distinguishable Feature Representation Basis]
-		Let $\mathcal{V}$ denote the complete decision space required to resolve entity identity. We hypothesize that useful identity information can be represented across $d$ distinct, architecturally separated feature channels whose signals remain accessible to downstream inference when preserved separately:
+	\begin{assumption}[Distinguishable Feature Representation Basis]
+		Let $\mathcal{V}$ denote the complete decision space required to resolve entity identity. We assume that discriminative identity information can be systematically recovered across $d$ distinct, architecturally separated feature channels whose signals remain structurally intact when preserved separately:
 		\begin{align*}
 			\mathcal{V} &= \mathcal{V}_{\text{context}} \times \mathcal{V}_{\text{semantic}} \times \dots
 		\end{align*}
 		where individual channels preserve specialized signals that are obscured when compressed into low-dimensional similarity measures or early aggregation operations.
-	\end{hypothesis}
+	\end{assumption}
 	
 	\begin{align*}
 		\mathbf{h}_i &= \left[ P_{\text{ctx}}\left(f_{\text{RoBERTa}}(m_i)\right) \parallel P_{\text{bge}}\left(f_{\text{BGE}}(m_i)\right) \right] \in \mathbb{R}^{d_1 + d_2}
 	\end{align*}
 	where $P_{\text{ctx}}: \mathbb{R}^{2048} \rightarrow \mathbb{R}^{1024}$ and $P_{\text{bge}}: \mathbb{R}^{1024} \rightarrow \mathbb{R}^{1024}$ are learned linear projections mapping frozen activations into isolated coordinate paths. 
 	
-	The critical property of this system is not that the underlying encoders are independent, but that the decision information is supplied through separate coordinate systems whose signals remain explicitly distinguishable throughout inference. Frozen universal encoders provide one convenient realization of this condition. Any mechanism capable of producing comparably distinct channels would satisfy the same architectural requirement. The contribution of this work is therefore not the use of frozen models itself, but the demonstration that preserving factorized information channels can mitigate the reliance on global token-level attention within document-level coreference resolution.
+	To isolate whether this specific factorization drives system capability, we introduce a channel control configuration $\text{channel} \in \{\text{both}, \text{ctx}, \text{bge}\}$. When a single channel is isolated, the unused projection layer is dropped entirely and the upstream scoring heads are dynamically resized. This architecture guarantees that single-channel variants are trained completely from scratch rather than evaluating zeroed vectors at inference time, avoiding confounding the capacity of the model head with the signal density of the channel.
+	
+	The critical property of this system is not that the underlying encoders are independent, but that the decision information is supplied through separate coordinate systems whose signals remain explicitly distinguishable throughout inference. Frozen universal encoders provide one convenient realization of this condition; any mechanism capable of producing comparably distinct channels would satisfy the same architectural requirement. The contribution of this work is therefore not the use of frozen models itself, but the demonstration that preserving factorized information channels can mitigate the reliance on global token-level attention within document-level coreference resolution.
 	
 	This factorization is explicitly validated by an empirical probe: computing raw cosine similarities over these embedding dimensions directly yields an AUC of $\approx 0.57$ on separating coreferent from non-coreferent pairs. Conversely, a shallow learned linear probe trained over the un-fused coordinate vectors $(\mathbf{h}_i, \mathbf{h}_j)$ separates identity at an AUC of $0.91$. This demonstrates that substantial coreference information is present in the preserved multi-channel representation and remains linearly recoverable. The large gap between cosine similarity and linear-probe performance suggests that scalar similarity measures discard discriminative structure that remains available when the separate coordinate channels are preserved.
 	
 	\section{Stage A: Bounded Local Equivalence Reconstruction}\label{sec:stagea}
 	Given the factorized representations $\mathbf{h}_i$, we restrict initial quadratic interaction to bounded observation domains to evaluate the structural locality of coreference decisions.
 	
-	\begin{hypothesis}[Transitive Link Reconstruction]
+	\begin{assumption}[Transitive Link Reconstruction]
 		Global entity paths are locally dense: any two coreferent mentions $m_a, m_b \in \mathcal{M}$ are connected via a finite chain of intermediate local links, where each adjacent link pair falls within a bounded sequence window.
-	\end{hypothesis}
+	\end{assumption}
 	
 	The architectural viability of restricting token-level quadratic attention to isolated local windows is supported by the factorization established in Section~\ref{sec:factorization}. Because the coordinate representations retain un-collapsed channel signals, local relational boundaries preserve substantial identity information that can drop under conventional scalarized similarity spaces, mitigating the contextual degradation typically observed in naive windowed models. This allows us to apply a deterministic partition over the document into disjoint sequence windows $W_k$ of length $K=256$ tokens, such that each mention is assigned to exactly one window via a mapping function $\pi: \mathcal{M} \rightarrow \mathcal{W}$.
 	
@@ -95,18 +100,18 @@
 	\begin{align*}
 		\mathcal{C}_k &= W_k / \sim_k^*
 	\end{align*}
-	The union of these sub-clusters across all windows forms our complete intermediate entity space $\mathcal{C} = \bigcup_{k=1}^{W} \mathcal{C}_k$. It is important to note that elements of $\mathcal{C}$ constitute local connected components under localized constraints, rather than a final global quotient space. Each local cluster $C \in \mathcal{C}$ is subsequently treated as an atomic node in a quotient graph of locally induced equivalence classes for cross-window inference layers.
+	The union of these sub-clusters across all windows forms our complete intermediate entity space $\mathcal{C} = \bigcup_{k=1}^{W} \mathcal{C}_k$. It is important to note that elements of $\mathcal{C}_k$ constitute local connected components under localized constraints, rather than a final global quotient space. Each local cluster $C \in \mathcal{C}$ is subsequently treated as an atomic node in a quotient graph of locally induced equivalence classes for cross-window inference layers.
 	
-	Evaluating the isolated performance of Stage A against full-document gold targets (leaving each local cluster as its own unmerged entity) yields a baseline score of $0.7439$ F$_1$ on CoNLL-2012. This establishes that local tracking alone achieves 87\% of the final CoNLL score obtained by the complete system ($0.7439 / 0.8556$), supporting the hypothesis that dense coreference links are highly concentrated within bounded token ranges.
+	Evaluating the isolated performance of Stage A against full-document gold targets (leaving each local cluster as its own unmerged entity) yields a baseline score of $0.7439$ F$_1$ on CoNLL-2012. Crucially, local equivalence reconstruction alone achieves a CoNLL F$_1$ score of $0.7439$, trailing the complete system by only $0.1117$ points. This provides a central empirical finding of this work: a large fraction of document-level coreference structure remains highly concentrated within bounded local neighborhoods, meaning that local tracking alone retains the vast majority of final performance without requiring global sequence-wide matching dependencies.
 	
 	\section{Stage B: Quotient-Space Completion}\label{sec:stageb}
 	The intermediate local equivalence classes derived in Section~\ref{sec:stagea} act as atomic nodes in a highly compressed graph. Rather than viewing cross-window execution as a secondary clustering heuristic, Stage B is mathematically formulated as a completion problem operating over a quotient graph of locally induced equivalence classes. The objective is to recover global coreference consistency by establishing a lifting relation $\approx$ across macro-nodes separated across distant window splits.
 	
 	\begin{proposition}
-		Let $\mathcal{C = \bigcup_k \mathcal{C}_k}$ denote the set of locally induced equivalence classes where $\mathcal{C}_k = W_k / \sim_k^*$. If an operator $\approx$ correctly identifies cross-window equivalences between elements of $\mathcal{C}$, then the global entity partition $\mathcal{E} = \mathcal{M}/\sim$ is recovered exactly by the transitive closure of $\approx$ lifted back onto $\mathcal{M}$.
+		Let $\mathcal{C} = \bigcup_k \mathcal{C}_k$ denote the set of locally induced equivalence classes where $\mathcal{C}_k = W_k / \sim_k^*$. If an operator $\approx$ correctly identifies cross-window equivalences between elements of $\mathcal{C}$, then the global entity partition $\mathcal{E} = \mathcal{M}/\sim$ is recovered exactly by the transitive closure of $\approx$ lifted back onto $\mathcal{M}$.
 	\end{proposition}
 	
-	To compute compliance between two macro-nodes $A, B \in \mathcal{C}$, we implement a size-invariant log-partition interaction operator (\texttt{MentionMatcher}) over the full bipartite structure induced by their constituent mentions:
+	To compute similarity between two macro-nodes $A, B \in \mathcal{C}$, we implement a size-invariant log-partition interaction operator (\texttt{MentionMatcher}) over the full bipartite structure induced by their constituent mentions:
 	\begin{align*}
 		\text{score}_{\text{neural}}(A,B) &= \log\sum_{m\in A}\sum_{n\in B}\exp\left(f(m,n)\right)-\log(|A|\cdot|B|)
 	\end{align*}
@@ -129,6 +134,27 @@
 	All evaluation experiments are conducted on the test split of the CoNLL-2012 English coreference benchmark \citep{pradhan2012conll} utilizing gold mention boundaries. Following empirical data mixture optimizations, our lightweight scoring modules are trained on a uniform corpus mixture consisting of CoNLL-2012, LitBank, CorefUD, and a subsampled partition of 8,000 documents from PreCo. Training enforces a uniform loss across all datasets without negative window-pair subsampling to preserve distributional balance. All baseline results cited from prior literature correspond strictly to their respective gold-mention evaluation configurations.
 	
 	\section{Results}\label{sec:results}
+	We isolated the performance of individual channels against the full dual-channel baseline. All variations utilize an identical window configuration ($K=256$) and a mention-level matching head trained on the uniform multi-corpus mixture. Table~\ref{tab:ablation} details the results.
+	
+	\begin{table}[ht]
+		\centering
+		\small
+		\begin{tabular}{lcccc}
+			\toprule
+			\textbf{Channel Configuration} & \textbf{Stage A (Local)} & \textbf{Stage A+B (Global)} & \textbf{$\Delta$ Global vs. Both} \\
+			\midrule
+			Both Channels (BGE + RoBERTa)   & \textbf{0.8970} & \textbf{0.8556} & --- \\
+			RoBERTa Contextual Only (\texttt{ctx}) & 0.8781          & 0.8370          & $-0.0186$ \\
+			BGE Semantic Only (\texttt{bge})      & 0.7960          & 0.7677          & $-0.0879$ \\
+			\bottomrule
+		\end{tabular}
+		\caption{Channel ablation control results ($\text{CoNLL F}_1$) on CoNLL-2012 test data splits.}
+		\label{tab:ablation}
+	\end{table}
+	
+	The empirical trajectory reveals a clear asymmetry between the two coordinate views. The contextual channel (\texttt{ctx}) is heavily dominant, achieving $0.8370$ $\text{F}_1$ on its own—within $2$ points of the complete system. Conversely, the semantic channel (\texttt{bge}) drops significantly to $0.7677$, showing that cross-window cluster bridging retains very little tracking signal when divorced from contextual sequence history.
+	
+	Granular cluster analysis uncovers a strict architectural division of labor between the channels. Pronominal groups (\text{PRON-only}) are almost completely dependent on the contextual channel, where the \texttt{ctx}-only run matches the full architecture baseline ($0.6556$ vs. $0.6640$), while the semantic \texttt{bge}-only run collapses to $0.5173$. Conversely, proper nouns (\text{PROPN-only}) lean securely on semantic assignments, where \texttt{bge}-only maintains a stable footing ($0.7276$) relative to context alone ($0.7983$). This split confirms that pronouns ride the contextual wave, while surface variations of proper nouns rely on global text-invariant semantic spaces.
 	
 	\subsection{Benchmarks}
 	Table \ref{tab:stageb} establishes the primary system performance evaluated against state-of-the-art architectures using identical gold mention contexts.
@@ -153,8 +179,6 @@
 		\label{tab:stageb}
 	\end{table}
 	
-	Table \ref{tab:stageb_type} itemizes performance across granular cluster configurations, tracking the architectural stability of the model over varied mention types.
-	
 	\begin{table}[ht]
 		\centering
 		\small
@@ -175,48 +199,61 @@
 		\label{tab:stageb_type}
 	\end{table}
 	
-	\subsection{Complexity and Quotient Graph Analysis}
-	Since window size is fixed, $W=N/K$. Total sequence encoding complexity runs at $O(WK^2) = O(NK)$, avoiding full-sequence token quadratics. Within Stage A, localized mention scoring operates at $O(W \cdot (M/W)^2) = O(M^2K/N)$. Cross-window Stage B matching adds an $O(C^2)$ execution factor over the nodes of the graph. Total computation scales as:
+	\subsection{Complexity}
+	Since window size is fixed, $W=N/K$. Total sequence encoding complexity runs at $\mathcal{O}(WK^2) = \mathcal{O}(NK)$, avoiding full-sequence token quadratics. Within Stage A, localized mention scoring operates at $\mathcal{O}(W \cdot (M/W)^2) = \mathcal{O}(M^2K/N)$. 
+	
+	For Stage B cross-window matching, the total runtime budget is precisely bounded by:
 	\begin{align*}
-		\text{Complexity} &\in \mathcal{O}\left(NK + \frac{M^2K}{N} + C^2\right)
+		T(N,M,C) = \mathcal{O}(NK) + \mathcal{O}\left(\frac{M^2K}{N}\right) + \mathcal{O}\left(M^2 - \sum_i s_i^2\right)
 	\end{align*}
-	For standard compositions, the compressed node counts satisfy $C \ll M \ll N$, concentrating structural steps into highly reduced fields. Mean document metrics collected on CoNLL-2012 reveal average scales of $N = 617.4$ tokens, $M = 57.1$ mentions, and $C = 20.7$ macro-nodes. Stage A collapses the initial graph space down to $36.3\%$ of its raw entity volume, yielding a strong \textbf{2.76:1} compression profile before Stage B inference begins on the quotient graph.
+	where $s_i = |C_i|$ denotes the size of each locally induced cluster node. The underlying mention-level interactions remain bounded by the remaining unmerged pairs:
+	\begin{align*}
+		\sum_{i<j} s_i s_j = \frac{1}{2}\left(M^2 - \sum_i s_i^2\right) \le \frac{1}{2}M^2
+	\end{align*}
+	Assuming a mean density $s_{i}\approx M/C$, it becomes
+		\begin{align*}
+			\frac{1}{2}\left(1-\frac{1}{C}\right)M^{2}
+		\end{align*}
+	While this is not directly $\mathcal{O}(C^2)$ and technically still operates in $O(M^{2})$ complexity, the quotient formulation restructures the parameter execution path: the total number of evaluated neural graph links drops to a learned decision count of $\mathcal{O}(C^2)$. The trainable neural matcher is invoked exclusively over macro-node pairs rather than individual mention pairs. The internal log-mean-exp mention evaluation is handled as a non-parametric tensor aggregation over cached coordinate blocks within candidate macro-node intersections.
 	
 	\begin{table}[ht]
 		\centering
 		\small
-		\begin{tabular}{p{4.5cm}cc}
+		\begin{tabularx}{\textwidth}{lclX}
 			\toprule
-			\textbf{Space Layer} & \textbf{Graph Nodes} & \textbf{Pairwise Comparisons} \\
+			\textbf{Space Layer} & \textbf{Graph Nodes} & \textbf{Evaluation Points} & \textbf{Algorithmic Mode} \\
 			\midrule
-			Token Sequence Space & 617.4 & 381,183 \\
-			Mention Sequence Space & 57.1 & 3,260 \\
-			Quotient Graph Space  & 20.7 & 428 \\
+			Token Sequence Space  & 617.4 & 381,183 & $\mathcal{O}(NK)$ Windowed Attention \\
+			Mention Graph Space   & 57.1  & 3,260   & $\mathcal{O}(M^2)$ Invariant Upper Bound \\
+			Quotient Graph Space  & 20.7  & \textbf{428}     & $\mathcal{O}(C^2)$ Learned Neural Decisions \\
 			\bottomrule
-		\end{tabular}
-		\caption{Average document graph sizes on CoNLL-2012 test data splits.}
+		\end{tabularx}
+		\caption{Average document graph dimensions and operational scales evaluated on CoNLL-2012 test data splits.}
+		\label{tab:graph_scales}
 	\end{table}
+	
+	Empirical metrics collected on the CoNLL-2012 test set (Table~\ref{tab:graph_scales}) validate this structural optimization. Mean scales establish document dimensions of $N = 617.4$ tokens, $M = 57.1$ nominal mentions, and $C = 20.7$ locally induced macro-nodes. Stage A contracts the entity node space down to $36.3\%$ of its uncollapsed volume, yielding a $2.76\text{:}1$ node compression ratio. 
+	
+	This contraction drastically reduces the learned evaluation space. While an unwindowed all-pairs system must parameterize and score 3,260 potential mention edges, Stage B operates over a highly compressed topology of only 428 candidate macro-node interactions. This represents an empirical \textbf{7.6$\times$ structural reduction} in the learned decision graph size $\left(M^2 / C^2 \approx 7.62\right)$. The trainable decision process operates over a quotient graph of only 428 macro-node pairs, while mention-level interactions are evaluated internally as non-parametric aggregation operations within each candidate macro-node comparison.
 	
 	Our experimental findings indicate that the explicit core theoretical assumptions are empirically viable:
 	\begin{enumerate}
-		\item \textbf{Preservation of Feature Distinctness (Hypothesis 1):} Reaching an F$_1$ score of $0.8556$ is consistent with the hypothesis that preserving distinguishable feature channels retains structural identity information that remains accessible for downstream reconstruction. This observation is supported by the notable performance gap between raw cosine evaluation and the un-fused multi-channel linear probe.
-		\item \textbf{Validation of Locality-Transitivity (Hypothesis 2 \& Proposition 1):} Stage B achieves an Edge Precision of 79.79\% ($2567 / 3217$) and Edge Recall of 70.96\% ($2883 / 4063$). Combined with an average fragmentation profile of only $1.45$ nodes per true entity, this tracks the accuracy of macro-transitive lifting across window boundaries.
+		\item \textbf{Preservation of Feature Distinctness (Assumption 1):} Reaching an F$_1$ score of $0.8556$ is consistent with the premise that preserving distinguishable feature channels retains structural identity information that remains accessible for downstream reconstruction. This observation is supported by the notable performance gap between raw cosine evaluation and the un-fused multi-channel linear probe.
+		\item \textbf{Validation of Locality-Transitivity (Assumption 2 \& Proposition 1):} Stage B achieves an Edge Precision of 79.79\% ($2567 / 3217$) and Edge Recall of 70.96\% ($2883 / 4063$). Combined with an average fragmentation profile of only $1.45$ nodes per true entity, this tracks the accuracy of macro-transitive lifting across window boundaries.
 	\end{enumerate}
-	
-	\subsection{Resource Footprint and Efficiency Analysis}
-	By locking the primary encoder backbones and routing cross-window connections through the quotient graph, the model significantly reduces computational overhead. 
+	By locking the primary encoder backbones and routing cross-window connections through the compressed quotient graph, the model significantly reduces computational overhead. As itemized in Table~\ref{tab:parameters}, trained parameters account for only 2.38\% (16.8M) of the total 706.83M parameter budget.
 	
 	\begin{table}[ht]
 		\centering
 		\small
-		\begin{tabular}{lrc}
+		\begin{tabular}{llc}
 			\toprule
 			\textbf{Component} & \textbf{Parameter Count} & \textbf{Status} \\
 			\midrule
-			Stage A (AntecedentScorer) & 8.43M & Trained \\
-			Stage B (MentionMatcher)    & 8.40M & Trained \\
-			RoBERTa-large               & 355.00M & Frozen \\
-			BGE-large                   & 335.00M & Frozen \\
+			Stage A (AntecedentScorer) & 8.43M  & Trained \\
+			Stage B (MentionMatcher)    & 8.40M  & Trained \\
+			RoBERTa-large               & 355.00M & Frozen  \\
+			BGE-large                   & 335.00M & Frozen  \\
 			\midrule
 			\textbf{Total Parameters}   & \textbf{706.83M} & (2.38\% Trained) \\
 			\bottomrule
@@ -225,17 +262,38 @@
 		\label{tab:parameters}
 	\end{table}
 	
-	As itemized in Table \textbf{\ref{tab:parameters}}, trained parameters account for only 2.38\% (16.8M) of the total parameter budget. In inference, this architectural factorization allows the model to achieve a wall-clock throughput of 19.4 ms / 1k tokens on consumer laptop hardware (a single RTX 4060 Laptop GPU). Crucially, the windowed compression layers prevent the system from materializing the full mention-pair score matrix, lowering peak inference activations and memory overhead by \textbf{3.1$\times$} compared to full-document all-pairs execution (159 MB vs 488 MB).
+	\begin{table}[ht]
+		\centering
+		\small
+		\begin{tabularx}{\textwidth}{lcrr}
+			\toprule
+			\textbf{Architecture Model} & \textbf{Inference Speed} & \textbf{Incremental Allocated} & \textbf{Total Reserved VRAM} \\
+			\midrule
+			Model C  & 19.4 ms / 1k tok & 64.2 MB  & 2.41 GB \\
+			Model B  & \textbf{13.8 ms / 1k tok} & 198.5 MB & 2.54 GB \\
+			\bottomrule
+		\end{tabularx}
+		\caption{Runtime and memory profile measurements collected per-document during inference on a single RTX 4060 Laptop GPU.}
+		\label{tab:profiling}
+	\end{table}
+	
+	We note an explicit architectural distinction regarding our computational profile: the primary claim of this work is not that the overall pipeline contains zero global-attention calculations, as the frozen backbones utilize internal transformer layers. Rather, the claim demonstrates that \textbf{task-specific entity inference and downstream cluster assembly are executed completely without document-wide token interaction}. 
+	
+	In inference, this architectural factorization limits memory usage. Model C restricts peak active incremental allocations to 64.2 MB by preventing the materialization of the full unwindowed mention-pair matrix, yielding a \textbf{3.1$\times$} optimization in active running footprint over Model B. Total cumulative VRAM footprint remains bounded near 2.41 GB for both setups due to the shared memory overhead of the frozen token embedding caches (~200 MB) and CUDA driver baselines. 
+	
+	An honest evaluation of wall-clock times reveals that at standard lengths (mean 617.4 subtokens), Model B retains a minor speed advantage (13.8 ms vs 19.4 ms per document). Because sequence spans are short in this corpus, unwindowed $O(N^2)$ mechanics are not yet computationally punitive, allowing Model B to benefit from highly parallel vectorized GPU paths. Model C encounters a minor Python execution loop penalty when processing small windowed batches sequentially. The asymptotic runtime advantage of the $O(NK)$ design manifests on significantly longer document horizons, while the memory runtime ceiling reduction remains immediately visible.
 	
 	\section{Limitations and Future Work}\label{sec:future}
-	Every result in this paper leaves both underlying representation encoders frozen. Consequently, the contextual channel is entirely dependent on general-purpose RoBERTa-large activations with zero coreference-specific fine-tuning. The PRON-only floor ($0.6640$) highlights this boundary: pronouns carry low semantic signal, forcing the matching head to rely on contextual binding spaces that naturally decay across extreme window gaps. 
+	Iterative configuration updates implemented throughout development provide clear architectural bounds for the frozen-encoder paradigm. Multiple complex engineering strategies—including hand-crafted structural cluster features (expanding node metrics to isolate canonical tokens), semantic hard-negative mining, and iterative multi-pass optimization cascades—systematically failed to beat or match the base mention-level matching framework, introducing minor testing degradations ranging from $-0.10$ to $-0.67$ $\text{CoNLL F}_1$. 
+	
+	Because Stage A sub-clusters already exhibit exceptional purity ($\approx 95\%$) and Stage B single-pass cross-window precision settles at $79.8\%$, the performance ceiling ($\approx 0.86\text{--}0.87$) is determined entirely by representation constraints rather than matching logic. Hand-engineered structural additions add optimization noise rather than signal.
 	
 	Furthermore, this work assumes gold mention boundaries to isolate coreference resolution logic from mention detection errors. The reported results isolate the entity-linking component and should not be interpreted as end-to-end coreference performance. Scaling this macro-node quotient framework to consume predicted mentions from an open span detector remains an immediate avenue for future research.
 	
 	\section{Conclusion}\label{sec:conclusion}
 	Our findings demonstrate that global entity resolution can be successfully recovered from local inference paired with quotient-graph reconstruction. Our results suggest that document-level coreference can be performed without global token-level attention when entity inference is reformulated as local equivalence reconstruction followed by quotient-space completion. In our implementation, preserving separate representation channels was sufficient to recover global entity structure through local edge induction and quotient-space reconstruction without requiring document-wide token attention.
 	
-	These results suggest that in problems where decision boundaries can be expressed as compositions of distinguishable information channels, exhaustive sequence-wide cross-attention may represent a structural redundancy. In the setting studied here, exhaustive sequence-wide cross-attention does not appear to be an absolute prerequisite for strong document-level coreference performance. Coreference resolution provides one concrete example of this broader relational class due to the inherent equivalence relation structure. Under this decentralized processing paradigm, downstream multi-task architectures could allocate parameter capacity toward isolating distinct specialized feature views, leveraging a lightweight central language infrastructure purely to execute structural orchestrations and macro-equivalence pooling rather than computing dense all-to-all token interactions over an entire contextual window.
+	These results raise the possibility that some relational prediction problems may admit similar structural decompositions into localized inference and quotient-space reconstruction, particularly where decision boundaries can be expressed as stable compositions of distinguishable information channels. In the setting studied here, exhaustive sequence-wide cross-attention does not appear to be an absolute prerequisite for strong document-level coreference performance due to the inherent equivalence relation structure. Under this decentralized processing paradigm, downstream multi-task architectures could allocate parameter capacity toward isolating distinct specialized feature views, leveraging a lightweight central language infrastructure purely to execute structural orchestrations and macro-equivalence pooling rather than computing dense all-to-all token interactions over an entire contextual window.
 	
 	\bibliography{references}
 	

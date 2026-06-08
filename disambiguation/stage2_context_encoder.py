@@ -53,16 +53,6 @@ def encode_document_ctx(
     return F.normalize(ctx, p=2, dim=-1)
 
 
-def compute_mention_ctx_vecs(ctx: torch.Tensor, span_sub: np.ndarray) -> torch.Tensor:
-    # Returns (M, 2, CTX_DIM): (ctx_start, ctx_end) per mention.
-    M = len(span_sub)
-    out = torch.zeros(M, 2, ctx.shape[1], dtype=ctx.dtype, device=ctx.device)
-    for k, (s, e) in enumerate(span_sub):
-        out[k, 0] = ctx[int(s)]
-        out[k, 1] = ctx[int(e)]
-    return out
-
-
 # ── Stage A ───────────────────────────────────────────────────────────────────
 
 
@@ -127,122 +117,56 @@ class AntecedentScorer(nn.Module):
         return scores, ante_mask
 
 
-def mll_loss(
-    scores: torch.Tensor,
-    ante_mask: torch.Tensor,
-    cluster_id: torch.Tensor,
-    null_bias: torch.Tensor,
-) -> torch.Tensor:
-    M = scores.shape[0]
-    idx = torch.arange(M, device=scores.device)
-    neg = torch.finfo(scores.dtype).min
-    null_col = null_bias.expand(M, 1)
-    denom = torch.logsumexp(torch.cat([null_col, scores.masked_fill(~ante_mask, neg)], dim=1), dim=1)
-    gold = (cluster_id.unsqueeze(0) == cluster_id.unsqueeze(1)) & ante_mask
-    has_gold = gold.any(dim=1)
-    gold_num = torch.logsumexp(scores.masked_fill(~gold, neg), dim=1)
-    num = torch.where(has_gold, gold_num, null_bias.squeeze().expand(M))
-    return (denom - num)[idx >= 1].mean()
-
-
 # ── Stage B ───────────────────────────────────────────────────────────────────
 
 
 class ClusterEncoder(nn.Module):
-    def __init__(self, proj_dim: int = 1024, dropout: float = 0.3, use_structured: bool = True):
+    def __init__(self, proj_dim: int = 1024, dropout: float = 0.3):
         super().__init__()
         self.proj_dim = proj_dim
         self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
         self.P_bge = nn.Linear(BGE_DIM, proj_dim)
         self.query = nn.Parameter(torch.randn(2 * proj_dim))
         self.drop = nn.Dropout(dropout)
-        self.use_structured = use_structured
 
     def forward(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # ctx: (M, 2, CTX_DIM), bge: (M, BGE_DIM) -> output dim varies based on use_structured
+        # ctx: (M, 2, CTX_DIM), bge: (M, BGE_DIM) -> (2*proj_dim,) attention-pooled cluster vector
         c = self.P_ctx(self.drop(ctx.flatten(1)))  # (M, proj_dim)
         s = self.P_bge(self.drop(bge))  # (M, proj_dim)
         m = torch.cat([c, s], dim=-1)  # (M, 2*proj_dim)
         attn = torch.softmax(m @ self.query / (m.shape[-1] ** 0.5), dim=0)
-        pooled = attn @ m  # (2*proj_dim,)
-        
-        if not self.use_structured:
-            return pooled
-        
-        # Structured cluster features: canonical, first, stats
-        # Split pooled back into ctx and bge parts for consistent dimensions
-        pooled_ctx, pooled_bge = pooled[:self.proj_dim], pooled[self.proj_dim:]  # each (proj_dim,)
-        
-        # Canonical mention: highest BGE norm = most specific
-        bge_norms = torch.norm(bge, dim=-1)  # (M,)
-        canonical_idx = torch.argmax(bge_norms)
-        canonical_ctx, canonical_bge = c[canonical_idx], s[canonical_idx]  # each (proj_dim,)
-        
-        # First mention: discourse position
-        first_ctx, first_bge = c[0], s[0]  # each (proj_dim,)
-        
-        # Cluster statistics
-        stats = torch.cat([
-            bge_norms.mean().unsqueeze(0),  # avg specificity
-            bge_norms.std().unsqueeze(0) if len(bge) > 1 else torch.zeros(1, device=bge.device, dtype=bge.dtype),   # specificity variance (0 for singleton)
-            torch.tensor([len(bge)], device=bge.device, dtype=bge.dtype),  # cluster size
-        ])  # (3,)
-        
-        # Concatenate: pooled_ctx + pooled_bge + canonical_ctx + canonical_bge + first_ctx + first_bge + stats
-        # = proj_dim + proj_dim + proj_dim + proj_dim + proj_dim + proj_dim + 3 = 6*proj_dim + 3
-        # Wait, that's still wrong! We want 4*proj_dim + 3.
-        # Let's use: [pooled | canonical | first | stats] where each mention part is the full 2*proj_dim concat
-        # Actually, let's recompute: we want 4*proj_dim + 3 total.
-        # Option: [pooled(2*p) | canonical(proj_dim) | first(proj_dim) | stats(3)] = 4*proj_dim + 3
-        # So canonical and first should each be proj_dim, not 2*proj_dim
-        # Let's use just the BGE projection for canonical/first to avoid doubling
-        
-        return torch.cat([pooled, canonical_bge, first_bge, stats], dim=-1)  # (2*proj_dim + proj_dim + proj_dim + 3) = (4*proj_dim + 3)
+        return attn @ m  # (2*proj_dim,)
 
     def forward_batched(self, clusters: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        # clusters: list of (ctx (M,2,CTX_DIM), bge (M,BGE_DIM)) -> (C, output_dim)
-        if not self.use_structured:
-            # Fast path: just pooling, no structured features
-            max_m = max(ctx.shape[0] for ctx, _ in clusters)
-            device = self.query.device
-            dtype = clusters[0][0].dtype
-            ctx_pad = torch.zeros(len(clusters), max_m, 2 * CTX_DIM, device=device, dtype=dtype)
-            bge_pad = torch.zeros(len(clusters), max_m, BGE_DIM, device=device, dtype=dtype)
-            lengths = []
-            for k, (ctx, bge) in enumerate(clusters):
-                m = ctx.shape[0]
-                ctx_pad[k, :m] = ctx.flatten(1)
-                bge_pad[k, :m] = bge
-                lengths.append(m)
-            c = self.P_ctx(self.drop(ctx_pad))  # (C, max_m, proj_dim)
-            s = self.P_bge(self.drop(bge_pad))  # (C, max_m, proj_dim)
-            m_all = torch.cat([c, s], dim=-1)  # (C, max_m, 2*proj_dim)
-            mask = torch.zeros(len(clusters), max_m, device=device)
-            for k, l in enumerate(lengths):
-                mask[k, :l] = 1.0
-            attn = (m_all @ self.query) / (m_all.shape[-1] ** 0.5)
-            attn = attn.masked_fill(mask == 0, float("-inf"))
-            attn = torch.softmax(attn, dim=1).unsqueeze(-1)
-            pooled = (attn * m_all).sum(dim=1)  # (C, 2*proj_dim)
-            return pooled
-        
-        # Structured path: compute per cluster individually to get correct canonical/first
-        results = []
-        for ctx, bge in clusters:
-            results.append(self.forward(ctx, bge))
-        return torch.stack(results)  # (C, 4*proj_dim + 3)
+        # clusters: list of (ctx (M,2,CTX_DIM), bge (M,BGE_DIM)) -> (C, 2*proj_dim)
+        max_m = max(ctx.shape[0] for ctx, _ in clusters)
+        device = self.query.device
+        dtype = clusters[0][0].dtype
+        ctx_pad = torch.zeros(len(clusters), max_m, 2 * CTX_DIM, device=device, dtype=dtype)
+        bge_pad = torch.zeros(len(clusters), max_m, BGE_DIM, device=device, dtype=dtype)
+        lengths = []
+        for k, (ctx, bge) in enumerate(clusters):
+            m = ctx.shape[0]
+            ctx_pad[k, :m] = ctx.flatten(1)
+            bge_pad[k, :m] = bge
+            lengths.append(m)
+        c = self.P_ctx(self.drop(ctx_pad))  # (C, max_m, proj_dim)
+        s = self.P_bge(self.drop(bge_pad))  # (C, max_m, proj_dim)
+        m_all = torch.cat([c, s], dim=-1)  # (C, max_m, 2*proj_dim)
+        mask = torch.zeros(len(clusters), max_m, device=device)
+        for k, l in enumerate(lengths):
+            mask[k, :l] = 1.0
+        attn = (m_all @ self.query) / (m_all.shape[-1] ** 0.5)
+        attn = attn.masked_fill(mask == 0, float("-inf"))
+        attn = torch.softmax(attn, dim=1).unsqueeze(-1)
+        return (attn * m_all).sum(dim=1)  # (C, 2*proj_dim)
 
 
 class ClusterMatcher(nn.Module):
-    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3, use_structured: bool = True):
+    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3):
         super().__init__()
-        self.cluster_enc = ClusterEncoder(proj_dim, dropout, use_structured)
-        # Input dimension: if structured, each cluster is (4*proj_dim + 3), pair is 2x that
-        # if not structured, each cluster is (2*proj_dim), pair is 2x that
-        if use_structured:
-            g = 4 * proj_dim + 3
-        else:
-            g = 2 * proj_dim
+        self.cluster_enc = ClusterEncoder(proj_dim, dropout)
+        g = 2 * proj_dim
         self.ffnn = nn.Sequential(
             nn.Linear(2 * g, hidden),
             nn.ReLU(),
@@ -255,15 +179,7 @@ class ClusterMatcher(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def encode_clusters(self, clusters: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        if self.cluster_enc.use_structured:
-            # Structured mode: process each cluster individually to get correct dimensions
-            results = []
-            for ctx, bge in clusters:
-                results.append(self.cluster_enc.forward(ctx, bge))
-            return torch.stack(results)  # (C, 4*proj_dim + 3)
-        else:
-            # Fast batched mode for non-structured
-            return self.cluster_enc.forward_batched(clusters)
+        return self.cluster_enc.forward_batched(clusters)
 
     def forward(
         self,
@@ -285,10 +201,9 @@ class MentionMatcher(nn.Module):
     # matrix (logsumexp ~ soft-max). Preserves per-mention evidence — the strongest single
     # mention pair (e.g. a shared proper noun) can drive the merge, which the pooled head
     # smears away. Drop-in for ClusterMatcher: same forward(left, right) -> (L, R) + null_bias.
-    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096, iterative: bool = False, channel: str = "both"):
+    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096, channel: str = "both"):
         super().__init__()
         self.chunk = chunk
-        self.iterative = iterative
         self.channel = channel
         if channel in ("both", "ctx"):
             self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
