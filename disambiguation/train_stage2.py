@@ -30,10 +30,12 @@ from disambiguation.stage2_context_encoder import (
     CONTENT,
     CTX_DIM,
     AntecedentScorer,
+    ClusterGNN,
     ClusterMatcher,
     ContextEncoder,
     MentionMatcher,
     _uf_find,
+    antecedent_mll_loss,
     cluster_match_loss,
     decode_antecedents,
     decode_cluster_matches,
@@ -754,9 +756,7 @@ def train_stage2(
         scorer.eval()
         with torch.inference_mode():
             val_losses = {
-                ds: run_epoch(scorer, vdocs, None, device, doc_bs, window)
-                for ds, vdocs in val_sets.items()
-                if vdocs
+                ds: run_epoch(scorer, vdocs, None, device, doc_bs, window) for ds, vdocs in val_sets.items() if vdocs
             }
         val_loss = val_losses["conll2012"]
         val_scores = {
@@ -984,6 +984,115 @@ def _predict_full_doc_clusters(
     return result
 
 
+def _doc_cluster_nodes(d: dict, per_window: dict[int, dict]) -> tuple[list[np.ndarray], list[int], list[int]]:
+    # Flatten Stage A clusters into an ordered node list for the GNN quotient graph:
+    # returns (member_idx, win_ids, gold) where member_idx[k] are the global mention indices
+    # of node k, win_ids[k] its window index, gold[k] its majority gold entity id. Nodes are
+    # ordered by first-mention subtoken position (discourse order) so antecedent ranking is causal.
+    cid, tok_pos = d["cluster_id"], d["tok_pos"]
+    nodes = []
+    for w in sorted(per_window):
+        gi = per_window[w]["global_idx"]
+        for cl in per_window[w]["clusters"]:
+            members = gi[np.array(cl)]
+            nodes.append((members, int(w), int(np.bincount(cid[members]).argmax()), int(tok_pos[members].min())))
+    nodes.sort(key=lambda n: n[3])
+    return [n[0] for n in nodes], [n[1] for n in nodes], [n[2] for n in nodes]
+
+
+def _gnn_node_tensors(d: dict, member_idx: list[np.ndarray], device: str) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    ctx_all, bge_all = d["ctx_vecs"], d["mention_bge"]
+    return [
+        (torch.from_numpy(ctx_all[m]).to(device).float(), torch.from_numpy(bge_all[m]).to(device).float())
+        for m in member_idx
+    ]
+
+
+def _subsample_neg_candidates(ante: torch.Tensor, gold_id: torch.Tensor, neg_ratio: float) -> torch.Tensor:
+    # Per cluster keep all gold antecedents + up to neg_ratio*max(n_gold,1) random negatives
+    # (floor 4), so each softmax sees a balanced candidate set instead of all ~20 distractors.
+    goldmat = (gold_id.unsqueeze(0) == gold_id.unsqueeze(1)) & ante
+    out = goldmat.clone()
+    for i in range(ante.shape[0]):
+        cap = max(int(neg_ratio * max(int(goldmat[i].sum()), 1)), 4)
+        negs = (ante[i] & ~goldmat[i]).nonzero(as_tuple=True)[0]
+        sel = negs[torch.randperm(negs.numel(), device=ante.device)[:cap]] if negs.numel() > cap else negs
+        out[i, sel] = True
+    return out
+
+
+def _gnn_doc_loss(
+    gnn: ClusterGNN,
+    d: dict,
+    per_window: dict[int, dict],
+    device: str,
+    pos_weight: float = 1.0,
+    neg_ratio: float | None = None,
+) -> torch.Tensor | None:
+    member_idx, win_ids, gold = _doc_cluster_nodes(d, per_window)
+    if len(member_idx) < 2:
+        return None
+    clusters = _gnn_node_tensors(d, member_idx, device)
+    scores, ante = gnn(clusters, torch.tensor(win_ids, device=device))
+    gold_t = torch.tensor(gold, device=device)
+    if neg_ratio is not None:
+        ante = _subsample_neg_candidates(ante, gold_t, neg_ratio)
+    return antecedent_mll_loss(scores, ante, gold_t, gnn.null_bias, pos_weight)
+
+
+def _predict_full_doc_clusters_gnn(d: dict, per_window: dict[int, dict], gnn: ClusterGNN, device: str) -> list[list]:
+    # Each cluster points to its single best earlier cluster (or null); the pointer forest is
+    # the entity partition. Unmerged nodes that are themselves >=2 mentions stay as entities.
+    member_idx, win_ids, _ = _doc_cluster_nodes(d, per_window)
+    C = len(member_idx)
+    if C == 0:
+        return []
+    if C == 1:
+        spans = [d["spans"][m] for m in member_idx[0]]
+        return [spans] if len(spans) >= 2 else []
+    with torch.inference_mode():
+        scores, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device))
+    s, a = scores.float().cpu().numpy(), ante.cpu().numpy()
+    nb = float(gnn.null_bias.item())
+    parent = list(range(C))
+    for i in range(1, C):
+        cand = np.where(a[i])[0]
+        if len(cand) == 0:
+            continue
+        j = int(cand[np.argmax(s[i, cand])])
+        if s[i, j] > nb:
+            parent[_uf_find(parent, i)] = _uf_find(parent, j)
+    groups: dict[int, list[int]] = {}
+    for i in range(C):
+        groups.setdefault(_uf_find(parent, i), []).append(i)
+    result = []
+    for ns in groups.values():
+        spans = [d["spans"][m] for ni in ns for m in member_idx[ni]]
+        if len(spans) >= 2:
+            result.append(spans)
+    return result
+
+
+def _gnn_merge_stats(d: dict, per_window: dict[int, dict], gnn: ClusterGNN, device: str) -> tuple[int, int, int]:
+    # (merges accepted, gold-positive nodes, total nodes) — exposes the all-null collapse directly.
+    member_idx, win_ids, gold = _doc_cluster_nodes(d, per_window)
+    C = len(member_idx)
+    if C < 2:
+        return 0, 0, C
+    with torch.inference_mode():
+        sc, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device))
+    s, a = sc.float().cpu().numpy(), ante.cpu().numpy()
+    g = np.array(gold)
+    goldmat = (g[:, None] == g[None, :]) & a
+    nb = float(gnn.null_bias.item())
+    merges = 0
+    for i in range(C):
+        c = np.where(a[i])[0]
+        if len(c) and s[i, c[np.argmax(s[i, c])]] > nb:
+            merges += 1
+    return merges, int(goldmat.any(axis=1).sum()), C
+
+
 def eval_stage_b(
     docs: list,
     stage_a_clusters: list[dict[int, list[list[int]]]],
@@ -993,19 +1102,28 @@ def eval_stage_b(
     type_breakdown: bool = False,
 ) -> dict:
     cluster_matcher.eval()
+    is_gnn = isinstance(cluster_matcher, ClusterGNN)
+    predict = _predict_full_doc_clusters_gnn if is_gnn else _predict_full_doc_clusters
     key_docs, resp_docs = [], []
+    g_merge = g_pos = g_nodes = 0
     for d, per_window in zip(docs, stage_a_clusters):
         if not per_window:
             continue
         key_docs.append((d["name"], d["sentences"], _key_clusters(d)))
-        resp_docs.append(
-            (d["name"], d["sentences"], _predict_full_doc_clusters(d, per_window, cluster_matcher, device))
-        )
+        resp_docs.append((d["name"], d["sentences"], predict(d, per_window, cluster_matcher, device)))
+        if is_gnn:
+            m, p, n = _gnn_merge_stats(d, per_window, cluster_matcher, device)
+            g_merge, g_pos, g_nodes = g_merge + m, g_pos + p, g_nodes + n
     key_path = MODELS_DIR / f"stageb_{tag}_key.conll"
     resp_path = MODELS_DIR / f"stageb_{tag}_resp.conll"
     write_conll(key_path, key_docs)
     write_conll(resp_path, resp_docs)
     result = conll_f1(key_path, resp_path)
+    if is_gnn:
+        print(
+            f"    [gnn:{tag}] merges accepted {g_merge} / gold-positive nodes {g_pos} "
+            f"({g_nodes} nodes, null_bias {float(cluster_matcher.null_bias.item()):+.3f})"
+        )
     if type_breakdown:
         result["by_type"] = conll_f1_by_type(key_docs, resp_docs, MODELS_DIR)
     return result
@@ -1148,6 +1266,8 @@ def train_stage_b(
     weight_decay: float = 0.1,
     head: str = "cluster",
     channel: str = "both",
+    pos_weight: float = 1.0,
+    member_pool: str = "attn",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
 ) -> None:
@@ -1155,6 +1275,8 @@ def train_stage_b(
     ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset, channel)
     if head == "mention":
         ckpt_b = ckpt_b.replace(".pt", "_ment.pt")
+    elif head == "gnn":
+        ckpt_b = ckpt_b.replace(".pt", "_gnn.pt")
     nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
     docs = build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n)
     docs = _filter_docs(docs, subset)
@@ -1199,9 +1321,11 @@ def train_stage_b(
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     if head == "mention":
         cluster_matcher = MentionMatcher(dropout=dropout, channel=channel).to(device)
+    elif head == "gnn":
+        cluster_matcher = ClusterGNN(dropout=dropout, channel=channel, member_pool=member_pool).to(device)
     else:
         if channel != "both":
-            raise ValueError("single-channel ablation requires head='mention' (pooled head is not channel-aware)")
+            raise ValueError("single-channel ablation requires head='mention'/'gnn' (pooled head is not channel-aware)")
         cluster_matcher = ClusterMatcher(dropout=dropout).to(device)
     if eval_only:
         cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
@@ -1224,77 +1348,104 @@ def train_stage_b(
         random.shuffle(order)
         cluster_matcher.train()
         total, n_pairs = 0.0, 0
-        # accumulate (left_clusters, right_clusters, left_cids, right_cids) across docs;
-        # the mention head materializes an Lm*Rm grid per pair, so cap a batch by accumulated
-        # mention-pair count (not just window-pair count) to bound peak VRAM on dense windows.
-        pending: list[tuple] = []
-        pending_pairs = 0
-        pair_budget = 40000 if head == "mention" else 10**12
-        for bi in tqdm(order, desc="train_b"):
-            d = train_docs[bi]
-            per_window = train_clusters[bi]
-            if not per_window:
-                continue
-            ctx_all, bge_all, cid = d["ctx_vecs"], d["mention_bge"], d["cluster_id"]
-            windows = sorted(per_window.keys())
-            # cheap pass: classify each window pair as positive (some left cluster has a
-            # gold match in the right window) or null, so nulls can be subsampled
-            metas = []
-            for i in range(len(windows)):
-                for j in range(i + 1, len(windows)):
-                    wi, wj = per_window[windows[i]], per_window[windows[j]]
-                    lc, rc = wi["clusters"], wj["clusters"]
-                    if not lc or not rc:
-                        continue
-                    left_cids = [_cluster_gold_cids([wi["global_idx"][li] for li in cl], cid) for cl in lc]
-                    right_cids = [_cluster_gold_cids([wj["global_idx"][li] for li in cl], cid) for cl in rc]
-                    rset = set(right_cids)
-                    is_pos = any(lcid in rset for lcid in left_cids)
-                    metas.append((wi, wj, lc, rc, left_cids, right_cids, is_pos))
-            if neg_ratio is not None and metas:
-                pos = [m for m in metas if m[6]]
-                neg = [m for m in metas if not m[6]]
-                cap = int(neg_ratio * len(pos)) if pos else min(len(neg), 1)
-                if len(neg) > cap:
-                    neg = random.sample(neg, cap)
-                metas = pos + neg
-            for wi, wj, lc, rc, left_cids, right_cids, _ in metas:
-                ctx_i, bge_i = ctx_all[wi["global_idx"]], bge_all[wi["global_idx"]]
-                ctx_j, bge_j = ctx_all[wj["global_idx"]], bge_all[wj["global_idx"]]
-                left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
-                right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
-                lex = (
-                    _lex_for_pair(
-                        d,
-                        int(wi["global_idx"][0]),
-                        int(wj["global_idx"][0]),
-                        lc,
-                        rc,
-                        wi["global_idx"],
-                        wj["global_idx"],
-                        device,
-                    )
-                    if head == "mention"
-                    else None
-                )
-                pending.append((left, right, left_cids, right_cids, lex))
-                pending_pairs += sum(c.shape[0] for c, _ in left) * sum(c.shape[0] for c, _ in right)
+        if head == "gnn":
+            # Per-doc quotient graph; accumulate doc losses over doc_bs docs, one step (the
+            # C-node forward is tiny, so gradient accumulation batches docs for free).
+            pending_g: list[torch.Tensor] = []
+            for bi in tqdm(order, desc="train_b"):
+                per_window = train_clusters[bi]
+                if not per_window:
+                    continue
+                loss = _gnn_doc_loss(cluster_matcher, train_docs[bi], per_window, device, pos_weight, neg_ratio)
+                if loss is None:
+                    continue
+                pending_g.append(loss)
                 n_pairs += 1
-                if len(pending) >= doc_bs or pending_pairs >= pair_budget:
+                if len(pending_g) >= doc_bs:
                     optimizer.zero_grad()
-                    losses = _stage_b_losses(cluster_matcher, pending)
-                    torch.stack(losses).mean().backward()
+                    torch.stack(pending_g).mean().backward()
                     torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
                     optimizer.step()
-                    total += sum(lo.item() for lo in losses)
-                    pending, pending_pairs = [], 0
-        if pending:
-            optimizer.zero_grad()
-            losses = _stage_b_losses(cluster_matcher, pending)
-            torch.stack(losses).mean().backward()
-            torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
-            optimizer.step()
-            total += sum(lo.item() for lo in losses)
+                    total += float(sum(lo.item() for lo in pending_g))
+                    pending_g = []
+            if pending_g:
+                optimizer.zero_grad()
+                torch.stack(pending_g).mean().backward()
+                torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
+                optimizer.step()
+                total += float(sum(lo.item() for lo in pending_g))
+        else:
+            # accumulate (left_clusters, right_clusters, left_cids, right_cids) across docs;
+            # the mention head materializes an Lm*Rm grid per pair, so cap a batch by accumulated
+            # mention-pair count (not just window-pair count) to bound peak VRAM on dense windows.
+            pending: list[tuple] = []
+            pending_pairs = 0
+            pair_budget = 40000 if head == "mention" else 10**12
+            for bi in tqdm(order, desc="train_b"):
+                d = train_docs[bi]
+                per_window = train_clusters[bi]
+                if not per_window:
+                    continue
+                ctx_all, bge_all, cid = d["ctx_vecs"], d["mention_bge"], d["cluster_id"]
+                windows = sorted(per_window.keys())
+                # cheap pass: classify each window pair as positive (some left cluster has a
+                # gold match in the right window) or null, so nulls can be subsampled
+                metas = []
+                for i in range(len(windows)):
+                    for j in range(i + 1, len(windows)):
+                        wi, wj = per_window[windows[i]], per_window[windows[j]]
+                        lc, rc = wi["clusters"], wj["clusters"]
+                        if not lc or not rc:
+                            continue
+                        left_cids = [_cluster_gold_cids([wi["global_idx"][li] for li in cl], cid) for cl in lc]
+                        right_cids = [_cluster_gold_cids([wj["global_idx"][li] for li in cl], cid) for cl in rc]
+                        rset = set(right_cids)
+                        is_pos = any(lcid in rset for lcid in left_cids)
+                        metas.append((wi, wj, lc, rc, left_cids, right_cids, is_pos))
+                if neg_ratio is not None and metas:
+                    pos = [m for m in metas if m[6]]
+                    neg = [m for m in metas if not m[6]]
+                    cap = int(neg_ratio * len(pos)) if pos else min(len(neg), 1)
+                    if len(neg) > cap:
+                        neg = random.sample(neg, cap)
+                    metas = pos + neg
+                for wi, wj, lc, rc, left_cids, right_cids, _ in metas:
+                    ctx_i, bge_i = ctx_all[wi["global_idx"]], bge_all[wi["global_idx"]]
+                    ctx_j, bge_j = ctx_all[wj["global_idx"]], bge_all[wj["global_idx"]]
+                    left = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_i, bge_i) for cl in lc]]
+                    right = [(c.to(device), b.to(device)) for c, b in [_cluster_reps(cl, ctx_j, bge_j) for cl in rc]]
+                    lex = (
+                        _lex_for_pair(
+                            d,
+                            int(wi["global_idx"][0]),
+                            int(wj["global_idx"][0]),
+                            lc,
+                            rc,
+                            wi["global_idx"],
+                            wj["global_idx"],
+                            device,
+                        )
+                        if head == "mention"
+                        else None
+                    )
+                    pending.append((left, right, left_cids, right_cids, lex))
+                    pending_pairs += sum(c.shape[0] for c, _ in left) * sum(c.shape[0] for c, _ in right)
+                    n_pairs += 1
+                    if len(pending) >= doc_bs or pending_pairs >= pair_budget:
+                        optimizer.zero_grad()
+                        losses = _stage_b_losses(cluster_matcher, pending)
+                        torch.stack(losses).mean().backward()
+                        torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
+                        optimizer.step()
+                        total += sum(lo.item() for lo in losses)
+                        pending, pending_pairs = [], 0
+            if pending:
+                optimizer.zero_grad()
+                losses = _stage_b_losses(cluster_matcher, pending)
+                torch.stack(losses).mean().backward()
+                torch.nn.utils.clip_grad_norm_(cluster_matcher.parameters(), 1.0)
+                optimizer.step()
+                total += sum(lo.item() for lo in losses)
         scheduler.step()
         tr_loss = total / max(n_pairs, 1)
 
@@ -1374,10 +1525,4 @@ if __name__ == "__main__":
     head_path = MODELS_DIR / f"{_win_names(256, 'all8k', channel)[1]}.pt"
     if not head_path.exists():
         train_stage2(window=256, subset="all8k", channel=channel)
-    train_stage_b(
-        window=256,
-        subset="all8k",
-        head="mention",
-        dropout=0.2,
-        channel=channel,
-    )
+    train_stage_b(window=256, subset="all8k", head="gnn", dropout=0.2, channel=channel, member_pool="lse", neg_ratio=5)
