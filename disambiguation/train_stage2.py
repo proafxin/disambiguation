@@ -3,6 +3,7 @@ import json
 import math
 import pickle
 import random
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -1008,6 +1009,149 @@ def _gnn_node_tensors(d: dict, member_idx: list[np.ndarray], device: str) -> lis
     ]
 
 
+def _gnn_lex_matrix(member_idx: list[np.ndarray], mention_tokens: list, idf: dict) -> np.ndarray:
+    # (C, C, 3) node-pair lexical features [IDF-Jaccard, containment, exact-match]. Each node's
+    # member surfaces are folded into ONE token set before any pairwise work, so the cost is
+    # O(M + C²) (build sets once, then C² set-overlaps) — never mention-pairs.
+    surf = [[mention_tokens[m] for m in members] for members in member_idx]
+    tset = [{t for mt in s for t in mt} for s in surf]
+    mass = [sum(idf.get(t, 0.0) for t in s) for s in tset]
+    cont = [[mt for mt in s if _content(mt)] for s in surf]
+    C = len(member_idx)
+    out = np.zeros((C, C, 3), dtype=np.float32)
+    for i in range(C):
+        ci = set(cont[i])
+        for j in range(C):
+            inter = tset[i] & tset[j]
+            im = sum(idf.get(t, 0.0) for t in inter)
+            um = mass[i] + mass[j] - im
+            out[i, j, 0] = im / um if um > 0 else 0.0
+            out[i, j, 2] = 1.0 if ci & set(cont[j]) else 0.0
+            out[i, j, 1] = 1.0 if any(_is_subseq(a, b) or _is_subseq(b, a) for a in cont[i] for b in cont[j]) else 0.0
+    return out
+
+
+def _gnn_content_jaccard(member_idx: list[np.ndarray], mention_tokens: list, idf: dict) -> np.ndarray:
+    # (C, C) IDF-weighted Jaccard over CONTENT tokens only (pronoun surfaces excluded). The rescue
+    # gate uses this so it fires only on shared *distinctive* words — never on identical pronouns
+    # ("it"/"it"), and common nouns are down-weighted by their low IDF.
+    csets = []
+    for members in member_idx:
+        toks: set = set()
+        for m in members:
+            mt = mention_tokens[m]
+            if _content(mt):
+                toks.update(mt)
+        csets.append(toks)
+    mass = [sum(idf.get(t, 0.0) for t in s) for s in csets]
+    C = len(member_idx)
+    out = np.zeros((C, C), dtype=np.float32)
+    for i in range(C):
+        for j in range(C):
+            inter = csets[i] & csets[j]
+            im = sum(idf.get(t, 0.0) for t in inter)
+            um = mass[i] + mass[j] - im
+            out[i, j] = im / um if um > 0 else 0.0
+    return out
+
+
+# pronoun -> (number, gender, person); 0 = unknown. number: 1=sing 2=plur; gender: 1=masc 2=fem 3=neut.
+_PRON_AGR = {
+    "he": (1, 1, 3),
+    "him": (1, 1, 3),
+    "his": (1, 1, 3),
+    "himself": (1, 1, 3),
+    "she": (1, 2, 3),
+    "her": (1, 2, 3),
+    "hers": (1, 2, 3),
+    "herself": (1, 2, 3),
+    "it": (1, 3, 3),
+    "its": (1, 3, 3),
+    "itself": (1, 3, 3),
+    "they": (2, 0, 3),
+    "them": (2, 0, 3),
+    "their": (2, 0, 3),
+    "theirs": (2, 0, 3),
+    "themselves": (2, 0, 3),
+    "i": (1, 0, 1),
+    "me": (1, 0, 1),
+    "my": (1, 0, 1),
+    "mine": (1, 0, 1),
+    "myself": (1, 0, 1),
+    "we": (2, 0, 1),
+    "us": (2, 0, 1),
+    "our": (2, 0, 1),
+    "ours": (2, 0, 1),
+    "ourselves": (2, 0, 1),
+    "you": (0, 0, 2),
+    "your": (0, 0, 2),
+    "yours": (0, 0, 2),
+    "yourself": (1, 0, 2),
+    "yourselves": (2, 0, 2),
+}
+
+
+def _cluster_agr(members: np.ndarray, mention_tokens: list) -> tuple[int, int, int]:
+    # (number, gender, person) profile from a cluster's pronoun members; 0 = unknown, and
+    # conflicting known values within a cluster collapse to unknown.
+    nums, gens, pers = set(), set(), set()
+    for m in members:
+        mt = mention_tokens[m]
+        if len(mt) == 1 and mt[0] in _PRON_AGR:
+            n, g, p = _PRON_AGR[mt[0]]
+            if n:
+                nums.add(n)
+            if g:
+                gens.add(g)
+            if p:
+                pers.add(p)
+
+    def pick(s: set) -> int:
+        return next(iter(s)) if len(s) == 1 else 0
+
+    return pick(nums), pick(gens), pick(pers)
+
+
+def _gnn_agr_matrix(member_idx: list[np.ndarray], mention_tokens: list) -> np.ndarray:
+    # (C, C, 6): for each of [number, gender, person] a (match, clash) indicator between the two
+    # clusters' profiles — match=both known and equal, clash=both known and differ. O(C²).
+    prof = np.array([_cluster_agr(m, mention_tokens) for m in member_idx], dtype=np.int64)  # (C, 3)
+    C = len(member_idx)
+    out = np.zeros((C, C, 6), dtype=np.float32)
+    for a in range(3):
+        v = prof[:, a]
+        both = (v != 0)[:, None] & (v != 0)[None, :]
+        eq = v[:, None] == v[None, :]
+        out[:, :, 2 * a] = (both & eq).astype(np.float32)
+        out[:, :, 2 * a + 1] = (both & ~eq).astype(np.float32)
+    return out
+
+
+def _gnn_agr_for_doc(gnn: ClusterGNN, d: dict, member_idx: list[np.ndarray], device: str) -> torch.Tensor | None:
+    if not getattr(gnn, "use_agreement", False):
+        return None
+    if "mention_tokens" not in d:
+        _build_lexical([d])
+    cache = d.get("_gnn_agr")
+    if cache is None or cache.shape[0] != len(member_idx):
+        cache = _gnn_agr_matrix(member_idx, d["mention_tokens"])
+        d["_gnn_agr"] = cache
+    return torch.from_numpy(cache).to(device)
+
+
+def _gnn_lex_for_doc(gnn: ClusterGNN, d: dict, member_idx: list[np.ndarray], device: str) -> torch.Tensor | None:
+    # constant per doc (nodes are fixed Stage A clusters) -> compute once and cache on d
+    if not getattr(gnn, "use_lexical", False):
+        return None
+    if "mention_tokens" not in d:
+        _build_lexical([d])
+    cache = d.get("_gnn_lex")
+    if cache is None or cache.shape[0] != len(member_idx):
+        cache = _gnn_lex_matrix(member_idx, d["mention_tokens"], d["mention_idf"])
+        d["_gnn_lex"] = cache
+    return torch.from_numpy(cache).to(device)
+
+
 def _subsample_neg_candidates(ante: torch.Tensor, gold_id: torch.Tensor, neg_ratio: float) -> torch.Tensor:
     # Per cluster keep all gold antecedents + up to neg_ratio*max(n_gold,1) random negatives
     # (floor 4), so each softmax sees a balanced candidate set instead of all ~20 distractors.
@@ -1033,7 +1177,9 @@ def _gnn_doc_loss(
     if len(member_idx) < 2:
         return None
     clusters = _gnn_node_tensors(d, member_idx, device)
-    scores, ante = gnn(clusters, torch.tensor(win_ids, device=device))
+    lex = _gnn_lex_for_doc(gnn, d, member_idx, device)
+    agr = _gnn_agr_for_doc(gnn, d, member_idx, device)
+    scores, ante = gnn(clusters, torch.tensor(win_ids, device=device), lex, agr)
     gold_t = torch.tensor(gold, device=device)
     if neg_ratio is not None:
         ante = _subsample_neg_candidates(ante, gold_t, neg_ratio)
@@ -1051,7 +1197,9 @@ def _predict_full_doc_clusters_gnn(d: dict, per_window: dict[int, dict], gnn: Cl
         spans = [d["spans"][m] for m in member_idx[0]]
         return [spans] if len(spans) >= 2 else []
     with torch.inference_mode():
-        scores, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device))
+        lex = _gnn_lex_for_doc(gnn, d, member_idx, device)
+        agr = _gnn_agr_for_doc(gnn, d, member_idx, device)
+        scores, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device), lex, agr)
     s, a = scores.float().cpu().numpy(), ante.cpu().numpy()
     nb = float(gnn.null_bias.item())
     parent = list(range(C))
@@ -1080,7 +1228,9 @@ def _gnn_merge_stats(d: dict, per_window: dict[int, dict], gnn: ClusterGNN, devi
     if C < 2:
         return 0, 0, C
     with torch.inference_mode():
-        sc, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device))
+        lex = _gnn_lex_for_doc(gnn, d, member_idx, device)
+        agr = _gnn_agr_for_doc(gnn, d, member_idx, device)
+        sc, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device), lex, agr)
     s, a = sc.float().cpu().numpy(), ante.cpu().numpy()
     g = np.array(gold)
     goldmat = (g[:, None] == g[None, :]) & a
@@ -1127,6 +1277,135 @@ def eval_stage_b(
     if type_breakdown:
         result["by_type"] = conll_f1_by_type(key_docs, resp_docs, MODELS_DIR)
     return result
+
+
+def _predict_gnn_rescue(
+    d: dict, per_window: dict[int, dict], gnn: ClusterGNN, device: str, lex_thresh: float, margin: float
+) -> list[list]:
+    # Monotone post-hoc lexical rescue: run the clean neural decode, then ALSO accept a rejected
+    # cross-window pair iff it is within `margin` of null AND lexically distinctive (IDF-Jaccard
+    # >= lex_thresh OR exact content match). Only adds merges — never removes one or moves a
+    # threshold — so pairs with no lexical signal are left exactly as the clean model decoded them.
+    member_idx, win_ids, _ = _doc_cluster_nodes(d, per_window)
+    C = len(member_idx)
+    if C == 0:
+        return []
+    if C == 1:
+        spans = [d["spans"][m] for m in member_idx[0]]
+        return [spans] if len(spans) >= 2 else []
+    with torch.inference_mode():
+        scores, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device))
+    s, a = scores.float().cpu().numpy(), ante.cpu().numpy()
+    cj = d.get("_gnn_cj")
+    if cj is None or cj.shape[0] != C:
+        cj = _gnn_content_jaccard(member_idx, d["mention_tokens"], d["mention_idf"])
+        d["_gnn_cj"] = cj
+    nb = float(gnn.null_bias.item())
+    parent = list(range(C))
+    for i in range(1, C):
+        cand = np.where(a[i])[0]
+        if len(cand) == 0:
+            continue
+        j = int(cand[np.argmax(s[i, cand])])
+        if s[i, j] > nb:
+            parent[_uf_find(parent, i)] = _uf_find(parent, j)
+            continue
+        ok = (s[i, cand] > nb - margin) & (cj[i, cand] >= lex_thresh)
+        if ok.any():
+            csub = cand[ok]
+            k = int(csub[np.argmax(s[i, csub])])
+            parent[_uf_find(parent, i)] = _uf_find(parent, k)
+    groups: dict[int, list[int]] = {}
+    for i in range(C):
+        groups.setdefault(_uf_find(parent, i), []).append(i)
+    out = []
+    for ns in groups.values():
+        spans = [d["spans"][m] for ni in ns for m in member_idx[ni]]
+        if len(spans) >= 2:
+            out.append(spans)
+    return out
+
+
+def _eval_gnn_rescue(docs, clusters, gnn, device, tag, lex_thresh, margin, type_breakdown=False) -> dict:
+    key_docs, resp_docs = [], []
+    for d, per_window in zip(docs, clusters):
+        if not per_window:
+            continue
+        key_docs.append((d["name"], d["sentences"], _key_clusters(d)))
+        resp_docs.append(
+            (d["name"], d["sentences"], _predict_gnn_rescue(d, per_window, gnn, device, lex_thresh, margin))
+        )
+    kp, rp = MODELS_DIR / f"rescue_{tag}_key.conll", MODELS_DIR / f"rescue_{tag}_resp.conll"
+    write_conll(kp, key_docs)
+    write_conll(rp, resp_docs)
+    res = conll_f1(kp, rp)
+    if type_breakdown:
+        res["by_type"] = conll_f1_by_type(key_docs, resp_docs, MODELS_DIR)
+    return res
+
+
+def gnn_lexical_rescue(
+    window: int = CONTENT,
+    subset: str = "all",
+    channel: str = "both",
+    member_pool: str = "lse",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    # Post-hoc: load the clean (no-lexical) GNN checkpoint, sweep the rescue knobs on val, report
+    # test at the best setting. No retraining; the rescue is monotone so the sweep can always fall
+    # back to no-rescue (val >= the clean baseline by construction).
+    ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset, channel)
+    ckpt_path = MODELS_DIR / ckpt_b.replace(".pt", "_gnn.pt")
+    nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
+    docs = build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n)
+    docs = _filter_docs(docs, subset)
+    for d in docs:
+        if "tok_pos" not in d:
+            d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
+    _build_lexical(docs)
+    stage_a = AntecedentScorer(channel=channel).to(device)
+    stage_a.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
+    stage_a.eval()
+    if single_ctx:
+        load_span_ctx_single(docs, ctx_dir)
+    else:
+        for i, d in enumerate(docs):
+            p = ctx_dir / f"{i:06d}.npy"
+            if p.exists() and "ctx_vecs" not in d:
+                d["ctx_vecs"] = np.load(p).astype(np.float16)
+    all_sa = _precompute_stage_a_clusters(docs, stage_a, device, window, subset, channel)
+    gnn = ClusterGNN(channel=channel, member_pool=member_pool).to(device)
+    gnn.load_state_dict(torch.load(ckpt_path, map_location=device)["cluster_matcher"], strict=False)
+    gnn.eval()
+
+    def split_set(split):
+        dd = [x for x in docs if x["split"] == split and x["name"].startswith("conll2012/")]
+        cc = [all_sa[i] for i, x in enumerate(docs) if x["split"] == split and x["name"].startswith("conll2012/")]
+        return dd, cc
+
+    val_docs, val_clusters = split_set("validation")
+    test_docs, test_clusters = split_set("test")
+
+    base = _eval_gnn_rescue(val_docs, val_clusters, gnn, device, "val_base", 1e9, 0.0)["CoNLL"]
+    print(f"\nval baseline (no rescue): {base * 100:.2f}")
+    best_f1, best = base, (1e9, 0.0)
+    for lt in (0.3, 0.5, 0.7):
+        for mg in (0.1, 0.3, 0.5, 1.0):
+            f1 = _eval_gnn_rescue(val_docs, val_clusters, gnn, device, "val_sweep", lt, mg)["CoNLL"]
+            print(f"  lex_thresh={lt} margin={mg}: val {f1 * 100:.2f}")
+            if f1 > best_f1 + 1e-5:
+                best_f1, best = f1, (lt, mg)
+    lt, mg = best
+    print(f"best val {best_f1 * 100:.2f} at lex_thresh={lt} margin={mg}")
+    base_test = _eval_gnn_rescue(test_docs, test_clusters, gnn, device, "test_base", 1e9, 0.0)["CoNLL"]
+    test = _eval_gnn_rescue(test_docs, test_clusters, gnn, device, "test", lt, mg, type_breakdown=True)
+    print(
+        f"\nTEST  no-rescue {base_test * 100:.2f}  ->  rescue {test['CoNLL'] * 100:.2f} "
+        f"(MUC {test['muc'] * 100:.2f} B3 {test['bcub'] * 100:.2f} CEAFe {test['ceafe'] * 100:.2f})"
+    )
+    if "by_type" in test:
+        for bucket, sc in sorted(test["by_type"].items()):
+            print(f"  {bucket:12s} CoNLL {sc['CoNLL'] * 100:.2f}")
 
 
 _PRONOUNS = frozenset(
@@ -1268,6 +1547,8 @@ def train_stage_b(
     channel: str = "both",
     pos_weight: float = 1.0,
     member_pool: str = "attn",
+    lexical: bool = False,
+    agreement: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
 ) -> None:
@@ -1276,15 +1557,16 @@ def train_stage_b(
     if head == "mention":
         ckpt_b = ckpt_b.replace(".pt", "_ment.pt")
     elif head == "gnn":
-        ckpt_b = ckpt_b.replace(".pt", "_gnn.pt")
+        tag = f"_gnn_{member_pool}{'_lex' if lexical else ''}{'_agr' if agreement else ''}"
+        ckpt_b = ckpt_b.replace(".pt", f"{tag}.pt")
     nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
     docs = build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n)
     docs = _filter_docs(docs, subset)
     for d in docs:
         if "tok_pos" not in d:
             d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
-    if head == "mention":
-        _build_lexical(docs)  # independent lexical-identity channel; mention head only
+    if head == "mention" or (head == "gnn" and (lexical or agreement)):
+        _build_lexical(docs)  # mention tokens feed the lexical and/or agreement channels
 
     stage_a = AntecedentScorer(channel=channel).to(device)
     stage_a.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
@@ -1322,7 +1604,9 @@ def train_stage_b(
     if head == "mention":
         cluster_matcher = MentionMatcher(dropout=dropout, channel=channel).to(device)
     elif head == "gnn":
-        cluster_matcher = ClusterGNN(dropout=dropout, channel=channel, member_pool=member_pool).to(device)
+        cluster_matcher = ClusterGNN(
+            dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical, use_agreement=agreement
+        ).to(device)
     else:
         if channel != "both":
             raise ValueError("single-channel ablation requires head='mention'/'gnn' (pooled head is not channel-aware)")
@@ -1517,12 +1801,141 @@ def train_stage_b(
             )
 
 
+def _mention_type(toks: tuple, surf: list) -> str:
+    if len(toks) == 1 and toks[0] in _PRONOUNS:
+        return "PRON"
+    if any(w[:1].isupper() for w in surf):
+        return "PROPN"
+    return "NOUN"
+
+
+def stage_a_error_analysis(
+    window: int = CONTENT,
+    subset: str = "all",
+    channel: str = "both",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    # Within-window decision-level analysis on CoNLL test: for each mention that has earlier
+    # candidates, did Stage A pick the right antecedent / correctly open a new entity? Buckets
+    # the misses by head-word match (same head still missed = fixable; different head = semantic)
+    # and measures which conditions predict coreference (impose-able rules).
+    ctx_dir, frozen_base, _, _ = _win_names(window, subset, channel)
+    nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
+    docs = _filter_docs(build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n), subset)
+    for d in docs:
+        d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
+    test_idx = [i for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")]
+    _build_lexical([docs[i] for i in test_idx])
+    for i in test_idx:
+        p = ctx_dir / f"{i:06d}.npy"
+        if p.exists():
+            docs[i]["ctx_vecs"] = np.load(p).astype(np.float16)
+    scorer = AntecedentScorer(channel=channel).to(device)
+    scorer.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
+    scorer.eval()
+    nb = float(scorer.null_bias.item())
+
+    outcome: Counter = Counter()
+    rec = {t: [0, 0] for t in ("PRON", "NOUN", "PROPN")}  # type -> [recovered, gold]
+    missed_head: Counter = Counter()
+    cond: dict = {}
+
+    def bump(name: str, is_coref: bool) -> None:
+        c = cond.setdefault(name, [0, 0])
+        c[0] += int(is_coref)
+        c[1] += 1
+
+    for i in test_idx:
+        d = docs[i]
+        if "ctx_vecs" not in d:
+            continue
+        cid, win_ids = d["cluster_id"], d["tok_pos"] // window
+        toks, spans, sents = d["mention_tokens"], d["spans"], d["sentences"]
+        surf = [sents[si][a:b] for (si, a, b) in spans]
+        types = [_mention_type(toks[k], surf[k]) for k in range(len(spans))]
+        agr = [_PRON_AGR.get(toks[k][0], (0, 0, 0)) if len(toks[k]) == 1 else (0, 0, 0) for k in range(len(spans))]
+        for w in np.unique(win_ids):
+            gidx = np.where(win_ids == w)[0]
+            if len(gidx) < 2:
+                continue
+            ctx = torch.from_numpy(d["ctx_vecs"][gidx]).to(device).float()
+            bge = torch.from_numpy(d["mention_bge"][gidx]).to(device).float()
+            with torch.inference_mode():
+                sc, mask = scorer(ctx, bge)
+            sc, mask = sc.float().cpu().numpy(), mask.cpu().numpy()
+            wc = cid[gidx]
+            wt = [types[k] for k in gidx]
+            wh = [toks[k][-1] for k in gidx]
+            wa = [agr[k] for k in gidx]
+            for a in range(1, len(gidx)):
+                cand = np.where(mask[a])[0]
+                if len(cand) == 0:
+                    continue
+                gold_ante = [b for b in cand if wc[b] == wc[a]]
+                for b in cand:
+                    ic = bool(wc[b] == wc[a])
+                    bump("ALL", ic)
+                    if wh[a] == wh[b]:
+                        bump("head_match", ic)
+                    if wa[a][1] and wa[b][1] and wa[a][1] != wa[b][1]:
+                        bump("gender_clash", ic)
+                    if wa[a][0] and wa[b][0] and wa[a][0] != wa[b][0]:
+                        bump("number_clash", ic)
+                    if wt[a] == wt[b]:
+                        bump(f"sametype_{wt[a]}", ic)
+                jb = int(cand[np.argmax(sc[a, cand])])
+                linked = sc[a, jb] > nb
+                if gold_ante:
+                    rec[wt[a]][1] += 1
+                    if linked and wc[jb] == wc[a]:
+                        outcome["TRUE_LINK"] += 1
+                        rec[wt[a]][0] += 1
+                    elif linked:
+                        outcome["WRONG_LINK"] += 1
+                    else:
+                        outcome["MISSED_LINK"] += 1
+                        missed_head["shared" if any(wh[a] == wh[b] for b in gold_ante) else "diff"] += 1
+                elif linked:
+                    outcome["FALSE_LINK"] += 1
+                else:
+                    outcome["TRUE_NULL"] += 1
+
+    tot = sum(outcome.values())
+    print("\n=== Stage A within-window error analysis: CoNLL-2012 test ===")
+    print(f"decisions: {tot}")
+    for k in ("TRUE_LINK", "WRONG_LINK", "MISSED_LINK", "TRUE_NULL", "FALSE_LINK"):
+        print(f"  {k:12s} {outcome[k]:6d}  ({100 * outcome[k] / max(tot, 1):4.1f}%)")
+    print("\nwithin-window LINK recall by mention type (mentions that have a gold antecedent):")
+    for t in ("PROPN", "NOUN", "PRON"):
+        r, g = rec[t]
+        print(f"  {t:6s} {100 * r / max(g, 1):5.1f}%  ({r}/{g})")
+    ms, md = missed_head["shared"], missed_head["diff"]
+    print("\nMISSED links by head word:")
+    print(f"  head SHARED (same word, still missed -> fixable): {ms} ({100 * ms / max(ms + md, 1):.0f}%)")
+    print(f"  head DIFFERENT (semantic, hard):                  {md} ({100 * md / max(ms + md, 1):.0f}%)")
+    p0 = cond["ALL"][0] / max(cond["ALL"][1], 1)
+    print(f"\nconditions among within-window candidate pairs (prior P(coref)={100 * p0:.1f}%):")
+    for name in ("head_match", "gender_clash", "number_clash", "sametype_PRON", "sametype_NOUN", "sametype_PROPN"):
+        if name in cond:
+            c, t = cond[name]
+            print(f"  {name:14s} P(coref)={100 * c / max(t, 1):5.1f}%   [{t} pairs]")
+
+
 if __name__ == "__main__":
-    # Mention-level Stage B: current best (85.56 F1 on test, channel="both")
-    # channel ablation: "both" | "bge" | "ctx". Stage A must be trained for the same
-    # channel before Stage B (Stage B loads the channel-tagged frozen head).
+    stage_a_error_analysis(window=256, subset="all8k", channel="both")
+    # GNN Stage B — current best config: lse member pooling + negative subsampling. Stage A's
+    # frozen head for this channel must already exist (it is loaded, not retrained here).
     channel = "both"
     head_path = MODELS_DIR / f"{_win_names(256, 'all8k', channel)[1]}.pt"
     if not head_path.exists():
         train_stage2(window=256, subset="all8k", channel=channel)
-    train_stage_b(window=256, subset="all8k", head="gnn", dropout=0.2, channel=channel, member_pool="lse", neg_ratio=5)
+    train_stage_b(
+        window=256,
+        subset="all8k",
+        head="gnn",
+        dropout=0.2,
+        channel=channel,
+        member_pool="lse",
+        neg_ratio=5,
+        lexical=True,
+    )

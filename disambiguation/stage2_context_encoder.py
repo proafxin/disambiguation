@@ -306,11 +306,15 @@ class ClusterGNN(nn.Module):
         channel: str = "both",
         max_windows: int = 64,
         member_pool: str = "attn",
+        use_lexical: bool = False,
+        use_agreement: bool = False,
     ):
         super().__init__()
         self.channel = channel
         self.max_windows = max_windows
         self.member_pool = member_pool  # how a cluster's members collapse to one node vector
+        self.use_lexical = use_lexical
+        self.use_agreement = use_agreement
         if channel in ("both", "ctx"):
             self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
         if channel in ("both", "bge"):
@@ -325,8 +329,13 @@ class ClusterGNN(nn.Module):
             activation="gelu", batch_first=True,
         )
         self.gnn = nn.TransformerEncoder(layer, n_layers)
+        # Symbolic channels (lexical 3-d, agreement 6-d) are CONCATENATED into the pair feature
+        # vector and read jointly by the score MLP — not added as a separate scalar — so the head
+        # can use them conditionally and non-linearly (e.g. a gender clash vetoes only pronoun
+        # pairs) and they never couple through the shared null_bias.
+        sym = (3 if use_lexical else 0) + (6 if use_agreement else 0)
         self.score = nn.Sequential(
-            nn.Linear(4 * hidden, hidden),
+            nn.Linear(4 * hidden + sym, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
@@ -363,10 +372,12 @@ class ClusterGNN(nn.Module):
         return torch.stack([self._pool_members(self._member_vecs(ctx, bge)) for ctx, bge in clusters])
 
     def forward(
-        self, clusters: list[tuple[torch.Tensor, torch.Tensor]], win_ids: torch.Tensor
+        self, clusters: list[tuple[torch.Tensor, torch.Tensor]], win_ids: torch.Tensor,
+        lex: torch.Tensor | None = None, agr: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # clusters ordered by first-mention position; win_ids: (C,) long window indices.
-        # Returns (C, C) antecedent scores (row i over antecedents j<i) and the j<i mask.
+        # clusters ordered by first-mention position; win_ids: (C,) long window indices;
+        # lex: optional (C, C, 3) lexical features; agr: optional (C, C, 6) agreement features —
+        # both added to the antecedent score. Returns (C, C) scores (row i over j<i) and the mask.
         C = len(clusters)
         h0 = self.node_in(self._node_feats(clusters))  # (C, hidden)
         h0 = h0 + self.win_emb(win_ids.clamp(max=self.max_windows - 1))
@@ -381,7 +392,12 @@ class ClusterGNN(nn.Module):
         ante = (idx.unsqueeze(1) > idx.unsqueeze(0)) & (win_ids.unsqueeze(1) != win_ids.unsqueeze(0))
         hi = h.unsqueeze(1).expand(C, C, -1)
         hj = h.unsqueeze(0).expand(C, C, -1)
-        feat = torch.cat([hi, hj, hi * hj, (hi - hj).abs()], dim=-1)
+        parts = [hi, hj, hi * hj, (hi - hj).abs()]
+        if lex is not None:
+            parts.append(lex)  # (C, C, 3) lexical features, read jointly by the MLP
+        if agr is not None:
+            parts.append(agr)  # (C, C, 6) agreement features, read jointly by the MLP
+        feat = torch.cat(parts, dim=-1)
         scores = self.score(feat).squeeze(-1)  # (C, C)
         return scores, ante
 
