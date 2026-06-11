@@ -281,6 +281,7 @@ def train_stage_b(
     sent_aligned: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
+    force: bool = False,
 ) -> None:
     print(
         f"\nTraining Stage B GNN... (window={window}, subset={subset}, "
@@ -288,6 +289,9 @@ def train_stage_b(
     )
     ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset, channel, sent_aligned=sent_aligned)
     ckpt_b = ckpt_b.replace(".pt", f"_gnn_{member_pool}{'_lex' if lexical else ''}{'_agr' if agreement else ''}.pt")
+    if not eval_only and not force and (MODELS_DIR / ckpt_b).exists():
+        print(f"✓ Stage B checkpoint {ckpt_b} exists; loading for eval instead of retraining (force=True to retrain).")
+        eval_only = True
     nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
     docs = build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n)
     docs = _filter_docs(docs, subset)
