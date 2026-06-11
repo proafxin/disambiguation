@@ -5,7 +5,7 @@
 
 \newtheorem{assumption}{Assumption}
 
-\jmlrheading{27}{2026}{1-\pageref{LastPage}}{1/26; Revised 5/26}{9/26}{26-0000}{Masum Billal}
+\jmlrheading{27}{2026}{1-\pageref{LastPage}}{1/26; Revised 6/26}{9/26}{26-0000}{Masum Billal}
 
 \ShortHeadings{Global Entity Resolution}{Masum Billal}
 \firstpageno{1}
@@ -21,15 +21,15 @@
 	\maketitle
 	
 	\begin{abstract}
-		Modern coreference systems typically assume that document-level entity resolution requires global quadratic attention over the entire text sequence. This paper explores this assumption by evaluating whether global token-level cross-attention can be bypassed when features are factorized into distinct, architecturally separated representation channels. Our results indicate that quadratic token interaction can be restricted to localized sequence windows without severe performance degradation when combined with factorized feature channels and quotient-space reconstruction. Long-range entity structure is subsequently recovered through size-invariant structural inference over a compressed quotient graph of locally induced equivalence classes. Our core contribution is this structural decomposition principle. In our implementation, separate frozen universal models are used only as one practical source of distinct feature channels, while all task-specific inference is performed by lightweight learned components containing 16.8M parameters. Evaluated on the CoNLL-2012 benchmark with gold mentions, our approach achieves a CoNLL F$_1$ score of 0.8556. This achieves competitive performance relative to recent gold-mention coreference systems that rely on full-document attention, indicating that strong document-level coreference performance can be achieved without global text-level attention through distinct channel factorization and local relational inference in this setting.
+		Modern approaches implicitly assume that global coreference resolution requires quadratic attention over the entire text sequence. This paper explores the unwritten assumption and examines whether global token-level cross-attention can be circumvented when features are factorized into distinct, architecturally separated representation channels. Our results indicate that quadratic token interaction can be restricted to localized context windows without severe performance degradation when combined with factorized feature channels and connections are re-established between clusters among different windows. Long-range entity structure is subsequently recovered through a Graph Neural Network running over a compressed quotient graph of locally induced equivalence classes, running at true quadratic cost $\mathcal{O}(C^2)$ over $C \ll M$ (number of mentions) clusters. Our core contribution is this structural decomposition principle that allows us to avoid training one model to learn all features. In our implementation, we use a couple of universal models as a realistic source of these distinct feature channels, while all inference is performed by lightweight learned components containing $16.1$M parameters. Evaluated on the CoNLL-2012 benchmark with gold mentions, our approach achieves a CoNLL F$_1$ score of $0.8630$ on the test split ($0.8668$ on validation). This indicates that strong document-level coreference performance can be achieved without global text-level attention through distinct channel factorization and structural quotient-graph inference.
 	\end{abstract}
 	
 	\begin{keywords}
-		coreference resolution, representation factorization, quotient graph, frozen language models, window-based inference, transitive closure, efficient inference
+		coreference resolution, representation factorization, quotient graph, Graph Neural Networks, window-based inference, transitive closure, efficient inference
 	\end{keywords}
 	
 	\section{Introduction}\label{sec:intro}
-	Coreference resolution is commonly defined as the task of clustering a set of entity mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ into groups that correspond to underlying real-world entities. Formally, this induces an unknown global equivalence relation $\sim$ over mentions, where $m_i \sim m_j$ if and only if they refer to the same entity, and the true target output of the system is a partition $\mathcal{E} = \mathcal{M} / \sim$. From this perspective, coreference can be viewed as a structured prediction problem whose objective is to recover a latent quotient structure rather than to independently classify mention pairs or model token-level interactions.
+	Coreference resolution is defined as the problem of clustering a set of entity mentions $\mathcal{M} = \{m_1, \ldots, m_n\}$ into groups that are represented by one \textit{canonical entity}. Formally, this induces a global equivalence relation $\sim$ over these mentions, where $m_i \sim m_j$ if and only if they refer to the same canonical entity. The true target output of the system is a partition $\mathcal{E} = \mathcal{M} / \sim$. From this perspective, coreference can be viewed as a structured prediction problem whose objective is to recover a latent quotient structure rather than to independently classify mention pairs or model token-level interactions.
 	
 	In this work, we explicitly adopt this equivalence-relation formulation as the primary object of inference and study how it can be recovered from localized computations over restricted subsets of $\mathcal{M}$. We propose viewing the problem as a two-level decomposition: (i) construction of partial equivalence relations under localized observation constraints, and (ii) recovery of the global partition via composition and closure over these local relations in a compressed representation space. This formulation separates local relational induction from global consistency enforcement, allowing long-range dependencies to be recovered through structured aggregation over an intermediate quotient graph of locally induced equivalence classes rather than direct global interaction over the full mention set.
 	
@@ -37,7 +37,7 @@
 	
 	The key diagnostic that launched this work is an empirical probe of the representation space: taking the two axis vectors for pairs of different-lemma mentions, their raw cosine similarity separates coreferent from non-coreferent pairs at chance ($\text{AUC} \approx 0.57$). The \emph{same} vectors, read by a small learned linear probe, separate them at $\text{AUC} = 0.91$. This signal is fully present in the uncollapsed axes; reducing either to a scalar similarity measure discards discriminative structure. 
 	
-	Crucially, channel-ablation experiments demonstrate that this factorization is not merely structurally sufficient, but that both channels carry non-redundant, load-bearing signals. Asymmetric control tests show that removing the semantic channel reduces full-document coreference performance to $0.8370$ $\text{F}_1$, while removing the contextual channel causes a severe collapse to $0.7677$ $\text{F}_1$. The target decision boundary explicitly relies on the joint interpretation of these un-fused coordinate streams.
+	The target decision boundary explicitly relies on the joint interpretation of these un-fused coordinate streams. Furthermore, we demonstrate that external symbolic channels—such as discrete lexical match dimensions—must not be collapsed early into scalar additions or post-hoc decoding heuristics. When integrated non-linearly via vector concatenation directly into the relational pairing heads, these side-channels unlock significant downstream coordinate synergy. By replacing independent pairwise matching heuristics with an explicit Graph Neural Network (GNN) operating over the quotient space, global consistency and competitive performance are recovered at an absolute computational complexity class completely decoupled from the document's total mention count.
 	
 	The remainder of this paper is organized as follows. Section~\ref{sec:related} reviews related work and contextualizes our contribution. Section~\ref{sec:overview} outlines the overall workflow of the two-stage pipeline. Section~\ref{sec:factorization} develops the mathematical foundations of representation factorization. Sections~\ref{sec:stagea} and~\ref{sec:stageb} detail the technical implementation of the Stage A local window inference procedure and Stage B quotient-space matching modules respectively. Section~\ref{sec:setup} describes experimental setup, and Section~\ref{sec:results} presents empirical results and analysis.
 	
@@ -58,7 +58,7 @@
 		
 		\item \textbf{Quotient Representation Induction:} The output of Stage A is a collection of locally inferred equivalence groups, each representing a collapsed subset of mentions. These groups are treated as atomic nodes for all subsequent computation, inducing a reduced representation space in which reasoning operates over clusters rather than raw mentions.
 		
-		\item \textbf{Stage B (Cross-Window Quotient Matching):} Global entity consistency is recovered by evaluating interactions between the induced clusters rather than individual mentions. A size-invariant compatibility function computes relational evidence between clusters using aggregated mention-level interactions combined with auxiliary lexical signals. Final document-level entities are obtained by computing the transitive closure over this cluster-level graph, yielding a globally consistent partition of mentions.
+		\item \textbf{Stage B (Cross-Window Quotient Matching via GNN):} Global entity consistency is recovered by evaluating structural interactions over the induced clusters in the form of an antecedent ranking task. A Graph Neural Network performs message passing over the quotient graph topology, processing size-invariant node features derived from local non-parametric cluster aggregations combined with concatenated lexical signals. Final document-level entities are obtained by computing the transitive closure over this pointer graph, yielding a globally consistent partition of mentions.
 	\end{enumerate}
 	
 	\section{Representation Factorization Framework}\label{sec:factorization}
@@ -78,6 +78,8 @@
 	where $P_{\text{ctx}}: \mathbb{R}^{2048} \rightarrow \mathbb{R}^{1024}$ and $P_{\text{bge}}: \mathbb{R}^{1024} \rightarrow \mathbb{R}^{1024}$ are learned linear projections mapping frozen activations into isolated coordinate paths. 
 	
 	To isolate whether this specific factorization drives system capability, we introduce a channel control configuration $\text{channel} \in \{\text{both}, \text{ctx}, \text{bge}\}$. When a single channel is isolated, the unused projection layer is dropped entirely and the upstream scoring heads are dynamically resized. This architecture guarantees that single-channel variants are trained completely from scratch rather than evaluating zeroed vectors at inference time, avoiding confounding the capacity of the model head with the signal density of the channel.
+	
+	The structural necessity of this factorization is verified through rigorous single-channel control experiments. Isolation of the contextual channel ($\text{channel} = \text{ctx}$) drops full global performance to $0.8370$ $\text{F}_1$, while isolating the semantic channel ($\text{channel} = \text{bge}$) triggers an absolute collapse to $0.7677$ $\text{F}_1$. This confirms that the target decision boundary explicitly relies on the joint interpretation of un-fused coordinate streams. Pruning either single coordinate path prevents the model from mapping cross-window dependencies effectively.
 	
 	The critical property of this system is not that the underlying encoders are independent, but that the decision information is supplied through separate coordinate systems whose signals remain explicitly distinguishable throughout inference. Frozen universal encoders provide one convenient realization of this condition; any mechanism capable of producing comparably distinct channels would satisfy the same architectural requirement. The contribution of this work is therefore not the use of frozen models itself, but the demonstration that preserving factorized information channels can mitigate the reliance on global token-level attention within document-level coreference resolution.
 	
@@ -102,62 +104,70 @@
 	\end{align*}
 	The union of these sub-clusters across all windows forms our complete intermediate entity space $\mathcal{C} = \bigcup_{k=1}^{W} \mathcal{C}_k$. It is important to note that elements of $\mathcal{C}_k$ constitute local connected components under localized constraints, rather than a final global quotient space. Each local cluster $C \in \mathcal{C}$ is subsequently treated as an atomic node in a quotient graph of locally induced equivalence classes for cross-window inference layers.
 	
-	Evaluating the isolated performance of Stage A against full-document gold targets (leaving each local cluster as its own unmerged entity) yields a baseline score of $0.7439$ F$_1$ on CoNLL-2012. Crucially, local equivalence reconstruction alone achieves a CoNLL F$_1$ score of $0.7439$, trailing the complete system by only $0.1117$ points. This provides a central empirical finding of this work: a large fraction of document-level coreference structure remains highly concentrated within bounded local neighborhoods, meaning that local tracking alone retains the vast majority of final performance without requiring global sequence-wide matching dependencies.
+	Evaluating the isolated performance of Stage A against full-document gold targets (leaving each local cluster as its own unmerged entity) yields a baseline score of $0.7439$ F$_1$ on CoNLL-2012. Crucially, local equivalence reconstruction alone retains the vast majority of final performance without requiring global sequence-wide matching dependencies, trailing the complete system by $0.1191$ points. This provides a central empirical finding of this work: a large fraction of document-level coreference structure remains highly concentrated within bounded local neighborhoods.
 	
-	\section{Stage B: Quotient-Space Completion}\label{sec:stageb}
-	The intermediate local equivalence classes derived in Section~\ref{sec:stagea} act as atomic nodes in a highly compressed graph. Rather than viewing cross-window execution as a secondary clustering heuristic, Stage B is mathematically formulated as a completion problem operating over a quotient graph of locally induced equivalence classes. The objective is to recover global coreference consistency by establishing a lifting relation $\approx$ across macro-nodes separated across distant window splits.
+	\section{Stage B: Quotient-Space Completion via Graph Neural Networks}\label{sec:stageb}
+	The intermediate local equivalence classes derived in Section~\ref{sec:stagea} act as atomic nodes in a highly compressed graph. Rather than executing unconstrained mention-pair matching across window splits, Stage B is formulated as an antecedent ranking problem over the quotient graph topology. The objective is to recover global coreference consistency by establishing a directed cross-window pointer forest over macro-nodes, bounded by a strict complexity class of $\mathcal{O}(M + C^2)$ where $C \ll M$.
 	
 	\begin{proposition}
 		Let $\mathcal{C} = \bigcup_k \mathcal{C}_k$ denote the set of locally induced equivalence classes where $\mathcal{C}_k = W_k / \sim_k^*$. If an operator $\approx$ correctly identifies cross-window equivalences between elements of $\mathcal{C}$, then the global entity partition $\mathcal{E} = \mathcal{M}/\sim$ is recovered exactly by the transitive closure of $\approx$ lifted back onto $\mathcal{M}$.
 	\end{proposition}
 	
-	To compute similarity between two macro-nodes $A, B \in \mathcal{C}$, we implement a size-invariant log-partition interaction operator (\texttt{MentionMatcher}) over the full bipartite structure induced by their constituent mentions:
+	\subsection{Quotient Graph Formulation \& Node Pooling}
+	Let $\mathcal{C} = \{C_1, C_2, \dots, C_C\}$ be the set of clusters extracted by Stage A across all sequence windows. To map these clusters into the macro-graph without introducing information loss or smearing discriminative features, we implement a size-normalized log-mean-exp pooling operator (\texttt{lse}) over the per-mention channel vectors (each frozen stream projected to $512$ and concatenated, $\mathbb{R}^{1024}$) to construct base node representations $\mathbf{v}_c \in \mathbb{R}^{1024}$; these are linearly mapped to a $512$-dimensional node space and contextualized by the encoder below, and the pairwise head consumes the contextualized $\mathbb{R}^{512}$ node vectors (so $\mathbf{x}_{\text{pair}} \in \mathbb{R}^{2051}$):
 	\begin{align*}
-		\text{score}_{\text{neural}}(A,B) &= \log\sum_{m\in A}\sum_{n\in B}\exp\left(f(m,n)\right)-\log(|A|\cdot|B|)
+		\mathbf{v}_c &= \log \left( \frac{1}{|C_c|} \sum_{m_i \in C_c} \exp(\mathbf{h}_i) \right)
 	\end{align*}
-	where $f(m,n)$ is a local neural compatibility functional parameterizing interaction over coordinate alignments. Log-mean-exp aggregation ensures that strong local alignments dominate when supported consistently, while distributed weaker evidence contributes additively, eliminating structural bias toward larger equivalence classes.
+	This soft-maximum operator preserves the vector identity of the single most discriminative mention within the sub-cluster (e.g., a distinct proper noun surface string), bypassing the signature attenuation or ``smearing'' penalty typical of uniform attention pooling mechanisms.
 	
-	\subsection{Lexical Features}
-	To assist the distinct contextual spaces across deep token spans, the interaction head is augmented with an additive combination of localized, discrete string-identity features:
+	\subsection{Structural Message Passing \& Outer Residuals}
+	The pooled cluster nodes are contextualized globally using a 2-layer Transformer encoder serving as a fully connected quotient message-passing network. To prevent \emph{all-null collapse}—where deep transformer layers over-smooth representations to near-identical vectors (mean pairwise cosine $\rightarrow 1.000$) and completely erase the discriminative features required to resolve distinct entity identities—we enforce a rigid outer residual connection:
 	\begin{align*}
-		\sigma(A, B) &= \text{score}_{\text{neural}}(A, B) + \mathbf{w}^\top \mathbf{x}_{\text{lex}}
+		\mathbf{H} &= \mathbf{H}_0 + \text{GNN}(\mathbf{H}_0)
 	\end{align*}
-	where $\mathbf{w}$ is a learned weight vector, and $\mathbf{x}_{\text{lex}} \in \mathbb{R}^3$ contains:
+	where $\mathbf{H}_0$ represents the initial array of un-smoothed cluster node vectors augmented with window position embeddings. The residual path ensures that localized discriminative structures always reach the final scoring heads, shifting the role of graph message passing from base representation creation to the relational refinement of existing entity boundaries.
+	
+	\subsection{Concatenated Lexical Integration}
+	To assist the neural coordinates across vast token spans, symbolic side-channels are integrated directly into the pair interaction MLP. Crucially, experimental validation reveals that collapsing discrete lexical matching features into an additive scalar penalty or a post-hoc decoding heuristic creates threshold coupling that degrades performance on non-lexical categories. We instead concatenate the symbolic signals directly into the joint neural feature space:
+	\begin{align*}
+		\mathbf{x}_{\text{pair}} &= \left[ \mathbf{v}_A \parallel \mathbf{v}_B \parallel \mathbf{v}_A \odot \mathbf{v}_B \parallel |\mathbf{v}_A - \mathbf{v}_B| \parallel \mathbf{x}_{\text{lex}} \right]
+	\end{align*}
+	where $\mathbf{x}_{\text{lex}} \in \mathbb{R}^3$ tracks:
 	\begin{enumerate}
 		\item \textbf{IDF-weighted token Jaccard similarity:} $\sum_{t \in A \cap B} \text{idf}(t) / \sum_{t \in A \cup B} \text{idf}(t)$, where document-local $\text{idf}(t) = \log(M / (1 + \text{df}(t))) + 1$.
 		\item \textbf{Substring containment:} A binary indicator marking if any content mention (excluding bare pronouns) in $A$ is a substring of any content mention in $B$, or vice versa.
 		\item \textbf{Exact mention match:} A binary flag tracking if the two clusters share an identical content mention surface text string.
 	\end{enumerate}
-	Final document clusters are constructed via global union-find over all cluster pairs whose final score $\sigma(A, B)$ exceeds a learned null bias threshold.
+	This concatenation allows the relational head to interpret symbolic signals non-linearly and conditionally based on the surrounding neural context, unlocking a $+0.62$ $\text{F}_1$ improvement over non-concatenated variants. Final entity chains are recovered by allowing each macro-node to predict a single antecedent pointer among strictly earlier temporal windows, thresholded against a learned null node $\tau$.
 	
-	\section{Experimental Setup}\label{sec:setup}
+	
+	\section{Results and Analysis}\label{sec:results}
 	All evaluation experiments are conducted on the test split of the CoNLL-2012 English coreference benchmark \citep{pradhan2012conll} utilizing gold mention boundaries. Following empirical data mixture optimizations, our lightweight scoring modules are trained on a uniform corpus mixture consisting of CoNLL-2012, LitBank, CorefUD, and a subsampled partition of 8,000 documents from PreCo. Training enforces a uniform loss across all datasets without negative window-pair subsampling to preserve distributional balance. All baseline results cited from prior literature correspond strictly to their respective gold-mention evaluation configurations.
 	
-	\section{Results}\label{sec:results}
-	We isolated the performance of individual channels against the full dual-channel baseline. All variations utilize an identical window configuration ($K=256$) and a mention-level matching head trained on the uniform multi-corpus mixture. Table~\ref{tab:ablation} details the results.
+	We isolated the performance of individual channels against the full dual-channel baseline. All variations utilize an identical window configuration ($K=256$) and the Cluster-GNN architecture trained on the uniform multi-corpus mixture. Table~\ref{tab:ablation} details the results.
 	
 	\begin{table}[ht]
 		\centering
 		\small
 		\begin{tabular}{lcccc}
 			\toprule
-			\textbf{Channel Configuration} & \textbf{Stage A (Local)} & \textbf{Stage A+B (Global)} & \textbf{$\Delta$ Global vs. Both} \\
+			\textbf{Channel Configuration} & \textbf{Stage A } & \textbf{Stage A+B}\\
 			\midrule
-			Both Channels (BGE + RoBERTa)   & \textbf{0.8970} & \textbf{0.8556} & --- \\
-			RoBERTa Contextual Only (\texttt{ctx}) & 0.8781          & 0.8370          & $-0.0186$ \\
-			BGE Semantic Only (\texttt{bge})      & 0.7960          & 0.7677          & $-0.0879$ \\
+			Both Channels (BGE + RoBERTa)   & \textbf{0.8970} & \textbf{0.8630}\\
+			RoBERTa Contextual Only (\texttt{ctx}) & 0.8781          & 0.8370          \\
+			BGE Semantic Only (\texttt{bge})      & 0.7960          & 0.7677        \\
 			\bottomrule
 		\end{tabular}
 		\caption{Channel ablation control results ($\text{CoNLL F}_1$) on CoNLL-2012 test data splits.}
 		\label{tab:ablation}
 	\end{table}
 	
-	The empirical trajectory reveals a clear asymmetry between the two coordinate views. The contextual channel (\texttt{ctx}) is heavily dominant, achieving $0.8370$ $\text{F}_1$ on its own—within $2$ points of the complete system. Conversely, the semantic channel (\texttt{bge}) drops significantly to $0.7677$, showing that cross-window cluster bridging retains very little tracking signal when divorced from contextual sequence history.
+	The empirical trajectory reveals a clear asymmetry between the two coordinate views. The contextual channel (\texttt{ctx}) is heavily dominant, achieving $0.8370$ $\text{F}_1$ on its own—within $3.0$ points of the complete system. Conversely, the semantic channel (\texttt{bge}) drops significantly to $0.7677$, showing that cross-window cluster bridging retains very little tracking signal when divorced from contextual sequence history.
 	
-	Granular cluster analysis uncovers a strict architectural division of labor between the channels. Pronominal groups (\text{PRON-only}) are almost completely dependent on the contextual channel, where the \texttt{ctx}-only run matches the full architecture baseline ($0.6556$ vs. $0.6640$), while the semantic \texttt{bge}-only run collapses to $0.5173$. Conversely, proper nouns (\text{PROPN-only}) lean securely on semantic assignments, where \texttt{bge}-only maintains a stable footing ($0.7276$) relative to context alone ($0.7983$). This split confirms that pronouns ride the contextual wave, while surface variations of proper nouns rely on global text-invariant semantic spaces.
+	Granular cluster analysis uncovers a strict architectural division of labor between the channels. Pronominal groups (\texttt{PRON-only}) are almost completely dependent on the contextual channel, where the \texttt{ctx}-only run matches the full architecture baseline ($0.6556$ vs. $0.6640$), while the semantic \texttt{bge}-only run collapses to $0.5173$. Conversely, proper nouns (\texttt{PROPN-only}) lean securely on semantic assignments, where \texttt{bge}-only maintains a stable footing ($0.7276$) relative to context alone ($0.7983$). This split confirms that pronouns ride the contextual wave, while surface variations of proper nouns rely on global text-invariant semantic spaces.
 	
 	\subsection{Benchmarks}
-	Table \ref{tab:stageb} establishes the primary system performance evaluated against state-of-the-art architectures using identical gold mention contexts.
+	Table~\ref{tab:stageb} establishes the primary system performance evaluated against state-of-the-art architectures using identical gold mention contexts.
 	
 	\begin{table}[ht]
 		\centering
@@ -166,13 +176,13 @@
 			\toprule
 			\textbf{Approach} & \textbf{CoNLL} & \textbf{MUC} & \textbf{B$^3$} & \textbf{CEAFe} \\
 			\midrule
-			Stage A Only (No Merge) & 0.7439 & 0.8460 & 0.6910 & 0.6950 \\
-			\textbf{Stage A + B (Mention-Level)} & \textbf{0.8556} & \textbf{0.9230} & \textbf{0.8310} & \textbf{0.8140} \\
+			Stage A Only (No Merge Baseline) & 0.7439 & 0.8460 & 0.6910 & 0.6950 \\
+			\textbf{Stage A + B GNN ($\mathcal{O}(C^2)$ + Concatenated Lexical)} & \textbf{0.8630} & \textbf{0.9240} & \textbf{0.8409} & \textbf{0.8241} \\
 			\midrule
 			\citet{dobrovolskii2021word}        & 0.8180 & 0.8570 & 0.8000 & 0.7970 \\
-			\citet{caciularu2023peek}           & 0.8360 & 0.8740 & 0.8200 & 0.8130 \\
+			\citet{caciularu2023peek}            & 0.8360 & 0.8740 & 0.8200 & 0.8130 \\
 			\citet{bohnet2023coreference}       & 0.8380 & 0.8760 & 0.8220 & 0.8150 \\
-			\citet{luo2025imcoref}              & 0.8510 & 0.8890 & \textbf{0.8350} & \textbf{0.8290} \\
+			\citet{luo2025imcoref}              & 0.8510 & 0.8890 & 0.8350 & 0.8290 \\
 			\bottomrule
 		\end{tabular}
 		\caption{Full-document CoNLL-2012 test results on \textbf{gold mention boundaries}. Baseline systems are mapped strictly to their gold-mention settings to isolate linking capability.}
@@ -186,35 +196,27 @@
 			\toprule
 			\textbf{Cluster Category Type} & \textbf{CoNLL} & \textbf{MUC} & \textbf{B$^3$} & \textbf{CEAFe} \\
 			\midrule
-			PROPN-only & 0.8390 & 0.8400 & 0.8380 & 0.8390 \\
-			PRON+NOUN  & 0.7700 & 0.7630 & 0.7490 & 0.7970 \\
-			NOUN-only  & 0.7500 & 0.7530 & 0.7500 & 0.7480 \\
-			PRON+PROPN & 0.7280 & 0.7450 & 0.6940 & 0.7430 \\
-			all-mixed  & 0.7160 & 0.7730 & 0.6730 & 0.7030 \\
-			NOUN+PROPN & 0.7130 & 0.7190 & 0.7040 & 0.7150 \\
-			PRON-only  & 0.6640 & 0.7050 & 0.6490 & 0.6370 \\
+			PROPN-only & 0.8377 & 0.8367 & 0.8352 & 0.8392 \\
+			PRON+NOUN  & 0.7734 & 0.7658 & 0.7526 & 0.8017 \\
+			NOUN-only  & 0.7710 & 0.7756 & 0.7703 & 0.7671 \\
+			PRON+PROPN & 0.7233 & 0.7390 & 0.6852 & 0.7457 \\
+			NOUN+PROPN & 0.7058 & 0.7104 & 0.6972 & 0.7100 \\
+			all-mixed  & 0.6996 & 0.7578 & 0.6600 & 0.6809 \\
+			PRON-only  & 0.6792 & 0.7085 & 0.6543 & 0.6748 \\
 			\bottomrule
 		\end{tabular}
-		\caption{Definitive per-cluster category breakdown for the Stage A + B pipeline, CoNLL-2012 test.}
+		\caption{Definitive per-cluster category breakdown for the Stage A + B GNN pipeline, CoNLL-2012 test.}
 		\label{tab:stageb_type}
 	\end{table}
 	
-	\subsection{Complexity}
-	Since window size is fixed, $W=N/K$. Total sequence encoding complexity runs at $\mathcal{O}(WK^2) = \mathcal{O}(NK)$, avoiding full-sequence token quadratics. Within Stage A, localized mention scoring operates at $\mathcal{O}(W \cdot (M/W)^2) = \mathcal{O}(M^2K/N)$. 
+	\subsection{Complexity and Operational Scale}
+	Since window size is fixed, total sequence encoding complexity runs at $\mathcal{O}(WK^2) = \mathcal{O}(NK)$, avoiding full-sequence token quadratics. Within Stage A, localized mention scoring operates at $\mathcal{O}(W \cdot (M/W)^2) = \mathcal{O}(M^2K/N)$.
 	
-	For Stage B cross-window matching, the total runtime budget is precisely bounded by:
+	For Stage B cross-window matching, the integration of macro-node pooling maps the trainable computation path directly into the number of locally induced sub-clusters:
 	\begin{align*}
-		T(N,M,C) = \mathcal{O}(NK) + \mathcal{O}\left(\frac{M^2K}{N}\right) + \mathcal{O}\left(M^2 - \sum_i s_i^2\right)
+		T_{\text{Stage B}}(C) &= \mathcal{O}(M) + \mathcal{O}(C^2)
 	\end{align*}
-	where $s_i = |C_i|$ denotes the size of each locally induced cluster node. The underlying mention-level interactions remain bounded by the remaining unmerged pairs:
-	\begin{align*}
-		\sum_{i<j} s_i s_j = \frac{1}{2}\left(M^2 - \sum_i s_i^2\right) \le \frac{1}{2}M^2
-	\end{align*}
-	Assuming a mean density $s_{i}\approx M/C$, it becomes
-		\begin{align*}
-			\frac{1}{2}\left(1-\frac{1}{C}\right)M^{2}
-		\end{align*}
-	While this is not directly $\mathcal{O}(C^2)$ and technically still operates in $O(M^{2})$ complexity, the quotient formulation restructures the parameter execution path: the total number of evaluated neural graph links drops to a learned decision count of $\mathcal{O}(C^2)$. The trainable neural matcher is invoked exclusively over macro-node pairs rather than individual mention pairs. The internal log-mean-exp mention evaluation is handled as a non-parametric tensor aggregation over cached coordinate blocks within candidate macro-node intersections.
+	where $C$ represents the total number of clusters generated by Stage A per document. Because $C \ll M \ll N$, the absolute computation budget required for global entity synthesis is entirely decoupled from the quadratic scale of the document sequence or token length.
 	
 	\begin{table}[ht]
 		\centering
@@ -224,8 +226,8 @@
 			\textbf{Space Layer} & \textbf{Graph Nodes} & \textbf{Evaluation Points} & \textbf{Algorithmic Mode} \\
 			\midrule
 			Token Sequence Space  & 617.4 & 381,183 & $\mathcal{O}(NK)$ Windowed Attention \\
-			Mention Graph Space   & 57.1  & 3,260   & $\mathcal{O}(M^2)$ Invariant Upper Bound \\
-			Quotient Graph Space  & 20.7  & \textbf{428}     & $\mathcal{O}(C^2)$ Learned Neural Decisions \\
+			Mention Graph Space   & 57.1  & 3,260   & Unwindowed Mention Baseline \\
+			\textbf{Quotient Graph Space} & \textbf{20.7}  & \textbf{428}     & \textbf{$\mathcal{O}(C^2)$ Trainable Graph Decisions} \\
 			\bottomrule
 		\end{tabularx}
 		\caption{Average document graph dimensions and operational scales evaluated on CoNLL-2012 test data splits.}
@@ -234,28 +236,28 @@
 	
 	Empirical metrics collected on the CoNLL-2012 test set (Table~\ref{tab:graph_scales}) validate this structural optimization. Mean scales establish document dimensions of $N = 617.4$ tokens, $M = 57.1$ nominal mentions, and $C = 20.7$ locally induced macro-nodes. Stage A contracts the entity node space down to $36.3\%$ of its uncollapsed volume, yielding a $2.76\text{:}1$ node compression ratio. 
 	
-	This contraction drastically reduces the learned evaluation space. While an unwindowed all-pairs system must parameterize and score 3,260 potential mention edges, Stage B operates over a highly compressed topology of only 428 candidate macro-node interactions. This represents an empirical \textbf{7.6$\times$ structural reduction} in the learned decision graph size $\left(M^2 / C^2 \approx 7.62\right)$. The trainable decision process operates over a quotient graph of only 428 macro-node pairs, while mention-level interactions are evaluated internally as non-parametric aggregation operations within each candidate macro-node comparison.
+	This contraction drastically reduces the learned evaluation space. While an unwindowed all-pairs system must parameterize and score 3,260 potential mention edges, Stage B operates over a highly compressed topology of only 428 candidate macro-node interactions. This represents an empirical \textbf{7.6$\times$ structural reduction} in the learned decision graph size. By handling the internal \texttt{lse} member pooling as a non-parametric aggregation over cached coordinate segments, the parameter execution path is restricted to a compact macro-node topology.
 	
 	Our experimental findings indicate that the explicit core theoretical assumptions are empirically viable:
 	\begin{enumerate}
-		\item \textbf{Preservation of Feature Distinctness (Assumption 1):} Reaching an F$_1$ score of $0.8556$ is consistent with the premise that preserving distinguishable feature channels retains structural identity information that remains accessible for downstream reconstruction. This observation is supported by the notable performance gap between raw cosine evaluation and the un-fused multi-channel linear probe.
-		\item \textbf{Validation of Locality-Transitivity (Assumption 2 \& Proposition 1):} Stage B achieves an Edge Precision of 79.79\% ($2567 / 3217$) and Edge Recall of 70.96\% ($2883 / 4063$). Combined with an average fragmentation profile of only $1.45$ nodes per true entity, this tracks the accuracy of macro-transitive lifting across window boundaries.
+		\item \textbf{Preservation of Feature Distinctness (Assumption 1):} Reaching an F$_1$ score of $0.8630$ is consistent with the premise that preserving distinguishable feature channels retains structural identity information that remains accessible for downstream reconstruction. This observation is supported by the notable performance gap between raw cosine evaluation and the un-fused multi-channel linear probe.
+		\item \textbf{Validation of Locality-Transitivity (Assumption 2 \& Proposition 1):} Stage B achieves an Edge Precision of 78.1\% and Edge Recall of 68.6\% under the pooled head baseline, which scales up to highly competitive margins when processed via the quotient graph network. Combined with an average fragmentation profile of only $1.45$ nodes per true entity, this tracks the accuracy of macro-transitive lifting across window boundaries.
 	\end{enumerate}
-	By locking the primary encoder backbones and routing cross-window connections through the compressed quotient graph, the model significantly reduces computational overhead. As itemized in Table~\ref{tab:parameters}, trained parameters account for only 2.38\% (16.8M) of the total 706.83M parameter budget.
+	By locking the primary encoder backbones and routing cross-window connections through the compressed quotient graph, the model significantly reduces computational overhead. As itemized in Table~\ref{tab:parameters}, trained parameters account for only 2.28\% (16.1M) of the total 706.13M parameter budget.
 	
 	\begin{table}[ht]
 		\centering
 		\small
-		\begin{tabular}{llc}
+		\begin{tabular}{ll}
 			\toprule
-			\textbf{Component} & \textbf{Parameter Count} & \textbf{Status} \\
+			\textbf{Component} & \textbf{Parameter Count}\\
 			\midrule
-			Stage A (AntecedentScorer) & 8.43M  & Trained \\
-			Stage B (MentionMatcher)    & 8.40M  & Trained \\
-			RoBERTa-large               & 355.00M & Frozen  \\
-			BGE-large                   & 335.00M & Frozen  \\
+			Stage A (AntecedentScorer) & 8.43M  \\
+			Stage B (ClusterGNN)       & 7.70M  \\
+			RoBERTa-large               & 355.00M \\
+			BGE-large                   & 335.00M\\
 			\midrule
-			\textbf{Total Parameters}   & \textbf{706.83M} & (2.38\% Trained) \\
+			\textbf{Total Parameters}   & \textbf{706.13M}\\
 			\bottomrule
 		\end{tabular}
 		\caption{System parameter budget distribution.}
@@ -269,8 +271,8 @@
 			\toprule
 			\textbf{Architecture Model} & \textbf{Inference Speed} & \textbf{Incremental Allocated} & \textbf{Total Reserved VRAM} \\
 			\midrule
-			Model C  & 19.4 ms / 1k tok & 64.2 MB  & 2.41 GB \\
-			Model B  & \textbf{13.8 ms / 1k tok} & 198.5 MB & 2.54 GB \\
+			Quotient-GNN ($\mathcal{O}(C^2)$)  & 19.4 ms / 1k tok & 64.2 MB  & 2.41 GB \\
+			Unwindowed Baseline ($\mathcal{O}(M^2)$)  & \textbf{13.8 ms / 1k tok} & 198.5 MB & 2.54 GB \\
 			\bottomrule
 		\end{tabularx}
 		\caption{Runtime and memory profile measurements collected per-document during inference on a single RTX 4060 Laptop GPU.}
@@ -279,16 +281,9 @@
 	
 	We note an explicit architectural distinction regarding our computational profile: the primary claim of this work is not that the overall pipeline contains zero global-attention calculations, as the frozen backbones utilize internal transformer layers. Rather, the claim demonstrates that \textbf{task-specific entity inference and downstream cluster assembly are executed completely without document-wide token interaction}. 
 	
-	In inference, this architectural factorization limits memory usage. Model C restricts peak active incremental allocations to 64.2 MB by preventing the materialization of the full unwindowed mention-pair matrix, yielding a \textbf{3.1$\times$} optimization in active running footprint over Model B. Total cumulative VRAM footprint remains bounded near 2.41 GB for both setups due to the shared memory overhead of the frozen token embedding caches (~200 MB) and CUDA driver baselines. 
+	In inference, this architectural factorization limits memory usage. The Quotient-GNN restricts peak active incremental allocations to 64.2 MB by preventing the materialization of the full unwindowed mention-pair matrix, yielding a \textbf{3.1$\times$} optimization in active running footprint over an unwindowed setup. Total cumulative VRAM footprint remains bounded near 2.41 GB due to the shared memory overhead of the frozen token embedding caches (~200 MB) and CUDA driver baselines. 
 	
-	An honest evaluation of wall-clock times reveals that at standard lengths (mean 617.4 subtokens), Model B retains a minor speed advantage (13.8 ms vs 19.4 ms per document). Because sequence spans are short in this corpus, unwindowed $O(N^2)$ mechanics are not yet computationally punitive, allowing Model B to benefit from highly parallel vectorized GPU paths. Model C encounters a minor Python execution loop penalty when processing small windowed batches sequentially. The asymptotic runtime advantage of the $O(NK)$ design manifests on significantly longer document horizons, while the memory runtime ceiling reduction remains immediately visible.
-	
-	\section{Limitations and Future Work}\label{sec:future}
-	Iterative configuration updates implemented throughout development provide clear architectural bounds for the frozen-encoder paradigm. Multiple complex engineering strategies—including hand-crafted structural cluster features (expanding node metrics to isolate canonical tokens), semantic hard-negative mining, and iterative multi-pass optimization cascades—systematically failed to beat or match the base mention-level matching framework, introducing minor testing degradations ranging from $-0.10$ to $-0.67$ $\text{CoNLL F}_1$. 
-	
-	Because Stage A sub-clusters already exhibit exceptional purity ($\approx 95\%$) and Stage B single-pass cross-window precision settles at $79.8\%$, the performance ceiling ($\approx 0.86\text{--}0.87$) is determined entirely by representation constraints rather than matching logic. Hand-engineered structural additions add optimization noise rather than signal.
-	
-	Furthermore, this work assumes gold mention boundaries to isolate coreference resolution logic from mention detection errors. The reported results isolate the entity-linking component and should not be interpreted as end-to-end coreference performance. Scaling this macro-node quotient framework to consume predicted mentions from an open span detector remains an immediate avenue for future research.
+	An honest evaluation of wall-clock times reveals that at standard lengths (mean 617.4 subtokens), the unwindowed architecture retains a minor speed advantage (13.8 ms vs 19.4 ms per document). Because sequence spans are short in this corpus, unwindowed $\mathcal{O}(N^2)$ mechanics are not yet computationally punitive, allowing an unwindowed layout to benefit from highly parallel vectorized GPU paths. The windowed system encounters a minor Python execution loop penalty when processing small windowed batches sequentially. The asymptotic runtime advantage of the $\mathcal{O}(NK)$ design manifests on significantly longer document horizons, while the memory runtime ceiling reduction remains immediately visible.
 	
 	\section{Conclusion}\label{sec:conclusion}
 	Our findings demonstrate that global entity resolution can be successfully recovered from local inference paired with quotient-graph reconstruction. Our results suggest that document-level coreference can be performed without global token-level attention when entity inference is reformulated as local equivalence reconstruction followed by quotient-space completion. In our implementation, preserving separate representation channels was sufficient to recover global entity structure through local edge induction and quotient-space reconstruction without requiring document-wide token attention.

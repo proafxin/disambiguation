@@ -27,10 +27,13 @@ class ContextEncoder(nn.Module):
 
 def encode_document_ctx(
     content_ids: np.ndarray, encoder: "ContextEncoder", cls_id: int, sep_id: int, device: str,
-    window: int = CONTENT,
+    window: int = CONTENT, spans: list[tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     n = len(content_ids)
-    spans = [(s, min(s + window, n)) for s in range(0, n, window)]
+    # spans = encoding chunks. Default is fixed-K blocks; sentence-aligned windowing passes
+    # sentence-packed chunks instead so a sentence's tokens are never split across a chunk.
+    if spans is None:
+        spans = [(s, min(s + window, n)) for s in range(0, n, window)]
     width = max(e - s for s, e in spans) + 2
     ids = np.ones((len(spans), width), dtype=np.int64)
     mask = np.zeros((len(spans), width), dtype=np.int64)
@@ -120,172 +123,6 @@ class AntecedentScorer(nn.Module):
 
 
 # ── Stage B ───────────────────────────────────────────────────────────────────
-
-
-class ClusterEncoder(nn.Module):
-    def __init__(self, proj_dim: int = 1024, dropout: float = 0.3):
-        super().__init__()
-        self.proj_dim = proj_dim
-        self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
-        self.P_bge = nn.Linear(BGE_DIM, proj_dim)
-        self.query = nn.Parameter(torch.randn(2 * proj_dim))
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # ctx: (M, 2, CTX_DIM), bge: (M, BGE_DIM) -> (2*proj_dim,) attention-pooled cluster vector
-        c = self.P_ctx(self.drop(ctx.flatten(1)))  # (M, proj_dim)
-        s = self.P_bge(self.drop(bge))  # (M, proj_dim)
-        m = torch.cat([c, s], dim=-1)  # (M, 2*proj_dim)
-        attn = torch.softmax(m @ self.query / (m.shape[-1] ** 0.5), dim=0)
-        return attn @ m  # (2*proj_dim,)
-
-    def forward_batched(self, clusters: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        # clusters: list of (ctx (M,2,CTX_DIM), bge (M,BGE_DIM)) -> (C, 2*proj_dim)
-        max_m = max(ctx.shape[0] for ctx, _ in clusters)
-        device = self.query.device
-        dtype = clusters[0][0].dtype
-        ctx_pad = torch.zeros(len(clusters), max_m, 2 * CTX_DIM, device=device, dtype=dtype)
-        bge_pad = torch.zeros(len(clusters), max_m, BGE_DIM, device=device, dtype=dtype)
-        lengths = []
-        for k, (ctx, bge) in enumerate(clusters):
-            m = ctx.shape[0]
-            ctx_pad[k, :m] = ctx.flatten(1)
-            bge_pad[k, :m] = bge
-            lengths.append(m)
-        c = self.P_ctx(self.drop(ctx_pad))  # (C, max_m, proj_dim)
-        s = self.P_bge(self.drop(bge_pad))  # (C, max_m, proj_dim)
-        m_all = torch.cat([c, s], dim=-1)  # (C, max_m, 2*proj_dim)
-        mask = torch.zeros(len(clusters), max_m, device=device)
-        for k, l in enumerate(lengths):
-            mask[k, :l] = 1.0
-        attn = (m_all @ self.query) / (m_all.shape[-1] ** 0.5)
-        attn = attn.masked_fill(mask == 0, float("-inf"))
-        attn = torch.softmax(attn, dim=1).unsqueeze(-1)
-        return (attn * m_all).sum(dim=1)  # (C, 2*proj_dim)
-
-
-class ClusterMatcher(nn.Module):
-    def __init__(self, proj_dim: int = 1024, hidden: int = 1024, dropout: float = 0.3):
-        super().__init__()
-        self.cluster_enc = ClusterEncoder(proj_dim, dropout)
-        g = 2 * proj_dim
-        self.ffnn = nn.Sequential(
-            nn.Linear(2 * g, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
-        )
-        self.null_bias = nn.Parameter(torch.zeros(1))
-
-    def encode_clusters(self, clusters: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        return self.cluster_enc.forward_batched(clusters)
-
-    def forward(
-        self,
-        left: list[tuple[torch.Tensor, torch.Tensor]],
-        right: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> torch.Tensor:
-        # returns (L, R) score matrix
-        gl = self.encode_clusters(left)  # (L, 2*proj_dim)
-        gr = self.encode_clusters(right)  # (R, 2*proj_dim)
-        L, R = gl.shape[0], gr.shape[0]
-        gi = gl.unsqueeze(1).expand(L, R, -1)
-        gj = gr.unsqueeze(0).expand(L, R, -1)
-        return self.ffnn(torch.cat([gi, gj], dim=-1)).squeeze(-1)  # (L, R)
-
-
-class MentionMatcher(nn.Module):
-    # Mention-level Stage B: instead of collapsing each cluster to one attention-pooled
-    # vector, score a cluster pair by aggregating over the full mention-pair interaction
-    # matrix (logsumexp ~ soft-max). Preserves per-mention evidence — the strongest single
-    # mention pair (e.g. a shared proper noun) can drive the merge, which the pooled head
-    # smears away. Drop-in for ClusterMatcher: same forward(left, right) -> (L, R) + null_bias.
-    def __init__(self, proj_dim: int = 512, hidden: int = 1024, dropout: float = 0.3, chunk: int = 4096, channel: str = "both"):
-        super().__init__()
-        self.chunk = chunk
-        self.channel = channel
-        if channel in ("both", "ctx"):
-            self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
-        if channel in ("both", "bge"):
-            self.P_bge = nn.Linear(BGE_DIM, proj_dim)
-        self.drop = nn.Dropout(dropout)
-        g = (2 if channel == "both" else 1) * proj_dim
-        self.pair = nn.Sequential(
-            nn.Linear(4 * g, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
-        )
-        # independent lexical-identity channel: additive term over [IDF-Jaccard, containment, exact],
-        # kept separate from the neural score (not concatenated onto mention vectors). Zero-init so it
-        # starts neutral and learns its weights. Active only when lexical features are supplied.
-        self.lex = nn.Linear(3, 1, bias=False)
-        nn.init.zeros_(self.lex.weight)
-        self.null_bias = nn.Parameter(torch.zeros(1))
-
-    def _vecs(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # (M, 2, CTX_DIM), (M, BGE_DIM) -> (M, g); g = 2*proj_dim (both) or proj_dim (single channel)
-        parts = []
-        if self.channel in ("both", "ctx"):
-            parts.append(self.P_ctx(self.drop(ctx.flatten(1))))
-        if self.channel in ("both", "bge"):
-            parts.append(self.P_bge(self.drop(bge)))
-        return torch.cat(parts, dim=-1)
-
-    def forward_many(self, pairs: list[tuple[list, list]], lex_list: list | None = None) -> list[torch.Tensor]:
-        # Batch every window-pair's mention-pair scoring into ONE chunked FFNN + ONE segmented
-        # reduction. For each window-pair p we enumerate its within-pair (Lm_p x Rm_p) mention
-        # pairs and tag each with a flat cluster-pair bucket id; all pairs' features are scored
-        # together, then reduced per bucket via LOG-MEAN-EXP (logsumexp - log N) and split back
-        # into per-pair (L_p, R_p) matrices. log-mean-exp keeps "strongest pair dominates" but
-        # removes the cluster-size bias of plain logsumexp (which over-merges large clusters).
-        feats, buckets, shapes = [], [], []
-        off = 0
-        for left, right in pairs:
-            lv = torch.cat([self._vecs(c, b) for c, b in left], 0)  # (Lm_p, g)
-            rv = torch.cat([self._vecs(c, b) for c, b in right], 0)  # (Rm_p, g)
-            dev = lv.device
-            li = torch.cat([torch.full((c.shape[0],), i, device=dev, dtype=torch.long) for i, (c, _) in enumerate(left)])
-            rj = torch.cat([torch.full((c.shape[0],), j, device=dev, dtype=torch.long) for j, (c, _) in enumerate(right)])
-            lp, rp, lm, rm = len(left), len(right), lv.shape[0], rv.shape[0]
-            ai = lv.unsqueeze(1).expand(lm, rm, -1)
-            bj = rv.unsqueeze(0).expand(lm, rm, -1)
-            feats.append(torch.cat([ai, bj, ai * bj, (ai - bj).abs()], dim=-1).reshape(lm * rm, -1))
-            buckets.append((li.unsqueeze(1) * rp + rj.unsqueeze(0)).reshape(-1) + off)
-            shapes.append((lp, rp))
-            off += lp * rp
-        feat = torch.cat(feats, 0)  # (total_mention_pairs, 4g)
-        bucket = torch.cat(buckets, 0)
-        score = torch.empty(feat.shape[0], device=feat.device, dtype=feat.dtype)
-        for s0 in range(0, feat.shape[0], self.chunk):
-            score[s0 : s0 + self.chunk] = self.pair(feat[s0 : s0 + self.chunk]).squeeze(-1)
-        gmax = score.max()
-        e = torch.exp((score - gmax).float())
-        sums = torch.zeros(off, device=feat.device, dtype=torch.float32).index_add(0, bucket, e)
-        counts = torch.zeros(off, device=feat.device, dtype=torch.float32).index_add(0, bucket, torch.ones_like(e))
-        flat = gmax.float() + torch.log(sums) - torch.log(counts)  # log-mean-exp (size-bias removed)
-        out, o = [], 0
-        for p, (lp, rp) in enumerate(shapes):
-            s = flat[o : o + lp * rp].reshape(lp, rp)
-            if lex_list is not None:
-                s = s + self.lex(lex_list[p].to(s.dtype)).squeeze(-1)  # additive lexical channel
-            out.append(s)
-            o += lp * rp
-        return out
-
-    def forward(
-        self,
-        left: list[tuple[torch.Tensor, torch.Tensor]],
-        right: list[tuple[torch.Tensor, torch.Tensor]],
-        lex: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.forward_many([(left, right)], None if lex is None else [lex])[0]  # (L, R)
 
 
 class ClusterGNN(nn.Module):
@@ -430,36 +267,6 @@ def antecedent_mll_loss(
     w = torch.where(has_gold, per.new_tensor(pos_weight), per.new_tensor(1.0))
     sel = idx >= 1
     return (per * w)[sel].sum() / w[sel].sum()
-
-
-def cluster_match_loss(
-    scores: torch.Tensor,
-    left_cids: list[int],
-    right_cids: list[int],
-    null_bias: torch.Tensor,
-) -> torch.Tensor:
-    # MLL over right clusters + null for each left cluster.
-    neg = torch.finfo(scores.dtype).min
-    losses = []
-    for i, lcid in enumerate(left_cids):
-        gold_mask = torch.tensor([rcid == lcid for rcid in right_cids], device=scores.device)
-        denom = torch.logsumexp(torch.cat([null_bias, scores[i]]), dim=0)
-        if gold_mask.any():
-            num = torch.logsumexp(scores[i].masked_fill(~gold_mask, neg), dim=0)
-        else:
-            num = null_bias.squeeze()
-        losses.append(denom - num)
-    return torch.stack(losses).mean()
-
-
-def decode_cluster_matches(scores: np.ndarray, null_bias: float) -> list[tuple[int, int]]:
-    # For each left cluster, link to best right cluster if score > null_bias.
-    pairs = []
-    for i in range(scores.shape[0]):
-        j = int(np.argmax(scores[i]))
-        if scores[i, j] > null_bias:
-            pairs.append((i, j))
-    return pairs
 
 
 # ── Shared utilities ──────────────────────────────────────────────────────────
