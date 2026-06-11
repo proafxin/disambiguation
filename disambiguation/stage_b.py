@@ -7,7 +7,6 @@ from tqdm import tqdm
 
 from disambiguation.conll_scorer import conll_f1, conll_f1_by_type, write_conll
 from disambiguation.data import (
-    _PRON_AGR,
     _apply_sentence_windows,
     _build_lexical,
     _content,
@@ -77,54 +76,6 @@ def _gnn_lex_matrix(member_idx: list[np.ndarray], mention_tokens: list, idf: dic
     return out
 
 
-def _cluster_agr(members: np.ndarray, mention_tokens: list) -> tuple[int, int, int]:
-    # (number, gender, person) profile from a cluster's pronoun members; 0 = unknown, and
-    # conflicting known values within a cluster collapse to unknown.
-    nums, gens, pers = set(), set(), set()
-    for m in members:
-        mt = mention_tokens[m]
-        if len(mt) == 1 and mt[0] in _PRON_AGR:
-            n, g, p = _PRON_AGR[mt[0]]
-            if n:
-                nums.add(n)
-            if g:
-                gens.add(g)
-            if p:
-                pers.add(p)
-
-    def pick(s: set) -> int:
-        return next(iter(s)) if len(s) == 1 else 0
-
-    return pick(nums), pick(gens), pick(pers)
-
-
-def _gnn_agr_matrix(member_idx: list[np.ndarray], mention_tokens: list) -> np.ndarray:
-    # (C, C, 6): for each of [number, gender, person] a (match, clash) indicator between the two
-    # clusters' profiles — match=both known and equal, clash=both known and differ. O(C²).
-    prof = np.array([_cluster_agr(m, mention_tokens) for m in member_idx], dtype=np.int64)  # (C, 3)
-    C = len(member_idx)
-    out = np.zeros((C, C, 6), dtype=np.float32)
-    for a in range(3):
-        v = prof[:, a]
-        both = (v != 0)[:, None] & (v != 0)[None, :]
-        eq = v[:, None] == v[None, :]
-        out[:, :, 2 * a] = (both & eq).astype(np.float32)
-        out[:, :, 2 * a + 1] = (both & ~eq).astype(np.float32)
-    return out
-
-
-def _gnn_agr_for_doc(gnn: ClusterGNN, d: dict, member_idx: list[np.ndarray], device: str) -> torch.Tensor | None:
-    if not getattr(gnn, "use_agreement", False):
-        return None
-    if "mention_tokens" not in d:
-        _build_lexical([d])
-    cache = d.get("_gnn_agr")
-    if cache is None or cache.shape[0] != len(member_idx):
-        cache = _gnn_agr_matrix(member_idx, d["mention_tokens"])
-        d["_gnn_agr"] = cache
-    return torch.from_numpy(cache).to(device)
-
-
 def _gnn_lex_for_doc(gnn: ClusterGNN, d: dict, member_idx: list[np.ndarray], device: str) -> torch.Tensor | None:
     # constant per doc (nodes are fixed Stage A clusters) -> compute once and cache on d
     if not getattr(gnn, "use_lexical", False):
@@ -164,8 +115,7 @@ def _gnn_doc_loss(
         return None
     clusters = _gnn_node_tensors(d, member_idx, device)
     lex = _gnn_lex_for_doc(gnn, d, member_idx, device)
-    agr = _gnn_agr_for_doc(gnn, d, member_idx, device)
-    scores, ante = gnn(clusters, torch.tensor(win_ids, device=device), lex, agr)
+    scores, ante = gnn(clusters, torch.tensor(win_ids, device=device), lex)
     gold_t = torch.tensor(gold, device=device)
     if neg_ratio is not None:
         ante = _subsample_neg_candidates(ante, gold_t, neg_ratio)
@@ -184,8 +134,7 @@ def _predict_full_doc_clusters_gnn(d: dict, per_window: dict[int, dict], gnn: Cl
         return [spans] if len(spans) >= 2 else []
     with torch.inference_mode():
         lex = _gnn_lex_for_doc(gnn, d, member_idx, device)
-        agr = _gnn_agr_for_doc(gnn, d, member_idx, device)
-        scores, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device), lex, agr)
+        scores, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device), lex)
     s, a = scores.float().cpu().numpy(), ante.cpu().numpy()
     nb = float(gnn.null_bias.item())
     parent = list(range(C))
@@ -215,8 +164,7 @@ def _gnn_merge_stats(d: dict, per_window: dict[int, dict], gnn: ClusterGNN, devi
         return 0, 0, C
     with torch.inference_mode():
         lex = _gnn_lex_for_doc(gnn, d, member_idx, device)
-        agr = _gnn_agr_for_doc(gnn, d, member_idx, device)
-        sc, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device), lex, agr)
+        sc, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device), lex)
     s, a = sc.float().cpu().numpy(), ante.cpu().numpy()
     g = np.array(gold)
     goldmat = (g[:, None] == g[None, :]) & a
@@ -277,7 +225,6 @@ def train_stage_b(
     pos_weight: float = 1.0,
     member_pool: str = "lse",
     lexical: bool = False,
-    agreement: bool = False,
     sent_aligned: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
@@ -288,7 +235,7 @@ def train_stage_b(
         f"member_pool={member_pool}, channel={channel}, sent_aligned={sent_aligned})"
     )
     ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset, channel, sent_aligned=sent_aligned)
-    ckpt_b = ckpt_b.replace(".pt", f"_gnn_{member_pool}{'_lex' if lexical else ''}{'_agr' if agreement else ''}.pt")
+    ckpt_b = ckpt_b.replace(".pt", f"_gnn_{member_pool}{'_lex' if lexical else ''}.pt")
     if not eval_only and not force and (MODELS_DIR / ckpt_b).exists():
         print(f"✓ Stage B checkpoint {ckpt_b} exists; loading for eval instead of retraining (force=True to retrain).")
         eval_only = True
@@ -300,8 +247,8 @@ def train_stage_b(
             d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
     if sent_aligned:  # reuse the exact windows Stage A used (matches the sent-aligned head + ctx)
         _apply_sentence_windows(docs, window)
-    if lexical or agreement:
-        _build_lexical(docs)  # mention tokens feed the gnn lexical and/or agreement channels
+    if lexical:
+        _build_lexical(docs)  # mention tokens feed the gnn lexical channel
 
     stage_a = AntecedentScorer(channel=channel).to(device)
     stage_a.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
@@ -337,7 +284,7 @@ def train_stage_b(
     )
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     cluster_matcher = ClusterGNN(
-        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical, use_agreement=agreement
+        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical
     ).to(device)
     if eval_only:
         cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
