@@ -425,7 +425,7 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
         d = docs[i]
         if "ctx_vecs" not in d:
             continue
-        cid, win_ids = d["cluster_id"], d["tok_pos"] // window
+        cid, win_ids = d["cluster_id"], _win_ids(d, window)
         toks, spans, sents, bge_all = d["mention_tokens"], d["spans"], d["sentences"], d["mention_bge"]
         surf = [sents[si][a:b] for (si, a, b) in spans]
         types = [_mention_type(toks[k], surf[k]) for k in range(len(spans))]
@@ -496,50 +496,59 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
     }
 
 
+def _window_of(pos: int, cstarts: np.ndarray | None, window: int) -> int:
+    # subtoken position -> window id: searchsorted over sentence-chunk starts when sent-aligned,
+    # else the fixed-K block pos // window.
+    if cstarts is None:
+        return pos // window
+    return int(np.searchsorted(cstarts, pos, side="right") - 1)
+
+
+def _doc_sentence_splits(d: dict, window: int) -> tuple[int, int]:
+    # (sentences split across a window boundary, total sentences); sent-aligned splits only a
+    # sentence that alone exceeds the window.
+    off, ln = d.get("sent_sub_offsets"), d.get("sent_sub_lengths")
+    if off is None or ln is None:
+        return 0, 0
+    chunks = d.get("win_chunks")
+    cstarts = np.asarray([s for s, _ in chunks], dtype=np.int64) if chunks is not None else None
+    split = sum(
+        _window_of(int(off[s]), cstarts, window) != _window_of(int(off[s]) + int(ln[s]) - 1, cstarts, window)
+        for s in range(len(off))
+    )
+    return int(split), len(off)
+
+
+def _doc_pair_splits(d: dict, window: int) -> tuple[int, int]:
+    # (gold intra-sentence coref pairs landing in different windows, total such pairs)
+    win_ids, cid, spans = _win_ids(d, window), d["cluster_id"], d["spans"]
+    si = np.array([s for (s, _, _) in spans])
+    split = tot = 0
+    for x in range(len(spans)):
+        for y in range(x):
+            if si[x] == si[y] and cid[x] == cid[y]:
+                tot += 1
+                split += int(win_ids[x] != win_ids[y])
+    return split, tot
+
+
 def _sentence_split_stats(docs: list, test_idx: list, window: int) -> tuple:
     # head-independent: fraction of sentences split across a window boundary, and fraction of gold
     # intra-sentence coref pairs that land in different windows (= lost to Stage A, handed to Stage B).
     split_sent = tot_sent = split_pair = tot_pair = 0
     for i in test_idx:
-        d = docs[i]
-        win_ids, cid, spans = d["tok_pos"] // window, d["cluster_id"], d["spans"]
-        off, ln = d.get("sent_sub_offsets"), d.get("sent_sub_lengths")
-        if off is not None and ln is not None:
-            for s in range(len(off)):
-                st, en = int(off[s]), int(off[s]) + int(ln[s]) - 1
-                tot_sent += 1
-                split_sent += int(st // window != en // window)
-        si = np.array([s for (s, _, _) in spans])
-        n = len(spans)
-        for x in range(n):
-            for y in range(x):
-                if si[x] == si[y] and cid[x] == cid[y]:
-                    tot_pair += 1
-                    split_pair += int(win_ids[x] != win_ids[y])
+        ss, ts = _doc_sentence_splits(docs[i], window)
+        sp, tp = _doc_pair_splits(docs[i], window)
+        split_sent, tot_sent, split_pair, tot_pair = split_sent + ss, tot_sent + ts, split_pair + sp, tot_pair + tp
     return split_sent, tot_sent, split_pair, tot_pair
 
 
-def stage_a_error_analysis(
-    window: int = CONTENT,
-    subset: str = "all",
-    channel: str = "both",
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> None:
-    nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
-    docs = _filter_docs(build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n), subset)
-    for d in docs:
-        d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
-    test_idx = [i for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")]
-    _build_lexical([docs[i] for i in test_idx])
-    ctx_dir = _win_names(window, subset, "both")[0]
-    for i in test_idx:
-        p = ctx_dir / f"{i:06d}.npy"
-        if p.exists():
-            docs[i]["ctx_vecs"] = np.load(p).astype(np.float16)
-
+def _run_error_channels(
+    docs: list, test_idx: list, window: int, subset: str, sent_aligned: bool, device: str
+) -> dict:
     results = {}
     for ch in ("both", "bge", "ctx"):
-        hp = MODELS_DIR / f"{_win_names(window, subset, ch)[1]}.pt"
+        hp = MODELS_DIR / f"{_win_names(window, subset, ch, sent_aligned=sent_aligned)[1]}.pt"
         if not hp.exists():
             print(f"(skip channel '{ch}': {hp.name} missing)")
             continue
@@ -547,7 +556,62 @@ def stage_a_error_analysis(
         sco.load_state_dict(torch.load(hp, map_location=device)["scorer"])
         sco.eval()
         results[ch] = _stage_a_run(docs, test_idx, sco, window, device)
+    return results
 
+
+def _print_both_channel_detail(r: dict | None) -> None:
+    if not r:
+        return
+    outcome, tot = r["outcome"], sum(r["outcome"].values())
+    print("\n--- both-channel head detail ---")
+    for k in ("TRUE_LINK", "WRONG_LINK", "MISSED_LINK", "TRUE_NULL", "FALSE_LINK"):
+        print(f"  {k:12s} {outcome[k]:6d}  ({100 * outcome[k] / max(tot, 1):4.1f}%)")
+    ms, md = r["missed_head"]["shared"], r["missed_head"]["diff"]
+    print(
+        f"\nMISSED links: head-shared {ms} ({100 * ms / max(ms + md, 1):.0f}%) | "
+        f"head-different {md} ({100 * md / max(ms + md, 1):.0f}%)"
+    )
+    pc, pt = r["prec"]
+    print(
+        f"precision errors (wrong+false links): {pt}, clashing gender/number: {pc} ({100 * pc / max(pt, 1):.0f}%)"
+        "  <- if high, an agreement veto fixes them"
+    )
+    bt, bm = r["bge_true"], r["bge_miss"]
+    print("\ndifferent-head NOUN/PROPN links — BGE cosine to gold antecedent (does BGE separate them?):")
+    print(f"  RESOLVED (true link): mean {np.mean(bt):.3f}  median {np.median(bt):.3f}  (n={len(bt)})")
+    print(f"  MISSED:               mean {np.mean(bm):.3f}  median {np.median(bm):.3f}  (n={len(bm)})")
+    print("  (MISSED << RESOLVED -> BGE separates, misses are low-similarity = need better embeddings;")
+    print("   MISSED ~ RESOLVED -> BGE has the signal but the head isn't using it)")
+    p0 = r["cond"]["ALL"][0] / max(r["cond"]["ALL"][1], 1)
+    print(f"\nconditions (prior P(coref)={100 * p0:.1f}%):")
+    for name in ("head_match", "gender_clash", "number_clash", "sametype_NOUN", "sametype_PROPN"):
+        if name in r["cond"]:
+            c, t = r["cond"][name]
+            print(f"  {name:14s} P(coref)={100 * c / max(t, 1):5.1f}%   [{t} pairs]")
+
+
+def stage_a_error_analysis(
+    window: int = CONTENT,
+    subset: str = "all",
+    channel: str = "both",
+    sent_aligned: bool = False,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    nom_cache, datasets, preco_n, single_ctx = _data_cfg(subset)
+    docs = _filter_docs(build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n), subset)
+    for d in docs:
+        d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
+    if sent_aligned:  # set d["win_ids"]/d["win_chunks"] so analysis uses the same windows as the head
+        _apply_sentence_windows(docs, window)
+    test_idx = [i for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")]
+    _build_lexical([docs[i] for i in test_idx])
+    ctx_dir = _win_names(window, subset, "both", sent_aligned=sent_aligned)[0]
+    for i in test_idx:
+        p = ctx_dir / f"{i:06d}.npy"
+        if p.exists():
+            docs[i]["ctx_vecs"] = np.load(p).astype(np.float16)
+
+    results = _run_error_channels(docs, test_idx, window, subset, sent_aligned, device)
     chans = list(results)
     print("\n=== Stage A within-window LINK recall by type, per channel (CoNLL-2012 test) ===")
     print(f"  {'type':6s} " + "  ".join(f"{ch:>8s}" for ch in chans))
@@ -555,34 +619,7 @@ def stage_a_error_analysis(
         cells = [f"{100 * results[ch]['rec'][t][0] / max(results[ch]['rec'][t][1], 1):8.1f}" for ch in chans]
         print(f"  {t:6s} " + "  ".join(cells))
 
-    r = results.get("both")
-    if r:
-        outcome, tot = r["outcome"], sum(r["outcome"].values())
-        print("\n--- both-channel head detail ---")
-        for k in ("TRUE_LINK", "WRONG_LINK", "MISSED_LINK", "TRUE_NULL", "FALSE_LINK"):
-            print(f"  {k:12s} {outcome[k]:6d}  ({100 * outcome[k] / max(tot, 1):4.1f}%)")
-        ms, md = r["missed_head"]["shared"], r["missed_head"]["diff"]
-        print(
-            f"\nMISSED links: head-shared {ms} ({100 * ms / max(ms + md, 1):.0f}%) | "
-            f"head-different {md} ({100 * md / max(ms + md, 1):.0f}%)"
-        )
-        pc, pt = r["prec"]
-        print(
-            f"precision errors (wrong+false links): {pt}, clashing gender/number: {pc} ({100 * pc / max(pt, 1):.0f}%)"
-            "  <- if high, an agreement veto fixes them"
-        )
-        bt, bm = r["bge_true"], r["bge_miss"]
-        print("\ndifferent-head NOUN/PROPN links — BGE cosine to gold antecedent (does BGE separate them?):")
-        print(f"  RESOLVED (true link): mean {np.mean(bt):.3f}  median {np.median(bt):.3f}  (n={len(bt)})")
-        print(f"  MISSED:               mean {np.mean(bm):.3f}  median {np.median(bm):.3f}  (n={len(bm)})")
-        print("  (MISSED << RESOLVED -> BGE separates, misses are low-similarity = need better embeddings;")
-        print("   MISSED ~ RESOLVED -> BGE has the signal but the head isn't using it)")
-        p0 = r["cond"]["ALL"][0] / max(r["cond"]["ALL"][1], 1)
-        print(f"\nconditions (prior P(coref)={100 * p0:.1f}%):")
-        for name in ("head_match", "gender_clash", "number_clash", "sametype_NOUN", "sametype_PROPN"):
-            if name in r["cond"]:
-                c, t = r["cond"][name]
-                print(f"  {name:14s} P(coref)={100 * c / max(t, 1):5.1f}%   [{t} pairs]")
+    _print_both_channel_detail(results.get("both"))
 
     ss, ts, sp, tp = _sentence_split_stats(docs, test_idx, window)
     print("\n=== windowing vs sentence borders ===")
