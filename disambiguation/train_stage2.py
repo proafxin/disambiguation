@@ -6,7 +6,7 @@ from disambiguation.stage_b import train_stage_b
 if __name__ == "__main__":
     # sent_aligned=True runs the sentence-packed-window variant end-to-end (own ctx cache, head,
     # clusters); Stage A and Stage B share the exact same windows. Set False for the fixed-K system.
-    window, channel, sent_aligned, subset = 256, "ctx", True, "all8k"
+    window, channel, sent_aligned, subset = 256, "both", True, "all8k"
     stage_a_error_analysis(window=window, subset=subset, channel=channel, sent_aligned=sent_aligned)
     # Stage A frozen head for this (channel, sent_aligned) must exist; train it if missing.
     head_path = MODELS_DIR / f"{_win_names(window, subset, channel, sent_aligned=sent_aligned)[1]}.pt"
