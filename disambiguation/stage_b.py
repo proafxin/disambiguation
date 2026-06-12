@@ -275,7 +275,6 @@ def train_stage_b(
     pos_weight: float = 1.0,
     member_pool: str = "lse",
     lexical: bool = False,
-    salience: bool = False,
     sent_aligned: bool = False,
     raw: bool = False,
     hidden: int = 1024,
@@ -296,7 +295,7 @@ def train_stage_b(
     arch_tag = ("_raw" if raw else "") + ("_nodist" if not use_distance else "")
     frozen_base += arch_tag  # Stage A head/clusters depend on the Stage A architecture only
     # ctx_proj widens only the GNN's RoBERTa projection, so it tags only the matcher checkpoint
-    gnn_tag = arch_tag + (f"_ctx{ctx_proj}" if ctx_proj else "") + ("_sal" if salience else "")
+    gnn_tag = arch_tag + (f"_ctx{ctx_proj}" if ctx_proj else "")
     ckpt_b = ckpt_b.replace(".pt", f"_gnn_{member_pool}{'_lex' if lexical else ''}{gnn_tag}.pt")
     if not eval_only and not force and (MODELS_DIR / ckpt_b).exists():
         print(f"✓ Stage B checkpoint {ckpt_b} exists; loading for eval instead of retraining (force=True to retrain).")
@@ -349,23 +348,27 @@ def train_stage_b(
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     val_sets = _val_sets_by_dataset(docs, all_stage_a, val_docs, val_clusters)
     cluster_matcher = ClusterGNN(
-        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical,
-        use_salience=salience, raw=raw, ctx_proj=ctx_proj,
+        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical, raw=raw, ctx_proj=ctx_proj,
     ).to(device)
     if eval_only:
-        cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
+        ckpt = torch.load(MODELS_DIR / ckpt_b, map_location=device)
+        cluster_matcher.load_state_dict(ckpt["cluster_matcher"])
         cluster_matcher.eval()
+        saved_off = ckpt.get("nb_offset", 0.0)  # baked-in val-tuned merge threshold (0 if never calibrated)
         print("\n=== Stage B Test (eval only) ===")
-        test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
+        test_scores = eval_stage_b(
+            test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True, nb_offset=saved_off
+        )
         print(
             f"Test CoNLL {test_scores['CoNLL'] * 100:.2f} MUC {test_scores['muc'] * 100:.2f} "
-            f"B3 {test_scores['bcub'] * 100:.2f} CEAFe {test_scores['ceafe'] * 100:.2f}"
+            f"B3 {test_scores['bcub'] * 100:.2f} CEAFe {test_scores['ceafe'] * 100:.2f} (nb_offset {saved_off:+.2f})"
         )
         if calibrate:
-            offsets = calibrate_merge_threshold(val_sets, cluster_matcher, device)
-            conll_off = offsets.get("conll2012", 0.0)
+            conll_off = calibrate_merge_threshold(val_sets, cluster_matcher, device).get("conll2012", 0.0)
+            ckpt["nb_offset"] = conll_off
+            torch.save(ckpt, MODELS_DIR / ckpt_b)  # persist so future eval applies it automatically
             cal = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test_calibrated", nb_offset=conll_off)
-            print(f"\nCoNLL test @ δ*={conll_off:+.2f} (val-tuned): CoNLL {cal['CoNLL'] * 100:.2f} (δ=0 was {test_scores['CoNLL'] * 100:.2f})")
+            print(f"\nCoNLL test @ δ*={conll_off:+.2f} (val-tuned, saved to checkpoint): CoNLL {cal['CoNLL'] * 100:.2f}")
         return
     optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
@@ -446,8 +449,10 @@ def train_stage_b(
                 f"B3 {sc['bcub'] * 100:.2f}  CEAFe {sc['ceafe'] * 100:.2f}"
             )
     if calibrate:
-        offsets = calibrate_merge_threshold(val_sets, cluster_matcher, device)
         # CoNLL has a test split — confirm the val-tuned offset transfers (others report val only)
-        conll_off = offsets.get("conll2012", 0.0)
+        conll_off = calibrate_merge_threshold(val_sets, cluster_matcher, device).get("conll2012", 0.0)
+        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt["nb_offset"] = conll_off  # persist so eval applies it automatically
+        torch.save(ckpt, ckpt_path)
         cal_test = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test_calibrated", nb_offset=conll_off)
-        print(f"\nCoNLL test @ δ*={conll_off:+.2f} (val-tuned): CoNLL {cal_test['CoNLL'] * 100:.2f} (δ=0 was {test_scores['CoNLL'] * 100:.2f})")
+        print(f"\nCoNLL test @ δ*={conll_off:+.2f} (val-tuned, saved to checkpoint): CoNLL {cal_test['CoNLL'] * 100:.2f} (δ=0 was {test_scores['CoNLL'] * 100:.2f})")

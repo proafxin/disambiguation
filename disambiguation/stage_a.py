@@ -6,13 +6,12 @@ from collections import Counter
 
 import numpy as np
 import torch
-from torch import nn, optim
+from torch import optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from disambiguation.conll_scorer import conll_f1, conll_f1_by_type, write_conll
 from disambiguation.data import (
-    _PRON_AGR,
     _PRONOUNS,
     RANDOM_SEED,
     _apply_sentence_windows,
@@ -417,20 +416,15 @@ def _mention_type(toks: tuple, surf: list) -> str:
     return "NOUN"
 
 
-def _agr_clash(p: tuple, q: tuple) -> bool:
-    # (num,gen,per) tuples: True if both known and differ on gender or number
-    return bool((p[1] and q[1] and p[1] != q[1]) or (p[0] and q[0] and p[0] != q[0]))
-
-
 def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -> dict:
     # one frozen Stage A head over CoNLL test: per-decision outcomes, recall by type, missed-by-head,
-    # precision-error clash rate, BGE-cosine on different-head links (resolved vs missed), conditions.
+    # precision-error count, BGE-cosine on different-head links (resolved vs missed), conditions.
     nb = float(scorer.null_bias.item())
     outcome: Counter = Counter()
     rec = {t: [0, 0] for t in ("PRON", "NOUN", "PROPN")}
     missed_head: Counter = Counter()
     cond: dict = {}
-    prec = [0, 0]  # [clashing, total] over precision errors (wrong + false links)
+    prec = 0  # total precision errors (wrong + false links)
     bge_true, bge_miss = [], []  # diff-head BGE cos to gold antecedent
 
     def bump(name: str, ic: bool) -> None:
@@ -446,7 +440,6 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
         toks, spans, sents, bge_all = d["mention_tokens"], d["spans"], d["sentences"], d["mention_bge"]
         surf = [sents[si][a:b] for (si, a, b) in spans]
         types = [_mention_type(toks[k], surf[k]) for k in range(len(spans))]
-        agr = [_PRON_AGR.get(toks[k][0], (0, 0, 0)) if len(toks[k]) == 1 else (0, 0, 0) for k in range(len(spans))]
         for w in np.unique(win_ids):
             gidx = np.where(win_ids == w)[0]
             if len(gidx) < 2:
@@ -459,7 +452,6 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
             wc, bg = cid[gidx], bge_all[gidx]
             wt = [types[k] for k in gidx]
             wh = [toks[k][-1] for k in gidx]
-            wa = [agr[k] for k in gidx]
             for a in range(1, len(gidx)):
                 cand = np.where(mask[a])[0]
                 if len(cand) == 0:
@@ -470,10 +462,6 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
                     bump("ALL", ic)
                     if wh[a] == wh[b]:
                         bump("head_match", ic)
-                    if wa[a][1] and wa[b][1] and wa[a][1] != wa[b][1]:
-                        bump("gender_clash", ic)
-                    if wa[a][0] and wa[b][0] and wa[a][0] != wa[b][0]:
-                        bump("number_clash", ic)
                     if wt[a] == wt[b]:
                         bump(f"sametype_{wt[a]}", ic)
                 jb = int(cand[np.argmax(sc[a, cand])])
@@ -489,8 +477,7 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
                             bge_true.append(mc)
                     elif linked:
                         outcome["WRONG_LINK"] += 1
-                        prec[1] += 1
-                        prec[0] += int(_agr_clash(wa[a], wa[jb]))
+                        prec += 1
                     else:
                         outcome["MISSED_LINK"] += 1
                         missed_head["shared" if any(wh[a] == wh[b] for b in gold_ante) else "diff"] += 1
@@ -498,8 +485,7 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
                             bge_miss.append(mc)
                 elif linked:
                     outcome["FALSE_LINK"] += 1
-                    prec[1] += 1
-                    prec[0] += int(_agr_clash(wa[a], wa[jb]))
+                    prec += 1
                 else:
                     outcome["TRUE_NULL"] += 1
     return {
@@ -588,11 +574,7 @@ def _print_both_channel_detail(r: dict | None) -> None:
         f"\nMISSED links: head-shared {ms} ({100 * ms / max(ms + md, 1):.0f}%) | "
         f"head-different {md} ({100 * md / max(ms + md, 1):.0f}%)"
     )
-    pc, pt = r["prec"]
-    print(
-        f"precision errors (wrong+false links): {pt}, clashing gender/number: {pc} ({100 * pc / max(pt, 1):.0f}%)"
-        "  <- if high, an agreement veto fixes them"
-    )
+    print(f"precision errors (wrong+false links): {r['prec']}")
     bt, bm = r["bge_true"], r["bge_miss"]
     print("\ndifferent-head NOUN/PROPN links — BGE cosine to gold antecedent (does BGE separate them?):")
     print(f"  RESOLVED (true link): mean {np.mean(bt):.3f}  median {np.median(bt):.3f}  (n={len(bt)})")
@@ -601,7 +583,7 @@ def _print_both_channel_detail(r: dict | None) -> None:
     print("   MISSED ~ RESOLVED -> BGE has the signal but the head isn't using it)")
     p0 = r["cond"]["ALL"][0] / max(r["cond"]["ALL"][1], 1)
     print(f"\nconditions (prior P(coref)={100 * p0:.1f}%):")
-    for name in ("head_match", "gender_clash", "number_clash", "sametype_NOUN", "sametype_PROPN"):
+    for name in ("head_match", "sametype_NOUN", "sametype_PROPN"):
         if name in r["cond"]:
             c, t = r["cond"][name]
             print(f"  {name:14s} P(coref)={100 * c / max(t, 1):5.1f}%   [{t} pairs]")
@@ -642,85 +624,3 @@ def stage_a_error_analysis(
     print("\n=== windowing vs sentence borders ===")
     print(f"sentences split across a window boundary:               {ss}/{ts} ({100 * ss / max(ts, 1):.1f}%)")
     print(f"gold intra-sentence coref pairs split into diff windows: {sp}/{tp} ({100 * sp / max(tp, 1):.1f}%)")
-
-
-def _probe_accuracy(X: np.ndarray, y: np.ndarray, device: str, hidden: int, epochs: int = 400) -> float:
-    # held-out accuracy of a probe predicting label y from features X; hidden=0 is a linear probe
-    # (tests linear dependence), hidden>0 is a 1-layer MLP (tests nonlinear dependence).
-    rng = np.random.default_rng(RANDOM_SEED)
-    perm = rng.permutation(len(y))
-    cut = int(0.8 * len(y))
-    classes = sorted(set(int(v) for v in y))
-    remap = {c: i for i, c in enumerate(classes)}
-    Xt = torch.from_numpy(X).float().to(device)
-    Yt = torch.tensor([remap[int(v)] for v in y], device=device)
-    tr = torch.from_numpy(perm[:cut]).to(device)
-    te = torch.from_numpy(perm[cut:]).to(device)
-    layers = (
-        [nn.Linear(X.shape[1], len(classes))]
-        if hidden == 0
-        else [nn.Linear(X.shape[1], hidden), nn.ReLU(), nn.Dropout(0.2), nn.Linear(hidden, len(classes))]
-    )
-    net = nn.Sequential(*layers).to(device)
-    opt = optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-3)
-    lossf = nn.CrossEntropyLoss()
-    for _ in range(epochs):
-        net.train()
-        opt.zero_grad()
-        lossf(net(Xt[tr]), Yt[tr]).backward()
-        opt.step()
-    net.eval()
-    with torch.inference_mode():
-        pred = net(Xt[te]).argmax(1)
-    return float((pred == Yt[te]).float().mean())
-
-
-def agreement_dependence_probe(
-    window: int = CONTENT,
-    subset: str = "all",
-    sent_aligned: bool = False,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> None:
-    # Causal/dependence check for the (removed) agreement channel: is a pronoun's number/gender/person
-    # already recoverable from a frozen channel? A LINEAR probe near ceiling ⇒ agreement is linearly
-    # dependent on that channel — redundant to even a linear head — explaining why concatenating it
-    # added nothing (RESEARCH.md §4.2). Distinguishes linear dependence (linear≈ceiling) from nonlinear
-    # dependence (only mlp high) from independent signal (both ≈ baseline, which would refute the claim).
-    nom_cache, datasets, preco_n, _ = _data_cfg(subset)
-    docs = _filter_docs(build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n), subset)
-    for d in docs:
-        d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
-    if sent_aligned:
-        _apply_sentence_windows(docs, window)
-    test_idx = [i for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")]
-    _build_lexical([docs[i] for i in test_idx])
-    ctx_dir = _win_names(window, subset, "both", sent_aligned=sent_aligned)[0]
-    ctx_rows, bge_rows, labels = [], [], []
-    for i in test_idx:
-        p = ctx_dir / f"{i:06d}.npy"
-        if not p.exists():
-            continue
-        ctx, d = np.load(p).astype(np.float32), docs[i]
-        toks, bge = d["mention_tokens"], d["mention_bge"]
-        for k in range(len(toks)):
-            if len(toks[k]) == 1 and toks[k][0] in _PRON_AGR:
-                ctx_rows.append(ctx[k].reshape(-1))  # start⊕end = 2048
-                bge_rows.append(bge[k])  # 1024
-                labels.append(_PRON_AGR[toks[k][0]])
-    ctx_arr, bge_arr, lab = np.stack(ctx_rows), np.stack(bge_rows), np.array(labels)  # (N,*), (N,3)
-    print(f"\n=== Agreement dependence probe (CoNLL test, {len(lab)} pronoun mentions) ===")
-    print("  recover pronoun [number/gender/person] from a frozen channel — linear≈ceiling ⇒ linear dependence")
-    print(f"  {'attr':7s} {'chan':4s}  {'baseline':>8s}  {'linear':>7s}  {'mlp':>5s}")
-    for a, name in enumerate(("number", "gender", "person")):
-        y = lab[:, a]
-        known = y[y != 0]
-        if len(known) < 50 or len(set(known.tolist())) < 2:
-            print(f"  {name:7s}: too few known labels ({len(known)})")
-            continue
-        _, cnts = np.unique(known, return_counts=True)
-        base = cnts.max() / len(known)
-        mask = y != 0
-        for ch, X in (("ctx", ctx_arr[mask]), ("bge", bge_arr[mask])):
-            lin = _probe_accuracy(X, known, device, hidden=0)
-            mlp = _probe_accuracy(X, known, device, hidden=256)
-            print(f"  {name:7s} {ch:4s}  {100 * base:7.1f}%  {100 * lin:6.1f}%  {100 * mlp:4.1f}%")

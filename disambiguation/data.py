@@ -22,6 +22,7 @@ from disambiguation.paths import (
 from disambiguation.stage2_context_encoder import (
     CONTENT,
     CTX_DIM,
+    ENCODER_TAG,
     encode_document_ctx,
     load_tokenizer,
 )
@@ -40,9 +41,14 @@ def _data_cfg(subset: str) -> tuple:
     # (nom_cache, datasets, preco_n, single_ctx) for building/loading this subset's data.
     # cp8k is a self-contained build (conll+preco only) with one single-file ctx. all8k reuses
     # the existing all-4 per-doc cache (10k preco) and caps training to 8k preco (no rebuild).
+    # The nominal cache holds tokenizer-specific subtoken ids, so it is ENCODER_TAG-tagged: a
+    # different contextual encoder (e.g. SpanBERT) gets its own re-tokenized nominal cache.
+    def tag(p: Path) -> Path:
+        return p.with_name(p.stem + ENCODER_TAG + p.suffix)
+
     if subset == "cp8k":
-        return (NOM_CACHE_CP8K, ("conll2012", "preco"), PRECO_SUBSAMPLE, True)
-    return (NOM_CACHE, ("conll2012", "litbank", "preco", "corefud"), 10000, False)
+        return (tag(NOM_CACHE_CP8K), ("conll2012", "preco"), PRECO_SUBSAMPLE, True)
+    return (tag(NOM_CACHE), ("conll2012", "litbank", "preco", "corefud"), 10000, False)
 
 
 def _train_idx(docs: list, subset: str) -> list:
@@ -84,11 +90,12 @@ def _win_names(window: int, subset: str = "all", channel: str = "both", sent_ali
     # both-channels artifacts; ctx dir is channel-agnostic (same cached features either way).
     # sent_aligned tags the sentence-packed-window variant; its ctx is encoded with
     # different chunk boundaries, so it gets its own ctx dir as well as head/matcher/clusters.
+    # ENCODER_TAG separates a non-default contextual encoder's artifacts (e.g. SpanBERT) from RoBERTa's
     sa = "_sent" if sent_aligned else ""
-    t = f"_k{window}" + _SUBSET_TAG[subset] + ("" if channel == "both" else f"_{channel}") + sa
+    t = f"_k{window}" + _SUBSET_TAG[subset] + ("" if channel == "both" else f"_{channel}") + sa + ENCODER_TAG
     ctx = SPAN_CTX_CP8K if subset == "cp8k" else SPAN_CTX_CACHE
     return (
-        ctx.with_name(ctx.name + f"_k{window}{sa}"),
+        ctx.with_name(ctx.name + f"_k{window}{sa}{ENCODER_TAG}"),
         f"stage2_frozen_head{t}",
         f"stage2_cluster_matcher{t}.pt",
         f"stage_a_clusters_cache{t}.pkl",
@@ -631,41 +638,6 @@ _PRONOUNS = frozenset(
         "here",
     }
 )
-
-
-_PRON_AGR = {
-    "he": (1, 1, 3),
-    "him": (1, 1, 3),
-    "his": (1, 1, 3),
-    "himself": (1, 1, 3),
-    "she": (1, 2, 3),
-    "her": (1, 2, 3),
-    "hers": (1, 2, 3),
-    "herself": (1, 2, 3),
-    "it": (1, 3, 3),
-    "its": (1, 3, 3),
-    "itself": (1, 3, 3),
-    "they": (2, 0, 3),
-    "them": (2, 0, 3),
-    "their": (2, 0, 3),
-    "theirs": (2, 0, 3),
-    "themselves": (2, 0, 3),
-    "i": (1, 0, 1),
-    "me": (1, 0, 1),
-    "my": (1, 0, 1),
-    "mine": (1, 0, 1),
-    "myself": (1, 0, 1),
-    "we": (2, 0, 1),
-    "us": (2, 0, 1),
-    "our": (2, 0, 1),
-    "ours": (2, 0, 1),
-    "ourselves": (2, 0, 1),
-    "you": (0, 0, 2),
-    "your": (0, 0, 2),
-    "yours": (0, 0, 2),
-    "yourself": (1, 0, 2),
-    "yourselves": (2, 0, 2),
-}
 
 
 def _build_lexical(docs: list) -> None:

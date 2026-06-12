@@ -14,9 +14,6 @@ if __name__ == "__main__":
     raw, hidden, use_distance = False, 1024, True
     ctx_proj = None  # ctx 512->1024 tested flat (86.26 vs 86.46); 512 is near-optimal, reverted
     # stage_a_error_analysis(window=window, subset=subset, channel=channel, sent_aligned=sent_aligned)
-    # Dependence/causal check for the removed agreement channel: linear≈ceiling ⇒ agreement is already
-    # linearly recoverable from RoBERTa, so concatenating it was redundant (RESEARCH.md §4.2).
-    # agreement_dependence_probe(window=window, subset=subset, sent_aligned=sent_aligned)
     # Stage A frozen head for this (channel, sent_aligned[, raw][, nodist]) must exist; train it if missing.
     frozen_name = (
         _win_names(window, subset, channel, sent_aligned=sent_aligned)[1]
@@ -42,7 +39,6 @@ if __name__ == "__main__":
         member_pool="lse",
         neg_ratio=5,
         lexical=True,
-        salience=False,  # #2: antecedent-cluster size as a common-noun discourse prior (concatenated)
         sent_aligned=sent_aligned,
         raw=raw,
         hidden=hidden,
