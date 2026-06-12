@@ -122,9 +122,13 @@ def _gnn_doc_loss(
     return antecedent_mll_loss(scores, ante, gold_t, gnn.null_bias, pos_weight)
 
 
-def _predict_full_doc_clusters_gnn(d: dict, per_window: dict[int, dict], gnn: ClusterGNN, device: str) -> list[list]:
+def _predict_full_doc_clusters_gnn(
+    d: dict, per_window: dict[int, dict], gnn: ClusterGNN, device: str, nb_offset: float = 0.0
+) -> list[list]:
     # Each cluster points to its single best earlier cluster (or null); the pointer forest is
     # the entity partition. Unmerged nodes that are themselves >=2 mentions stay as entities.
+    # nb_offset raises (>0) or lowers (<0) the merge threshold — per-dataset calibration against
+    # over/under-merging, since one global null_bias is tuned for the CoNLL-dominated mix.
     member_idx, win_ids, _ = _doc_cluster_nodes(d, per_window)
     C = len(member_idx)
     if C == 0:
@@ -136,7 +140,7 @@ def _predict_full_doc_clusters_gnn(d: dict, per_window: dict[int, dict], gnn: Cl
         lex = _gnn_lex_for_doc(gnn, d, member_idx, device)
         scores, ante = gnn(_gnn_node_tensors(d, member_idx, device), torch.tensor(win_ids, device=device), lex)
     s, a = scores.float().cpu().numpy(), ante.cpu().numpy()
-    nb = float(gnn.null_bias.item())
+    nb = float(gnn.null_bias.item()) + nb_offset
     parent = list(range(C))
     for i in range(1, C):
         cand = np.where(a[i])[0]
@@ -184,6 +188,7 @@ def eval_stage_b(
     device: str,
     tag: str,
     type_breakdown: bool = False,
+    nb_offset: float = 0.0,
 ) -> dict:
     cluster_matcher.eval()
     key_docs, resp_docs = [], []
@@ -193,7 +198,7 @@ def eval_stage_b(
             continue
         key_docs.append((d["name"], d["sentences"], _key_clusters(d)))
         resp_docs.append(
-            (d["name"], d["sentences"], _predict_full_doc_clusters_gnn(d, per_window, cluster_matcher, device))
+            (d["name"], d["sentences"], _predict_full_doc_clusters_gnn(d, per_window, cluster_matcher, device, nb_offset))
         )
         m, p, n = _gnn_merge_stats(d, per_window, cluster_matcher, device)
         g_merge, g_pos, g_nodes = g_merge + m, g_pos + p, g_nodes + n
@@ -202,13 +207,58 @@ def eval_stage_b(
     write_conll(key_path, key_docs)
     write_conll(resp_path, resp_docs)
     result = conll_f1(key_path, resp_path)
+    if not type_breakdown and tag.startswith("cal_"):  # quiet during threshold sweeps
+        return result
     print(
         f"    [gnn:{tag}] merges accepted {g_merge} / gold-positive nodes {g_pos} "
-        f"({g_nodes} nodes, null_bias {float(cluster_matcher.null_bias.item()):+.3f})"
+        f"({g_nodes} nodes, null_bias {float(cluster_matcher.null_bias.item()):+.3f}, nb_offset {nb_offset:+.2f})"
     )
     if type_breakdown:
         result["by_type"] = conll_f1_by_type(key_docs, resp_docs, MODELS_DIR)
     return result
+
+
+def calibrate_merge_threshold(
+    val_sets: dict[str, tuple[list, list]],
+    cluster_matcher: ClusterGNN,
+    device: str,
+    offsets: tuple[float, ...] = tuple(round(-0.30 + 0.05 * k, 2) for k in range(19)),
+) -> dict[str, float]:
+    # Per-dataset merge-threshold calibration. The single global null_bias is tuned for the
+    # CoNLL-heavy training mix and over-merges out-of-domain (LitBank/PreCo: high MUC, collapsed
+    # CEAFe). Sweeping a per-dataset null_bias offset on that dataset's val recovers the lost CEAFe.
+    # Returns the val-optimal offset per dataset (an upper bound; a held-out split would de-bias it).
+    print("\n=== Per-dataset merge-threshold calibration (val-optimal offset) ===")
+    print(f"  {'dataset':10s}  {'base δ=0':>9s}  {'best':>7s}  {'δ*':>6s}  {'gain':>7s}")
+    best_offsets: dict[str, float] = {}
+    for ds, (vdocs, vclusters) in val_sets.items():
+        if not vdocs:
+            continue
+        base = eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"cal_{ds}_base", nb_offset=0.0)["CoNLL"]
+        scored = [
+            (o, eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"cal_{ds}_{o}", nb_offset=o)["CoNLL"])
+            for o in offsets
+        ]
+        best_o, best_f1 = max(scored, key=lambda t: t[1])
+        best_offsets[ds] = best_o
+        print(
+            f"  {ds:10s}  {100 * base:9.2f}  {100 * best_f1:7.2f}  {best_o:+6.2f}  {100 * (best_f1 - base):+7.2f}"
+        )
+    return best_offsets
+
+
+def _val_sets_by_dataset(docs: list, all_stage_a: list, val_docs: list, val_clusters: list) -> dict[str, tuple]:
+    # per-dataset (val docs, val clusters); conll2012 is precomputed, the rest filtered by name prefix
+    def pick(prefix: str) -> tuple[list, list]:
+        idx = [i for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith(prefix)]
+        return [docs[i] for i in idx], [all_stage_a[i] for i in idx]
+
+    return {
+        "conll2012": (val_docs, val_clusters),
+        "litbank": pick("litbank/"),
+        "preco": pick("preco/"),
+        "corefud": pick("corefud/"),
+    }
 
 
 def train_stage_b(
@@ -226,16 +276,27 @@ def train_stage_b(
     member_pool: str = "lse",
     lexical: bool = False,
     sent_aligned: bool = False,
+    raw: bool = False,
+    hidden: int = 1024,
+    use_distance: bool = True,
+    ctx_proj: int | None = None,
+    calibrate: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     eval_only: bool = False,
     force: bool = False,
 ) -> None:
     print(
         f"\nTraining Stage B GNN... (window={window}, subset={subset}, "
-        f"member_pool={member_pool}, channel={channel}, sent_aligned={sent_aligned})"
+        f"member_pool={member_pool}, channel={channel}, sent_aligned={sent_aligned}, raw={raw})"
     )
     ctx_dir, frozen_base, ckpt_b, _ = _win_names(window, subset, channel, sent_aligned=sent_aligned)
-    ckpt_b = ckpt_b.replace(".pt", f"_gnn_{member_pool}{'_lex' if lexical else ''}.pt")
+    # arch_tag pins Stage B to the matching Stage A head/clusters when Stage A used a non-default
+    # architecture (raw projection-free, or distance off), so it never reuses the projected artifacts.
+    arch_tag = ("_raw" if raw else "") + ("_nodist" if not use_distance else "")
+    frozen_base += arch_tag  # Stage A head/clusters depend on the Stage A architecture only
+    # ctx_proj widens only the GNN's RoBERTa projection, so it tags only the matcher checkpoint
+    gnn_tag = arch_tag + (f"_ctx{ctx_proj}" if ctx_proj else "")
+    ckpt_b = ckpt_b.replace(".pt", f"_gnn_{member_pool}{'_lex' if lexical else ''}{gnn_tag}.pt")
     if not eval_only and not force and (MODELS_DIR / ckpt_b).exists():
         print(f"✓ Stage B checkpoint {ckpt_b} exists; loading for eval instead of retraining (force=True to retrain).")
         eval_only = True
@@ -250,7 +311,7 @@ def train_stage_b(
     if lexical:
         _build_lexical(docs)  # mention tokens feed the gnn lexical channel
 
-    stage_a = AntecedentScorer(channel=channel).to(device)
+    stage_a = AntecedentScorer(channel=channel, raw=raw, hidden=hidden, use_distance=use_distance).to(device)
     stage_a.load_state_dict(torch.load(MODELS_DIR / f"{frozen_base}.pt", map_location=device)["scorer"])
     for p in stage_a.parameters():
         p.requires_grad_(False)
@@ -270,7 +331,9 @@ def train_stage_b(
     test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
 
     # precompute Stage A clusters once — avoids re-running Stage A every epoch
-    all_stage_a = precompute_stage_a_clusters(docs, stage_a, device, window, subset, channel, sent_aligned=sent_aligned)
+    all_stage_a = precompute_stage_a_clusters(
+        docs, stage_a, device, window, subset, channel, sent_aligned=sent_aligned, name_tag=arch_tag
+    )
     train_clusters = [all_stage_a[i] for i in train_idx]
     val_clusters = [
         all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")
@@ -283,8 +346,9 @@ def train_stage_b(
         len(per_window) * (len(per_window) - 1) // 2 for per_window in train_clusters if per_window
     )
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
+    val_sets = _val_sets_by_dataset(docs, all_stage_a, val_docs, val_clusters)
     cluster_matcher = ClusterGNN(
-        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical
+        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical, raw=raw, ctx_proj=ctx_proj
     ).to(device)
     if eval_only:
         cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])
@@ -295,6 +359,11 @@ def train_stage_b(
             f"Test CoNLL {test_scores['CoNLL'] * 100:.2f} MUC {test_scores['muc'] * 100:.2f} "
             f"B3 {test_scores['bcub'] * 100:.2f} CEAFe {test_scores['ceafe'] * 100:.2f}"
         )
+        if calibrate:
+            offsets = calibrate_merge_threshold(val_sets, cluster_matcher, device)
+            conll_off = offsets.get("conll2012", 0.0)
+            cal = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test_calibrated", nb_offset=conll_off)
+            print(f"\nCoNLL test @ δ*={conll_off:+.2f} (val-tuned): CoNLL {cal['CoNLL'] * 100:.2f} (δ=0 was {test_scores['CoNLL'] * 100:.2f})")
         return
     optimizer = optim.AdamW(cluster_matcher.parameters(), lr=head_lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
@@ -335,33 +404,6 @@ def train_stage_b(
         scheduler.step()
         tr_loss = total / max(n_pairs, 1)
 
-        val_sets = {
-            "conll2012": (val_docs, val_clusters),
-            "litbank": (
-                [d for d in docs if d["split"] == "validation" and d["name"].startswith("litbank/")],
-                [
-                    all_stage_a[i]
-                    for i, d in enumerate(docs)
-                    if d["split"] == "validation" and d["name"].startswith("litbank/")
-                ],
-            ),
-            "preco": (
-                [d for d in docs if d["split"] == "validation" and d["name"].startswith("preco/")],
-                [
-                    all_stage_a[i]
-                    for i, d in enumerate(docs)
-                    if d["split"] == "validation" and d["name"].startswith("preco/")
-                ],
-            ),
-            "corefud": (
-                [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
-                [
-                    all_stage_a[i]
-                    for i, d in enumerate(docs)
-                    if d["split"] == "validation" and d["name"].startswith("corefud/")
-                ],
-            ),
-        }
         val_scores_all = {
             ds: eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"val_{ds}_epoch{epoch + 1}")
             for ds, (vdocs, vclusters) in val_sets.items()
@@ -401,3 +443,9 @@ def train_stage_b(
                 f"  {bucket:12s}  CoNLL {sc['CoNLL'] * 100:.2f}  MUC {sc['muc'] * 100:.2f}  "
                 f"B3 {sc['bcub'] * 100:.2f}  CEAFe {sc['ceafe'] * 100:.2f}"
             )
+    if calibrate:
+        offsets = calibrate_merge_threshold(val_sets, cluster_matcher, device)
+        # CoNLL has a test split — confirm the val-tuned offset transfers (others report val only)
+        conll_off = offsets.get("conll2012", 0.0)
+        cal_test = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test_calibrated", nb_offset=conll_off)
+        print(f"\nCoNLL test @ δ*={conll_off:+.2f} (val-tuned): CoNLL {cal_test['CoNLL'] * 100:.2f} (δ=0 was {test_scores['CoNLL'] * 100:.2f})")

@@ -6,7 +6,7 @@ from collections import Counter
 
 import numpy as np
 import torch
-from torch import optim
+from torch import nn, optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -76,8 +76,11 @@ def stage_a_batched_loss(scorer, windows: list, device: str) -> torch.Tensor:
     pair = torch.empty(gi.shape[0], device=device, dtype=g.dtype)
     for s0 in range(0, gi.shape[0], scorer.chunk):
         sl = slice(s0, s0 + scorer.chunk)
-        bucket = torch.bucketize(dist[sl].clamp(min=0), scorer.dist_bounds, right=True)
-        feat = torch.cat([g[gi[sl]], g[gj[sl]], scorer.dist_emb(bucket)], dim=-1)
+        parts = [g[gi[sl]], g[gj[sl]]]
+        if scorer.use_distance:
+            bucket = torch.bucketize(dist[sl].clamp(min=0), scorer.dist_bounds, right=True)
+            parts.append(scorer.dist_emb(bucket))
+        feat = torch.cat(parts, dim=-1)
         pair[sl] = scorer.ffnn(feat).squeeze(-1).to(g.dtype)
 
     neg = torch.finfo(g.dtype).min
@@ -187,11 +190,15 @@ def train_stage_a(
     loss_weights: dict | None = None,
     channel: str = "both",
     sent_aligned: bool = False,
+    raw: bool = False,
+    hidden: int = 1024,
+    use_distance: bool = True,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
     print(
         f"\nBuilding Stage 2 nominal data... "
-        f"(window={window}, subset={subset}, channel={channel}, sent_aligned={sent_aligned})"
+        f"(window={window}, subset={subset}, channel={channel}, sent_aligned={sent_aligned}, "
+        f"raw={raw}, hidden={hidden}, use_distance={use_distance})"
     )
     print("Evaluation setting: gold mentions")
     random.seed(RANDOM_SEED)
@@ -220,7 +227,13 @@ def train_stage_a(
     }
 
     ctx_dir, frozen_name, _, _ = _win_names(window, subset, channel, sent_aligned=sent_aligned)
-    scorer = AntecedentScorer(dropout=dropout, channel=channel).to(device)
+    if raw:  # raw head is a different architecture — tag it so it never collides with / warm-starts the projected head
+        frozen_name += "_raw"
+    if not use_distance:  # distance-off head has a different ffnn input width — tag it too
+        frozen_name += "_nodist"
+    scorer = AntecedentScorer(
+        dropout=dropout, channel=channel, raw=raw, hidden=hidden, use_distance=use_distance
+    ).to(device)
     encoder = ContextEncoder().to(device)
     for p in encoder.parameters():
         p.requires_grad_(False)
@@ -371,8 +384,12 @@ def precompute_stage_a_clusters(
     subset: str = "all",
     channel: str = "both",
     sent_aligned: bool = False,
+    name_tag: str = "",
 ) -> list[dict[int, dict]]:
-    cache_path = MODELS_DIR / _win_names(window, subset, channel, sent_aligned=sent_aligned)[3]
+    # name_tag distinguishes clusters from a non-default Stage A architecture (e.g. raw/nodist head)
+    cache_path = MODELS_DIR / _win_names(window, subset, channel, sent_aligned=sent_aligned)[3].replace(
+        ".pkl", f"{name_tag}.pkl"
+    )
     if cache_path.exists():
         print("Loading cached Stage A clusters...")
         with cache_path.open("rb") as f:
@@ -625,3 +642,85 @@ def stage_a_error_analysis(
     print("\n=== windowing vs sentence borders ===")
     print(f"sentences split across a window boundary:               {ss}/{ts} ({100 * ss / max(ts, 1):.1f}%)")
     print(f"gold intra-sentence coref pairs split into diff windows: {sp}/{tp} ({100 * sp / max(tp, 1):.1f}%)")
+
+
+def _probe_accuracy(X: np.ndarray, y: np.ndarray, device: str, hidden: int, epochs: int = 400) -> float:
+    # held-out accuracy of a probe predicting label y from features X; hidden=0 is a linear probe
+    # (tests linear dependence), hidden>0 is a 1-layer MLP (tests nonlinear dependence).
+    rng = np.random.default_rng(RANDOM_SEED)
+    perm = rng.permutation(len(y))
+    cut = int(0.8 * len(y))
+    classes = sorted(set(int(v) for v in y))
+    remap = {c: i for i, c in enumerate(classes)}
+    Xt = torch.from_numpy(X).float().to(device)
+    Yt = torch.tensor([remap[int(v)] for v in y], device=device)
+    tr = torch.from_numpy(perm[:cut]).to(device)
+    te = torch.from_numpy(perm[cut:]).to(device)
+    layers = (
+        [nn.Linear(X.shape[1], len(classes))]
+        if hidden == 0
+        else [nn.Linear(X.shape[1], hidden), nn.ReLU(), nn.Dropout(0.2), nn.Linear(hidden, len(classes))]
+    )
+    net = nn.Sequential(*layers).to(device)
+    opt = optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-3)
+    lossf = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        net.train()
+        opt.zero_grad()
+        lossf(net(Xt[tr]), Yt[tr]).backward()
+        opt.step()
+    net.eval()
+    with torch.inference_mode():
+        pred = net(Xt[te]).argmax(1)
+    return float((pred == Yt[te]).float().mean())
+
+
+def agreement_dependence_probe(
+    window: int = CONTENT,
+    subset: str = "all",
+    sent_aligned: bool = False,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    # Causal/dependence check for the (removed) agreement channel: is a pronoun's number/gender/person
+    # already recoverable from a frozen channel? A LINEAR probe near ceiling ⇒ agreement is linearly
+    # dependent on that channel — redundant to even a linear head — explaining why concatenating it
+    # added nothing (RESEARCH.md §4.2). Distinguishes linear dependence (linear≈ceiling) from nonlinear
+    # dependence (only mlp high) from independent signal (both ≈ baseline, which would refute the claim).
+    nom_cache, datasets, preco_n, _ = _data_cfg(subset)
+    docs = _filter_docs(build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n), subset)
+    for d in docs:
+        d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
+    if sent_aligned:
+        _apply_sentence_windows(docs, window)
+    test_idx = [i for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")]
+    _build_lexical([docs[i] for i in test_idx])
+    ctx_dir = _win_names(window, subset, "both", sent_aligned=sent_aligned)[0]
+    ctx_rows, bge_rows, labels = [], [], []
+    for i in test_idx:
+        p = ctx_dir / f"{i:06d}.npy"
+        if not p.exists():
+            continue
+        ctx, d = np.load(p).astype(np.float32), docs[i]
+        toks, bge = d["mention_tokens"], d["mention_bge"]
+        for k in range(len(toks)):
+            if len(toks[k]) == 1 and toks[k][0] in _PRON_AGR:
+                ctx_rows.append(ctx[k].reshape(-1))  # start⊕end = 2048
+                bge_rows.append(bge[k])  # 1024
+                labels.append(_PRON_AGR[toks[k][0]])
+    ctx_arr, bge_arr, lab = np.stack(ctx_rows), np.stack(bge_rows), np.array(labels)  # (N,*), (N,3)
+    print(f"\n=== Agreement dependence probe (CoNLL test, {len(lab)} pronoun mentions) ===")
+    print("  recover pronoun [number/gender/person] from a frozen channel — linear≈ceiling ⇒ linear dependence")
+    print(f"  {'attr':7s} {'chan':4s}  {'baseline':>8s}  {'linear':>7s}  {'mlp':>5s}")
+    for a, name in enumerate(("number", "gender", "person")):
+        y = lab[:, a]
+        known = y[y != 0]
+        if len(known) < 50 or len(set(known.tolist())) < 2:
+            print(f"  {name:7s}: too few known labels ({len(known)})")
+            continue
+        _, cnts = np.unique(known, return_counts=True)
+        base = cnts.max() / len(known)
+        mask = y != 0
+        for ch, X in (("ctx", ctx_arr[mask]), ("bge", bge_arr[mask])):
+            lin = _probe_accuracy(X, known, device, hidden=0)
+            mlp = _probe_accuracy(X, known, device, hidden=256)
+            print(f"  {name:7s} {ch:4s}  {100 * base:7.1f}%  {100 * lin:6.1f}%  {100 * mlp:4.1f}%")

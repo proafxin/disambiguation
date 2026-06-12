@@ -69,19 +69,27 @@ class AntecedentScorer(nn.Module):
         dropout: float = 0.3,
         chunk: int = 8192,
         channel: str = "both",
+        raw: bool = False,
+        use_distance: bool = True,
     ):
         super().__init__()
         self.chunk = chunk
         self.channel = channel
-        if channel in ("both", "ctx"):
-            self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
-        if channel in ("both", "bge"):
-            self.P_bge = nn.Linear(BGE_DIM, proj_dim)
-        self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
-        self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
-        g = (2 if channel == "both" else 1) * proj_dim
+        self.raw = raw  # raw=True skips P_ctx/P_bge and feeds the unprojected vectors to the ffnn
+        self.use_distance = use_distance
+        ctx_in, bge_in = 2 * CTX_DIM, BGE_DIM  # raw per-mention widths (ctx is start⊕end = 2048, bge 1024)
+        if not raw:
+            if channel in ("both", "ctx"):
+                self.P_ctx = nn.Linear(ctx_in, proj_dim)
+            if channel in ("both", "bge"):
+                self.P_bge = nn.Linear(bge_in, proj_dim)
+        if use_distance:
+            self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
+            self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
+        ctx_g, bge_g = (ctx_in if raw else proj_dim), (bge_in if raw else proj_dim)  # per-mention rep width
+        g = (ctx_g if channel in ("both", "ctx") else 0) + (bge_g if channel in ("both", "bge") else 0)
         self.ffnn = nn.Sequential(
-            nn.Linear(2 * g + 32, hidden),
+            nn.Linear(2 * g + (32 if use_distance else 0), hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
@@ -93,12 +101,14 @@ class AntecedentScorer(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def mention_rep(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # (M, g) where g = 2*proj_dim (both) or proj_dim (single channel)
+        # (M, g); raw=True returns the unprojected [ctx|bge], else the learned projections
         parts = []
         if self.channel in ("both", "ctx"):
-            parts.append(self.P_ctx(self.drop(ctx.flatten(1))))
+            c = self.drop(ctx.flatten(1))
+            parts.append(c if self.raw else self.P_ctx(c))
         if self.channel in ("both", "bge"):
-            parts.append(self.P_bge(self.drop(bge)))
+            b = self.drop(bge)
+            parts.append(b if self.raw else self.P_bge(b))
         return torch.cat(parts, dim=-1)
 
     def forward(
@@ -114,9 +124,10 @@ class AntecedentScorer(nn.Module):
         i_idx, j_idx = ante_mask.nonzero(as_tuple=True)
         for s0 in range(0, i_idx.shape[0], self.chunk):
             ii, jj = i_idx[s0 : s0 + self.chunk], j_idx[s0 : s0 + self.chunk]
-            gi, gj = g[ii], g[jj]
-            bucket = torch.bucketize((ii - jj).clamp(min=0), self.dist_bounds, right=True)
-            parts = [gi, gj, self.dist_emb(bucket)]
+            parts = [g[ii], g[jj]]
+            if self.use_distance:
+                bucket = torch.bucketize((ii - jj).clamp(min=0), self.dist_bounds, right=True)
+                parts.append(self.dist_emb(bucket))
             feat = torch.cat(parts, dim=-1)
             scores[ii, jj] = self.ffnn(feat).squeeze(-1).to(scores.dtype)
         return scores, ante_mask
@@ -144,18 +155,28 @@ class ClusterGNN(nn.Module):
         max_windows: int = 64,
         member_pool: str = "attn",
         use_lexical: bool = False,
+        raw: bool = False,
+        ctx_proj: int | None = None,
+        bge_proj: int | None = None,
     ):
         super().__init__()
         self.channel = channel
         self.max_windows = max_windows
         self.member_pool = member_pool  # how a cluster's members collapse to one node vector
         self.use_lexical = use_lexical
-        if channel in ("both", "ctx"):
-            self.P_ctx = nn.Linear(2 * CTX_DIM, proj_dim)
-        if channel in ("both", "bge"):
-            self.P_bge = nn.Linear(BGE_DIM, proj_dim)
+        self.raw = raw  # raw=True skips P_ctx/P_bge; node_in projects the unprojected member vecs
+        ctx_in, bge_in = 2 * CTX_DIM, BGE_DIM
+        # per-channel projection widths; default to proj_dim. ctx_proj=1024 gives RoBERTa (the dominant,
+        # most-compressed channel) more room without going fully raw.
+        ctx_proj, bge_proj = ctx_proj or proj_dim, bge_proj or proj_dim
+        if not raw:
+            if channel in ("both", "ctx"):
+                self.P_ctx = nn.Linear(ctx_in, ctx_proj)
+            if channel in ("both", "bge"):
+                self.P_bge = nn.Linear(bge_in, bge_proj)
         self.drop = nn.Dropout(dropout)
-        g = (2 if channel == "both" else 1) * proj_dim
+        ctx_g, bge_g = (ctx_in if raw else ctx_proj), (bge_in if raw else bge_proj)
+        g = (ctx_g if channel in ("both", "ctx") else 0) + (bge_g if channel in ("both", "bge") else 0)
         self.member_q = nn.Parameter(torch.randn(g))  # learned query for attn pooling (unused otherwise)
         self.node_in = nn.Linear(g, hidden)
         self.win_emb = nn.Embedding(max_windows, hidden)  # window-position signal per cluster
@@ -182,12 +203,14 @@ class ClusterGNN(nn.Module):
         self.null_bias = nn.Parameter(torch.zeros(1))
 
     def _member_vecs(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
-        # (m, 2, CTX_DIM), (m, BGE_DIM) -> (m, g)
+        # (m, 2, CTX_DIM), (m, BGE_DIM) -> (m, g); raw=True keeps the unprojected vectors
         parts = []
         if self.channel in ("both", "ctx"):
-            parts.append(self.P_ctx(self.drop(ctx.flatten(1))))
+            c = self.drop(ctx.flatten(1))
+            parts.append(c if self.raw else self.P_ctx(c))
         if self.channel in ("both", "bge"):
-            parts.append(self.P_bge(self.drop(bge)))
+            b = self.drop(bge)
+            parts.append(b if self.raw else self.P_bge(b))
         return torch.cat(parts, dim=-1)
 
     def _pool_members(self, v: torch.Tensor) -> torch.Tensor:
