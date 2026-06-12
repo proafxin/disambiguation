@@ -42,10 +42,11 @@ if __name__ == "__main__":
         member_pool="lse",
         neg_ratio=5,
         lexical=True,
+        salience=False,  # #2: antecedent-cluster size as a common-noun discourse prior (concatenated)
         sent_aligned=sent_aligned,
         raw=raw,
         hidden=hidden,
         use_distance=use_distance,
         ctx_proj=ctx_proj,
-        calibrate=True,  # #1: per-dataset merge-threshold sweep (fixes LitBank/PreCo over-merge)
+        calibrate=False,
     )

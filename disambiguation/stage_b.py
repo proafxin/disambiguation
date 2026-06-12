@@ -275,6 +275,7 @@ def train_stage_b(
     pos_weight: float = 1.0,
     member_pool: str = "lse",
     lexical: bool = False,
+    salience: bool = False,
     sent_aligned: bool = False,
     raw: bool = False,
     hidden: int = 1024,
@@ -295,7 +296,7 @@ def train_stage_b(
     arch_tag = ("_raw" if raw else "") + ("_nodist" if not use_distance else "")
     frozen_base += arch_tag  # Stage A head/clusters depend on the Stage A architecture only
     # ctx_proj widens only the GNN's RoBERTa projection, so it tags only the matcher checkpoint
-    gnn_tag = arch_tag + (f"_ctx{ctx_proj}" if ctx_proj else "")
+    gnn_tag = arch_tag + (f"_ctx{ctx_proj}" if ctx_proj else "") + ("_sal" if salience else "")
     ckpt_b = ckpt_b.replace(".pt", f"_gnn_{member_pool}{'_lex' if lexical else ''}{gnn_tag}.pt")
     if not eval_only and not force and (MODELS_DIR / ckpt_b).exists():
         print(f"✓ Stage B checkpoint {ckpt_b} exists; loading for eval instead of retraining (force=True to retrain).")
@@ -348,7 +349,8 @@ def train_stage_b(
     print(f"Training cluster pairs per epoch: {all_train_pairs_count}")
     val_sets = _val_sets_by_dataset(docs, all_stage_a, val_docs, val_clusters)
     cluster_matcher = ClusterGNN(
-        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical, raw=raw, ctx_proj=ctx_proj
+        dropout=dropout, channel=channel, member_pool=member_pool, use_lexical=lexical,
+        use_salience=salience, raw=raw, ctx_proj=ctx_proj,
     ).to(device)
     if eval_only:
         cluster_matcher.load_state_dict(torch.load(MODELS_DIR / ckpt_b, map_location=device)["cluster_matcher"])

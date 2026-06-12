@@ -155,6 +155,7 @@ class ClusterGNN(nn.Module):
         max_windows: int = 64,
         member_pool: str = "attn",
         use_lexical: bool = False,
+        use_salience: bool = False,
         raw: bool = False,
         ctx_proj: int | None = None,
         bge_proj: int | None = None,
@@ -164,6 +165,7 @@ class ClusterGNN(nn.Module):
         self.max_windows = max_windows
         self.member_pool = member_pool  # how a cluster's members collapse to one node vector
         self.use_lexical = use_lexical
+        self.use_salience = use_salience  # antecedent-cluster size as a common-noun discourse prior
         self.raw = raw  # raw=True skips P_ctx/P_bge; node_in projects the unprojected member vecs
         ctx_in, bge_in = 2 * CTX_DIM, BGE_DIM
         # per-channel projection widths; default to proj_dim. ctx_proj=1024 gives RoBERTa (the dominant,
@@ -189,8 +191,10 @@ class ClusterGNN(nn.Module):
         # by the score MLP — not added as a separate scalar — so the head can use it conditionally
         # and non-linearly and it never couples through the shared null_bias. (An agreement channel
         # was tried the same way and removed: it was functionally redundant with the RoBERTa
-        # contextual channel — see RESEARCH.md §4.2 — and added nothing.)
-        sym = 3 if use_lexical else 0
+        # contextual channel — see RESEARCH.md §4.2 — and added nothing.) Salience (2-d: anaphor and
+        # antecedent cluster sizes) is a document-level count no node vector carries, so it is the
+        # discourse prior "a bare common noun binds to a salient (large) entity".
+        sym = (3 if use_lexical else 0) + (2 if use_salience else 0)
         self.score = nn.Sequential(
             nn.Linear(4 * hidden + sym, hidden),
             nn.ReLU(),
@@ -254,6 +258,10 @@ class ClusterGNN(nn.Module):
         parts = [hi, hj, hi * hj, (hi - hj).abs()]
         if lex is not None:
             parts.append(lex)  # (C, C, 3) lexical features, read jointly by the MLP
+        if self.use_salience:
+            log_sz = torch.log1p(torch.tensor([c.shape[0] for c, _ in clusters], device=h.device, dtype=h.dtype))
+            sal = torch.stack([log_sz.unsqueeze(1).expand(C, C), log_sz.unsqueeze(0).expand(C, C)], dim=-1)
+            parts.append(sal)  # (C, C, 2): [log size of anaphor i, log size of antecedent j]
         feat = torch.cat(parts, dim=-1)
         scores = self.score(feat).squeeze(-1)  # (C, C)
         return scores, ante
