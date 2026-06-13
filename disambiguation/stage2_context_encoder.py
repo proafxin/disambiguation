@@ -8,7 +8,7 @@ from transformers import AutoModel, AutoTokenizer
 
 CKPT_NAME = "stage2_global_coref.pt"
 CKPT_B_NAME = "stage2_cluster_matcher.pt"
-BACKBONE = "SpanBERT/spanbert-large-cased"  # contextual encoder (1024-d); "roberta-large" for the prior system
+BACKBONE = "roberta-large"  # contextual encoder (1024-d); SpanBERT/spanbert-large-cased tested worse (frozen)
 # tag appended to all on-disk artifacts so a different encoder never shares RoBERTa's cache;
 # empty for the roberta-large default (backward-compatible with existing caches).
 ENCODER_TAG = "" if BACKBONE == "roberta-large" else "_" + BACKBONE.split("/")[-1].split("-")[0]
@@ -25,7 +25,7 @@ class ContextEncoder(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        return F.normalize(out.last_hidden_state, p=2, dim=-1)
+        return F.normalize(out.last_hidden_state, p=2, dim=-1, eps=1e-4)  # eps>0 in fp16
 
 
 def encode_document_ctx(
@@ -57,8 +57,8 @@ def encode_document_ctx(
     counts = torch.zeros(n, device=device, dtype=vals.dtype).index_add(
         0, pos, torch.ones(len(pos), device=device, dtype=vals.dtype)
     )
-    ctx /= counts.unsqueeze(1)
-    return F.normalize(ctx, p=2, dim=-1)
+    ctx /= counts.clamp(min=1).unsqueeze(1)  # uncovered positions stay 0 (avoid 0/0 -> NaN)
+    return F.normalize(ctx, p=2, dim=-1, eps=1e-4)  # eps>0 in fp16: a zero (uncovered) row -> 0, not NaN
 
 
 # ── Stage A ───────────────────────────────────────────────────────────────────

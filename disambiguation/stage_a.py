@@ -421,7 +421,8 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
     # precision-error count, BGE-cosine on different-head links (resolved vs missed), conditions.
     nb = float(scorer.null_bias.item())
     outcome: Counter = Counter()
-    rec = {t: [0, 0] for t in ("PRON", "NOUN", "PROPN")}
+    rec = {t: [0, 0] for t in ("PRON", "NOUN", "PROPN")}  # [correct links, gold-positive] per anaphor type
+    precs = {t: [0, 0] for t in ("PRON", "NOUN", "PROPN")}  # [correct links, links made] per anaphor type
     missed_head: Counter = Counter()
     cond: dict = {}
     prec = 0  # total precision errors (wrong + false links)
@@ -473,11 +474,14 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
                     if linked and wc[jb] == wc[a]:
                         outcome["TRUE_LINK"] += 1
                         rec[wt[a]][0] += 1
+                        precs[wt[a]][0] += 1
+                        precs[wt[a]][1] += 1
                         if mc is not None:
                             bge_true.append(mc)
                     elif linked:
                         outcome["WRONG_LINK"] += 1
                         prec += 1
+                        precs[wt[a]][1] += 1
                     else:
                         outcome["MISSED_LINK"] += 1
                         missed_head["shared" if any(wh[a] == wh[b] for b in gold_ante) else "diff"] += 1
@@ -486,11 +490,13 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
                 elif linked:
                     outcome["FALSE_LINK"] += 1
                     prec += 1
+                    precs[wt[a]][1] += 1
                 else:
                     outcome["TRUE_NULL"] += 1
     return {
         "outcome": outcome,
         "rec": rec,
+        "precs": precs,
         "missed_head": missed_head,
         "cond": cond,
         "prec": prec,
@@ -616,6 +622,12 @@ def stage_a_error_analysis(
     print(f"  {'type':6s} " + "  ".join(f"{ch:>8s}" for ch in chans))
     for t in ("PROPN", "NOUN", "PRON"):
         cells = [f"{100 * results[ch]['rec'][t][0] / max(results[ch]['rec'][t][1], 1):8.1f}" for ch in chans]
+        print(f"  {t:6s} " + "  ".join(cells))
+
+    print("\n=== Stage A within-window LINK precision by type, per channel (correct / links made) ===")
+    print(f"  {'type':6s} " + "  ".join(f"{ch:>8s}" for ch in chans))
+    for t in ("PROPN", "NOUN", "PRON"):
+        cells = [f"{100 * results[ch]['precs'][t][0] / max(results[ch]['precs'][t][1], 1):8.1f}" for ch in chans]
         print(f"  {t:6s} " + "  ".join(cells))
 
     _print_both_channel_detail(results.get("both"))

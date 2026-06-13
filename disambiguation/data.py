@@ -41,14 +41,12 @@ def _data_cfg(subset: str) -> tuple:
     # (nom_cache, datasets, preco_n, single_ctx) for building/loading this subset's data.
     # cp8k is a self-contained build (conll+preco only) with one single-file ctx. all8k reuses
     # the existing all-4 per-doc cache (10k preco) and caps training to 8k preco (no rebuild).
-    # The nominal cache holds tokenizer-specific subtoken ids, so it is ENCODER_TAG-tagged: a
-    # different contextual encoder (e.g. SpanBERT) gets its own re-tokenized nominal cache.
-    def tag(p: Path) -> Path:
-        return p.with_name(p.stem + ENCODER_TAG + p.suffix)
-
+    # The nominal cache is encoder-independent (BGE vectors + structure); only the subtoken
+    # tokenization is encoder-specific and is re-derived at load by _retokenize for a non-default
+    # contextual encoder — so swapping encoders never re-encodes BGE or re-runs spaCy.
     if subset == "cp8k":
-        return (tag(NOM_CACHE_CP8K), ("conll2012", "preco"), PRECO_SUBSAMPLE, True)
-    return (tag(NOM_CACHE), ("conll2012", "litbank", "preco", "corefud"), 10000, False)
+        return (NOM_CACHE_CP8K, ("conll2012", "preco"), PRECO_SUBSAMPLE, True)
+    return (NOM_CACHE, ("conll2012", "litbank", "preco", "corefud"), 10000, False)
 
 
 def _train_idx(docs: list, subset: str) -> list:
@@ -283,6 +281,42 @@ def _raw_from_doc(
     )
 
 
+def _retokenize(d: dict, tokenizer) -> None:
+    # Re-derive subtoken ids + span/sentence subtoken offsets for the current contextual tokenizer,
+    # in place, reusing the cached (encoder-independent) sentences/spans/BGE/clusters — no BGE
+    # re-encode, no spaCy. A different tokenizer can reorder mentions by subtoken position, so
+    # spans/cluster_id/mention_bge are re-sorted to match.
+    sents = d["sentences"]
+    offsets, off = [], 0
+    for s in sents:
+        offsets.append(off)
+        off += len(s)
+    words_flat = [w for s in sents for w in s]
+    content_ids, w2s = _word_to_subtok(words_flat, tokenizer)
+    last = len(content_ids) - 1
+    sent_sub_off, sent_sub_len = [], []
+    for si, sent in enumerate(sents):
+        ss = w2s.get(offsets[si], min(offsets[si], last))
+        se = w2s.get(offsets[si] + len(sent), last + 1)
+        sent_sub_off.append(ss)
+        sent_sub_len.append(max(1, se - ss))
+    span_sub, m_off, m_len = [], [], []
+    for si, a, b in d["spans"]:
+        ss = w2s.get(offsets[si] + a, min(offsets[si] + a, last))
+        se = min(max(w2s.get(offsets[si] + b, len(content_ids)) - 1, ss), last)
+        span_sub.append((ss, se))
+        m_off.append(sent_sub_off[si])
+        m_len.append(sent_sub_len[si])
+    order = sorted(range(len(span_sub)), key=lambda k: span_sub[k])
+    d["content_ids"] = content_ids
+    d["spans"] = [d["spans"][k] for k in order]
+    d["cluster_id"] = d["cluster_id"][order]
+    d["mention_bge"] = d["mention_bge"][order]
+    d["span_sub"] = np.asarray([span_sub[k] for k in order], dtype=np.int64)
+    d["sent_sub_offsets"] = np.asarray([m_off[k] for k in order], dtype=np.int64)
+    d["sent_sub_lengths"] = np.asarray([m_len[k] for k in order], dtype=np.int64)
+
+
 def _assemble_docs(raw: list, device: str, cache_path) -> list:
     surface_vocab = sorted({surf for r in raw for surf in r[5]})
     print(f"Encoding {len(surface_vocab)} unique mention surfaces with BGE...")
@@ -336,6 +370,10 @@ def build_docs(
             docs = pickle.load(f)
         for d in docs:
             d["mention_bge"] = d["mention_bge"].astype(np.float32)
+        if ENCODER_TAG:  # cache is tokenized for the default encoder; re-derive subtokens for this one
+            tokenizer = load_tokenizer()
+            for d in tqdm(docs, desc="re-tokenizing for current encoder"):
+                _retokenize(d, tokenizer)
         print(f"Loaded cached nominal docs: {len(docs)}")
         return docs
 
