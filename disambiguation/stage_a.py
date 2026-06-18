@@ -3,6 +3,7 @@ import json
 import pickle
 import random
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import spacy.tokens
@@ -36,6 +37,7 @@ from disambiguation.stage2_context_encoder import (
     BGE_DIM,
     CONTENT,
     CTX_DIM,
+    BIO_BACKBONE,
     ENCODER_TAG,
     AntecedentScorer,
     BIOTagger,
@@ -985,26 +987,45 @@ def _gold_depths(spans: list) -> list:
     ]
 
 
-def _bio_predict_doc(model, d: dict, tokenizer, device, window, win_bs, n_layers) -> set:
-    # argmax decode every depth head over every window, union to a set of (start, end) inclusive spans
+def _bio_predict_doc_by_head(model, d: dict, tokenizer, device, window, win_bs, n_layers, thr=None) -> list:
+    # decode each depth head over every window, keeping the heads SEPARATE -> list of L span sets.
+    # thr=None -> argmax (precision-balanced). thr set -> recall-biased: a token joins a span when
+    # P(non-O) >= thr (lower thr over-generates for recall); among B/I the larger prob wins, and
+    # _decode_bio's orphan-I handling stitches the runs.
     cids = d["content_ids"]
     chunks = _bio_windows(d, window)
-    pred = set()
+    per_head = [set() for _ in range(n_layers)]
     for t in range(0, len(chunks), win_bs):
         sub = chunks[t : t + win_bs]
         slices = [np.asarray(cids[cs:ce], dtype=np.int64) for cs, ce in sub]
         ids, mask = _bio_pack(slices, tokenizer, device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-            cls = model(ids, mask).argmax(-1).cpu().numpy()  # (L, B, W)
+            logits = model(ids, mask)  # (L, B, W, 3)
+        if thr is None:
+            lab = logits.argmax(-1).cpu().numpy()
+        else:
+            p = torch.softmax(logits.float(), dim=-1)
+            in_span = (1 - p[..., 0]) >= thr
+            bi = torch.where(p[..., 1] >= p[..., 2], 1, 2)
+            lab = torch.where(in_span, bi, torch.zeros_like(bi)).cpu().numpy()
         for k, (cs, ce) in enumerate(sub):
             w = ce - cs
             for layer in range(n_layers):
-                for a, b in _decode_bio(cls[layer, k, 1 : 1 + w]):
-                    pred.add((cs + a, cs + b))
+                for a, b in _decode_bio(lab[layer, k, 1 : 1 + w]):
+                    per_head[layer].add((cs + a, cs + b))
+    return per_head
+
+
+def _bio_predict_doc(model, d: dict, tokenizer, device, window, win_bs, n_layers, thr: float | None = None) -> set:
+    # union of all depth heads' spans. Over-generation is fine in the pipeline — Stage A prunes
+    # spurious mentions (and ~89% of the disjoint FPs are benign singletons), but a miss is gone.
+    pred: set = set()
+    for h in _bio_predict_doc_by_head(model, d, tokenizer, device, window, win_bs, n_layers, thr):
+        pred |= h
     return pred
 
 
-def _bio_eval(model, docs, idx, tokenizer, device, window, win_bs, n_layers) -> dict:
+def _bio_eval(model, docs, idx, tokenizer, device, window, win_bs, n_layers, thr: float | None = None) -> dict:
     # Span-detection diagnostics under three match criteria, plus per-depth recall and an FP split.
     #  exact   : same (start, end) subtoken span
     #  overlap : predicted span intersects a gold span (boundary-agnostic — is the mention there at all?)
@@ -1022,7 +1043,7 @@ def _bio_eval(model, docs, idx, tokenizer, device, window, win_bs, n_layers) -> 
             gold = [(int(s), int(e)) for s, e in d["span_sub"]]
             gset = set(gold)
             depths = _gold_depths(gold)
-            pred = _bio_predict_doc(model, d, tokenizer, device, window, win_bs, n_layers)
+            pred = _bio_predict_doc(model, d, tokenizer, device, window, win_bs, n_layers, thr)
             n_gold += len(gold)
             n_pred += len(pred)
             for (gs, ge), dep in zip(gold, depths, strict=True):
@@ -1132,6 +1153,45 @@ def _bio_singleton_breakdown(model, docs, idx, tokenizer, device, window, win_bs
     )
 
 
+def _bio_nested_breakdown(model, docs, idx, tokenizer, device, window, win_bs, n_layers, thr=None) -> None:
+    # Per containment depth, how well we retrieve gold mentions, split two ways:
+    #  own-head : the matching depth head (head d) — does the stacked design specialize as intended?
+    #  any-head : any head's union — are nested mentions retrieved at all (regardless of which head)?
+    # each under exact and overlap match, so we see whether nested misses are outright (low overlap)
+    # or just mis-bounded (overlap >> exact). depth d2 has few gold, so treat its rates as noisy.
+    g = [0] * n_layers
+    eh = [0] * n_layers
+    oh = [0] * n_layers
+    ea = [0] * n_layers
+    oa = [0] * n_layers
+    with torch.inference_mode():
+        for i in idx:
+            d = docs[i]
+            gold = [(int(s), int(e)) for s, e in d["span_sub"]]
+            depths = _gold_depths(gold)
+            heads = _bio_predict_doc_by_head(model, d, tokenizer, device, window, win_bs, n_layers, thr)
+            anyset: set = set()
+            for h in heads:
+                anyset |= h
+            for (gs, ge), dep in zip(gold, depths, strict=True):
+                if dep >= n_layers:
+                    continue
+                g[dep] += 1
+                hd = heads[dep]
+                eh[dep] += (gs, ge) in hd
+                oh[dep] += any(_span_overlap(gs, ge, ps, pe) for ps, pe in hd)
+                ea[dep] += (gs, ge) in anyset
+                oa[dep] += any(_span_overlap(gs, ge, ps, pe) for ps, pe in anyset)
+    print(f"\n=== Nested retrieval by depth (thr={'argmax' if thr is None else thr}) ===")
+    for dep in range(n_layers):
+        n = max(g[dep], 1)
+        tag = "flat/outer" if dep == 0 else f"nested d{dep}"
+        print(
+            f"depth {dep} ({tag}): gold {g[dep]:5d} | own-head exact {100 * eh[dep] / n:5.1f} overlap {100 * oh[dep] / n:5.1f}"
+            f" | any-head exact {100 * ea[dep] / n:5.1f} overlap {100 * oa[dep] / n:5.1f}"
+        )
+
+
 def _bio_epoch(model, docs, idx, optimizer, tokenizer, device, doc_bs, win_bs, window, n_layers) -> float:
     # one optimizer step per doc_bs docs; windows forwarded in win_bs sub-batches with grad
     # accumulation (fine-tuning roberta-large over ~512-token windows is the 8 GB constraint).
@@ -1168,6 +1228,8 @@ def train_bio_tagger(
     window: int = 256,
     sent_aligned: bool = True,
     n_layers: int = 3,
+    model_name: str = BIO_BACKBONE,
+    n_trainable_layers: int = 0,
     max_epochs: int = 20,
     patience: int = 4,
     doc_bs: int = 4,
@@ -1176,11 +1238,15 @@ def train_bio_tagger(
     head_lr: float = 1e-3,
     dropout: float = 0.2,
     weight_decay: float = 0.1,
+    resume: bool = True,
+    init_ckpt: Path | str | None = None,
+    eval_only: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> None:
+    trainable_desc = f"top {n_trainable_layers} layers + heads" if n_trainable_layers else "heads only (frozen backbone)"
     print(
         f"\nTraining BIO mention tagger (conll2012 only, window={window}, sent_aligned={sent_aligned}, "
-        f"L={n_layers} depth heads, fine-tuned {BACKBONE}, backbone_lr={backbone_lr})"
+        f"L={n_layers} depth heads, backbone={model_name}, training {trainable_desc})"
     )
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
@@ -1215,20 +1281,65 @@ def train_bio_tagger(
         f"gold mentions deeper than L={n_layers} (dropped): {n_drop}/{n_all} ({100 * n_drop / max(n_all, 1):.2f}%)"
     )
 
-    model = BIOTagger(n_layers=n_layers, dropout=dropout).to(device)
-    optimizer = optim.AdamW(
-        [
-            {"params": model.roberta.parameters(), "lr": backbone_lr},
-            {"params": model.heads.parameters(), "lr": head_lr},
-        ],
-        weight_decay=weight_decay,
+    model = BIOTagger(n_layers=n_layers, dropout=dropout, model_name=model_name, n_trainable_layers=n_trainable_layers).to(
+        device
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=backbone_lr * 0.1)
-    print(f"tagger params: {sum(p.numel() for p in model.parameters()):,} (backbone fine-tuned)")
-    ckpt = MODELS_DIR / f"bio_tagger_k{window}_L{n_layers}{'_sent' if sent_aligned else ''}{ENCODER_TAG}.pt"
-    best_f1, patience_ctr = -1.0, 0
+    # only the heads (+ any unfrozen top layers) get optimizer state — a frozen backbone carries no
+    # gradients or Adam moments, which is what keeps this within 8 GB.
+    groups = [{"params": list(model.heads.parameters()), "lr": head_lr}]
+    backbone_params = [p for p in model.roberta.parameters() if p.requires_grad]
+    if backbone_params:
+        groups.append({"params": backbone_params, "lr": backbone_lr})
+    optimizer = optim.AdamW(groups, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=head_lr * 0.1)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_tot = sum(p.numel() for p in model.parameters())
+    print(f"tagger params: {n_train:,} trainable / {n_tot:,} total")
+    mtag = "_ner" if model_name != BACKBONE else ""
+    fttag = f"_ft{n_trainable_layers}" if n_trainable_layers else "_head"
+    ckpt = MODELS_DIR / f"bio_tagger_k{window}_L{n_layers}{mtag}{fttag}{'_sent' if sent_aligned else ''}{ENCODER_TAG}.pt"
+    best_f1, patience_ctr, start_epoch = -1.0, 0, 0
 
-    for epoch in range(max_epochs):
+    if eval_only:
+        # eval any checkpoint: init_ckpt if given (e.g. the 85.6 file under its own name), else the
+        # config-derived name. Sweep the recall-biased decode threshold so we can read the
+        # recall/precision tradeoff on an already-trained model with no retraining.
+        load_path = init_ckpt if init_ckpt is not None else ckpt
+        model.load_state_dict(torch.load(load_path, map_location=device)["model"])
+        model.eval()
+        print(f"\n=== BIO eval ({Path(load_path).name}) — decode-threshold sweep (TEST) ===")
+        for thr in (None, 0.4, 0.3, 0.2, 0.1):
+            m = _bio_eval(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr)
+            print(f"thr={('argmax' if thr is None else thr):>6} | {_fmt_bio_eval(m)}")
+        _bio_nested_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=None)
+        _bio_nested_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=0.2)
+        _bio_singleton_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers)
+        return
+
+    if resume and ckpt.exists():
+        state = torch.load(ckpt, map_location=device)
+        model.load_state_dict(state["model"])
+        if "optimizer" in state:  # full resume state; older checkpoints hold only the weights
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+        start_epoch = state.get("epoch", 0)
+        # seed best_f1 so a warm-started epoch can't overwrite good weights with a worse model: use the
+        # saved best if present, else evaluate the loaded weights on val.
+        best_f1 = state.get("best_f1")
+        if best_f1 is None:
+            model.eval()
+            best_f1 = _bio_eval(model, docs, val_i, tokenizer, device, window, win_bs, n_layers)["exact"][2]
+        print(f"↻ resumed from {ckpt.name} at epoch {start_epoch}, best val exact F1 {100 * best_f1:.2f}")
+    elif init_ckpt is not None:
+        # warm-start the weights from another checkpoint (e.g. continue the 85.6 full-FT run under a new
+        # config/name) without restarting. Fresh optimizer/scheduler; best_f1 seeded from the init weights
+        # so we never overwrite them with a worse epoch. Requires a matching architecture (same backbone/heads).
+        model.load_state_dict(torch.load(init_ckpt, map_location=device)["model"])
+        model.eval()
+        best_f1 = _bio_eval(model, docs, val_i, tokenizer, device, window, win_bs, n_layers)["exact"][2]
+        print(f"↻ warm-started from {Path(init_ckpt).name}, val exact F1 {100 * best_f1:.2f}")
+
+    for epoch in range(start_epoch, max_epochs):
         print(f"\n=== BIO Epoch {epoch + 1}/{max_epochs} ===")
         model.train()
         tr_loss = _bio_epoch(model, docs, train_i, optimizer, tokenizer, device, doc_bs, win_bs, window, n_layers)
@@ -1239,7 +1350,17 @@ def train_bio_tagger(
         print(f"train loss {tr_loss:.4f} | val {_fmt_bio_eval(m)}")
         if f1 > best_f1 + 1e-4:
             best_f1, patience_ctr = f1, 0
-            torch.save({"model": model.state_dict(), "n_layers": n_layers}, ckpt)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "n_layers": n_layers,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch + 1,
+                    "best_f1": best_f1,
+                },
+                ckpt,
+            )
             print(f"✓ saved (val exact F1 {100 * f1:.2f})")
         else:
             patience_ctr += 1
@@ -1248,7 +1369,13 @@ def train_bio_tagger(
                 print(f"⊘ early stop. best val F1 {100 * best_f1:.2f}")
                 break
 
-    model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
+    # The run's best weights: the new ckpt if any epoch beat the starting score, else the warm-start
+    # init weights (nothing improved over them — they remain best), else the current in-memory model.
+    best_ckpt = ckpt if ckpt.exists() else init_ckpt
+    if best_ckpt is not None and Path(best_ckpt).exists():
+        model.load_state_dict(torch.load(best_ckpt, map_location=device)["model"])
+        if not ckpt.exists():
+            print(f"(no epoch beat the warm-start; {Path(init_ckpt).name} remains the best detector)")
     model.eval()
     m = _bio_eval(model, docs, test_i, tokenizer, device, window, win_bs, n_layers)
     print("\n=== BIO tagger TEST (conll2012) ===")

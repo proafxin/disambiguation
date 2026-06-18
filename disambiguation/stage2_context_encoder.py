@@ -279,23 +279,44 @@ class MentionDetector(nn.Module):
         return ii, jj, logit
 
 
+BIO_BACKBONE = "Jean-Baptiste/roberta-large-ner-english"  # NER-pretrained init for the mention detector
+
+
 class BIOTagger(nn.Module):
-    # Fine-tuned RoBERTa-large token classifier for mention detection. L stacked B/I/O heads, one per
-    # containment depth: head 0 tags flat/outermost mentions, head 1 the depth-1 nested ones, etc.
-    # CoNLL nesting is 100% clean containment (0% crossing), so per-depth labels never conflict and
-    # each head is an independent 3-way {O,B,I} classifier. The backbone is trainable (unlike the
-    # frozen ContextEncoder); the raw last_hidden_state (not normalized) feeds the heads.
-    def __init__(self, n_layers: int = 3, dropout: float = 0.2):
+    # RoBERTa token classifier for mention detection. L stacked B/I/O heads, one per containment depth:
+    # head 0 tags flat/outermost mentions, head 1 the depth-1 nested ones, etc. CoNLL nesting is 100%
+    # clean containment (0% crossing), so per-depth labels never conflict and each head is an
+    # independent 3-way {O,B,I} classifier reading the raw last_hidden_state (not normalized).
+    #
+    # Default init is the NER-pretrained backbone (its features already localize entity spans), frozen,
+    # with only the heads trained — the GDELT setup. n_trainable_layers>0 unfreezes the top N encoder
+    # layers (needed if pronoun/common-noun recall lags, since the NER backbone was tuned for named
+    # entities). A frozen backbone runs under no_grad (no activation/grad/optimizer-state cost — fits 8 GB).
+    def __init__(
+        self, n_layers: int = 3, dropout: float = 0.2, model_name: str = BIO_BACKBONE, n_trainable_layers: int = 0
+    ):
         super().__init__()
         self.n_layers = n_layers
-        self.roberta = AutoModel.from_pretrained(BACKBONE)
-        self.roberta.gradient_checkpointing_enable()  # 8 GB: trade compute for activation memory
+        self.roberta = AutoModel.from_pretrained(model_name)
+        self.backbone_trainable = n_trainable_layers > 0
+        for p in self.roberta.parameters():
+            p.requires_grad_(False)
+        if n_trainable_layers > 0:
+            for layer in self.roberta.encoder.layer[-n_trainable_layers:]:
+                for p in layer.parameters():
+                    p.requires_grad_(True)
+            self.roberta.gradient_checkpointing_enable()  # 8 GB: trade compute for activation memory
         self.drop = nn.Dropout(dropout)
         self.heads = nn.ModuleList([nn.Linear(CTX_DIM, 3) for _ in range(n_layers)])
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        # (B, W) ids -> (L, B, W, 3) per-token class logits {O=0, B=1, I=2} for each depth head
-        h = self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        # (B, W) ids -> (L, B, W, 3) per-token class logits {O=0, B=1, I=2} for each depth head.
+        # A fully frozen backbone runs under no_grad so its activations are freed immediately.
+        if self.backbone_trainable:
+            h = self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        else:
+            with torch.no_grad():
+                h = self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         h = self.drop(h)
         return torch.stack([head(h) for head in self.heads], dim=0)
 
