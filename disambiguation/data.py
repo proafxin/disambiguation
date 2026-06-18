@@ -614,6 +614,29 @@ def precompute_span_ctx(
     print(f"Cached span ctx to {cache_dir.name}/")
 
 
+def precompute_full_ctx(encoder, docs, cls_id, sep_id, device, cache_dir: Path, window: int = CONTENT) -> None:
+    # Like precompute_span_ctx but writes the FULL (n_subtokens, CTX_DIM) token reps per doc
+    # (mention detection needs every token, not just gathered mention endpoints). Keeps span_sub
+    # (the gold detection targets); only content_ids is dropped after encoding.
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    encoder.eval()
+    with torch.inference_mode():
+        for i, d in enumerate(tqdm(docs, desc="full ctx precompute")):
+            p = cache_dir / f"{i:06d}.npy"
+            if p.exists():
+                d["full_ctx"] = np.load(p).astype(np.float16)
+                d.pop("content_ids", None)
+                continue
+            ctx = (
+                encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device, window, spans=d.get("win_chunks"))
+                .float().cpu().numpy()
+            )
+            np.save(p, ctx.astype(np.float16))
+            d["full_ctx"] = ctx.astype(np.float16)
+            d.pop("content_ids", None)
+    print(f"Cached full ctx to {cache_dir.name}/")
+
+
 def _key_clusters(d: dict, window: int | None = None) -> list:
     if window is not None:
         # gold for Stage A: split each entity cluster at the same window boundaries used to score

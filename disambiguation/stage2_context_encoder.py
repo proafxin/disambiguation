@@ -136,6 +136,170 @@ class AntecedentScorer(nn.Module):
         return scores, ante_mask
 
 
+class MentionTransformer(nn.Module):
+    # Stage A RELATIONAL head: a per-window Transformer over the window's mentions (full
+    # self-attention = fully-connected GNN over mentions), then intra-window antecedent ranking.
+    # AntecedentScorer scores each mention pair from FIXED per-mention reps (independent FFNN);
+    # here every mention is contextualized by all other mentions in the window BEFORE scoring, so
+    # the referential binding ("the company" <- "Microsoft") can surface relationally from the SAME
+    # frozen reps the FFNN sees. Same (ctx, bge) -> (scores, ante) interface as AntecedentScorer, so
+    # eval/decode are unchanged; training uses a padded per-window MLL (mention_transformer_loss).
+    # This is the controlled head A/B that isolates head-vs-representation on the noun ceiling.
+    # O(W^2) per window — the budget windowing already pays.
+    def __init__(
+        self,
+        proj_dim: int = 512,
+        hidden: int = 512,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        dropout: float = 0.3,
+        channel: str = "both",
+        use_distance: bool = True,
+        max_positions: int = 256,
+    ):
+        super().__init__()
+        self.channel = channel
+        self.use_distance = use_distance
+        ctx_in, bge_in = 2 * CTX_DIM, BGE_DIM
+        if channel in ("both", "ctx"):
+            self.P_ctx = nn.Linear(ctx_in, proj_dim)
+        if channel in ("both", "bge"):
+            self.P_bge = nn.Linear(bge_in, proj_dim)
+        self.drop = nn.Dropout(dropout)
+        g = (proj_dim if channel in ("both", "ctx") else 0) + (proj_dim if channel in ("both", "bge") else 0)
+        self.node_in = nn.Linear(g, hidden)
+        # Within-window mention-ORDER embedding: the self-attention is otherwise a permutation-
+        # invariant bag (order only re-enters at the pair distance). Added to nodes before the
+        # transformer so the relational mixing is order-aware (cf. ClusterGNN.win_emb).
+        self.pos_emb = nn.Embedding(max_positions, hidden)
+        if use_distance:
+            self.register_buffer("dist_bounds", torch.tensor([2, 3, 4, 5, 8, 16, 32, 64]))
+            self.dist_emb = nn.Embedding(len(self.dist_bounds) + 1, 32)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=n_heads, dim_feedforward=2 * hidden, dropout=dropout,
+            activation="gelu", batch_first=True,
+        )
+        self.tf = nn.TransformerEncoder(layer, n_layers)
+        self.score = nn.Sequential(
+            nn.Linear(4 * hidden + (32 if use_distance else 0), hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        self.null_bias = nn.Parameter(torch.zeros(1))
+
+    def _mention_vecs(self, ctx: torch.Tensor, bge: torch.Tensor) -> torch.Tensor:
+        # (..., 2, CTX_DIM), (..., BGE_DIM) -> (..., g); projects each channel and concatenates
+        parts = []
+        if self.channel in ("both", "ctx"):
+            parts.append(self.P_ctx(self.drop(ctx.flatten(-2))))
+        if self.channel in ("both", "bge"):
+            parts.append(self.P_bge(self.drop(bge)))
+        return torch.cat(parts, dim=-1)
+
+    def _pair_score(self, hi: torch.Tensor, hj: torch.Tensor, bucket: torch.Tensor | None) -> torch.Tensor:
+        # symmetric+order pair feature [hi | hj | hi*hj | |hi-hj| (| dist)] -> scalar score
+        parts = [hi, hj, hi * hj, (hi - hj).abs()]
+        if self.use_distance:
+            parts.append(self.dist_emb(bucket))
+        return self.score(torch.cat(parts, dim=-1)).squeeze(-1)
+
+    def forward(self, ctx: torch.Tensor, bge: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # single window: ctx (M,2,CTX), bge (M,BGE) -> scores (M,M), ante (M,M) [j<i]. Used at eval.
+        M = ctx.shape[0]
+        device = ctx.device
+        idx = torch.arange(M, device=device)
+        h0 = self.node_in(self._mention_vecs(ctx, bge))  # (M, hidden)
+        h0 = h0 + self.pos_emb(idx.clamp(max=self.pos_emb.num_embeddings - 1))
+        h = h0 + self.tf(h0.unsqueeze(0)).squeeze(0)  # outer residual (see ClusterGNN note)
+        ante = idx.unsqueeze(0) < idx.unsqueeze(1)  # ante[i,j] = j<i
+        hi = h.unsqueeze(1).expand(M, M, h.shape[-1])
+        hj = h.unsqueeze(0).expand(M, M, h.shape[-1])
+        bucket = (
+            torch.bucketize((idx.unsqueeze(1) - idx.unsqueeze(0)).clamp(min=0), self.dist_bounds, right=True)
+            if self.use_distance else None
+        )
+        return self._pair_score(hi, hj, bucket), ante
+
+    def batched_scores(self, ctx: torch.Tensor, bge: torch.Tensor, pad: torch.Tensor, chunk: int = 8192) -> torch.Tensor:
+        # padded training path: ctx (B,M,2,CTX), bge (B,M,BGE), pad (B,M) True=padding -> dense
+        # scores (B,M,M). The transformer runs over the whole padded batch (cheap), but the pair
+        # feature [hi|hj|hi*hj||hi-hj|(|dist)] is materialized only for the j<i pairs and scored in
+        # chunks — the full dense (B,M,M,4H) tensor OOMs on a high-mention window. Padded positions
+        # are zeroed post-attention (no NaN) and every pair touching one is masked by the MLL anyway.
+        B, M = ctx.shape[0], ctx.shape[1]
+        device = ctx.device
+        idx = torch.arange(M, device=device)
+        h0 = self.node_in(self._mention_vecs(ctx, bge))  # (B, M, hidden)
+        h0 = h0 + self.pos_emb(idx.clamp(max=self.pos_emb.num_embeddings - 1)).unsqueeze(0)
+        h = h0 + self.tf(h0, src_key_padding_mask=pad)  # (B, M, hidden)
+        h = h.masked_fill(pad.unsqueeze(-1), 0.0)
+        ai, aj = (idx.unsqueeze(1) > idx.unsqueeze(0)).nonzero(as_tuple=True)  # (P,) i>j within a window
+        bb = torch.arange(B, device=device).repeat_interleave(ai.shape[0])
+        ii, jj = ai.repeat(B), aj.repeat(B)  # (B*P,)
+        scores = torch.zeros(B, M, M, device=device, dtype=h.dtype)
+        for s0 in range(0, bb.shape[0], chunk):
+            sl = slice(s0, s0 + chunk)
+            b_, i_, j_ = bb[sl], ii[sl], jj[sl]
+            bucket = torch.bucketize((i_ - j_).clamp(min=0), self.dist_bounds, right=True) if self.use_distance else None
+            scores[b_, i_, j_] = self._pair_score(h[b_, i_], h[b_, j_], bucket).to(scores.dtype)
+        return scores
+
+
+class MentionDetector(nn.Module):
+    # s2e/Maverick-style span detector over FROZEN window token reps (no gold mentions). Every
+    # candidate span (i,j) with 0<=j-i<max_span gets one score:
+    #   score(i,j) = w_s·f_s(x_i) + w_e·f_e(x_j) + f_s(x_i)ᵀ B f_e(x_j)
+    # ~O(T·max_span), represents nested/overlapping mentions natively. The heavy negative imbalance
+    # (~thousands of candidates per ~M gold mentions) is handled at the LOSS by sampling negatives
+    # 1:1 with positives per window (see detector_loss) — no pos_weight.
+    def __init__(self, proj: int = 512, dropout: float = 0.2, max_span: int = 30):
+        super().__init__()
+        self.max_span = max_span
+        self.drop = nn.Dropout(dropout)
+        self.f_start = nn.Sequential(nn.Linear(CTX_DIM, proj), nn.GELU(), nn.Dropout(dropout))
+        self.f_end = nn.Sequential(nn.Linear(CTX_DIM, proj), nn.GELU(), nn.Dropout(dropout))
+        self.start_score = nn.Linear(proj, 1)
+        self.end_score = nn.Linear(proj, 1)
+        self.bil = nn.Bilinear(proj, proj, 1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x (T, CTX) window token reps -> (start_idx, end_idx, logit) over valid candidate spans
+        T = x.shape[0]
+        s, e = self.f_start(self.drop(x)), self.f_end(self.drop(x))
+        ss, es = self.start_score(s).squeeze(-1), self.end_score(e).squeeze(-1)
+        i = torch.arange(T, device=x.device).unsqueeze(1)
+        j = i + torch.arange(self.max_span, device=x.device).unsqueeze(0)  # (T, max_span)
+        valid = j < T
+        ii, jj = i.expand_as(j)[valid], j[valid]
+        logit = ss[ii] + es[jj] + self.bil(s[ii], e[jj]).squeeze(-1)
+        return ii, jj, logit
+
+
+class BIOTagger(nn.Module):
+    # Fine-tuned RoBERTa-large token classifier for mention detection. L stacked B/I/O heads, one per
+    # containment depth: head 0 tags flat/outermost mentions, head 1 the depth-1 nested ones, etc.
+    # CoNLL nesting is 100% clean containment (0% crossing), so per-depth labels never conflict and
+    # each head is an independent 3-way {O,B,I} classifier. The backbone is trainable (unlike the
+    # frozen ContextEncoder); the raw last_hidden_state (not normalized) feeds the heads.
+    def __init__(self, n_layers: int = 3, dropout: float = 0.2):
+        super().__init__()
+        self.n_layers = n_layers
+        self.roberta = AutoModel.from_pretrained(BACKBONE)
+        self.roberta.gradient_checkpointing_enable()  # 8 GB: trade compute for activation memory
+        self.drop = nn.Dropout(dropout)
+        self.heads = nn.ModuleList([nn.Linear(CTX_DIM, 3) for _ in range(n_layers)])
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # (B, W) ids -> (L, B, W, 3) per-token class logits {O=0, B=1, I=2} for each depth head
+        h = self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        h = self.drop(h)
+        return torch.stack([head(h) for head in self.heads], dim=0)
+
+
 # ── Stage B ───────────────────────────────────────────────────────────────────
 
 
