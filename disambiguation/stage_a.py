@@ -14,7 +14,7 @@ from torch import optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from disambiguation.conll_scorer import conll_f1, conll_f1_by_type, write_conll
+from disambiguation.conll_scorer import conll_f1, conll_f1_by_type, mention_type, write_conll
 from disambiguation.data import (
     _PRONOUNS,
     RANDOM_SEED,
@@ -941,17 +941,45 @@ def _bio_pack(content_slices: list, tokenizer, device: str) -> tuple:
     return torch.from_numpy(ids).to(device), torch.from_numpy(mask).to(device)
 
 
-def _bio_loss(model, content_slices: list, label_slices: list, tokenizer, device: str) -> torch.Tensor:
-    # per-token cross-entropy summed over the L depth heads, content tokens only (skip cls/sep/pad)
+def _bio_loss(
+    model, content_slices: list, label_slices: list, tokenizer, device: str, class_weight: torch.Tensor | None = None
+) -> torch.Tensor:
+    # per-token cross-entropy over the L depth heads, content tokens only (skip cls/sep/pad).
+    # class_weight (L, 3) up-weights B/I vs the dominant O *per head* — the nested heads are O-saturated
+    # (head-2 ~99.5% O), so weighting bakes recall into the weights and argmax fires on nested mentions
+    # without a lowered decode threshold. None = unweighted.
     ids, mask = _bio_pack(content_slices, tokenizer, device)
     logits = model(ids, mask)  # (L, B, W, 3)
+    n_heads = logits.shape[0]
     losses = []
     for k, (c, lab) in enumerate(zip(content_slices, label_slices, strict=True)):
         w = len(c)
-        lg = logits[:, k, 1 : 1 + w, :].reshape(-1, 3)
-        tg = torch.from_numpy(lab).to(device).reshape(-1)
-        losses.append(F.cross_entropy(lg, tg))
+        lg = logits[:, k, 1 : 1 + w, :]  # (L, w, 3)
+        tg = torch.from_numpy(lab).to(device)  # (L, w)
+        if class_weight is None:
+            losses.append(F.cross_entropy(lg.reshape(-1, 3), tg.reshape(-1)))
+        else:
+            losses.append(
+                torch.stack([F.cross_entropy(lg[h], tg[h], weight=class_weight[h]) for h in range(n_heads)]).mean()
+            )
     return torch.stack(losses).mean()
+
+
+def _bio_class_weights(docs, train_i, n_layers, device) -> torch.Tensor:
+    # per-head (L, 3) sqrt-inverse-frequency class weights from the training labels, normalized to mean
+    # 1 per head and clipped. sqrt-damped + clipped so head-2's extreme O:B:I imbalance doesn't blow up.
+    counts = np.ones((n_layers, 3))  # +1 smoothing
+    for i in tqdm(train_i, desc="class weights"):
+        lab = _bio_doc_labels(docs[i], n_layers)
+        for h in range(n_layers):
+            for cls in range(3):
+                counts[h, cls] += int((lab[h] == cls).sum())
+    w = (counts.sum(axis=1, keepdims=True) / (3 * counts)) ** 0.5
+    w = np.clip(w / w.mean(axis=1, keepdims=True), 0.2, 30.0)
+    print("per-head class weights [O, B, I]:")
+    for h in range(n_layers):
+        print(f"  head {h}: {w[h].round(2).tolist()}")
+    return torch.tensor(w, dtype=torch.float32, device=device)
 
 
 def _decode_bio(labels: np.ndarray) -> list[tuple[int, int]]:
@@ -1122,6 +1150,44 @@ def _plausible_spans_for_docs(docs, idx, tokenizer) -> dict:
     return out
 
 
+def _bio_miss_analysis(model, docs, idx, tokenizer, device, window, win_bs, n_layers, thr=None) -> None:
+    # Characterize the *unrecoverable* misses — gold mentions with NO overlapping prediction — by
+    # containment depth, mention type (PRON/PROPN/NOUN), and word length, to see where detector recall
+    # actually leaks (nested? a type? rare/long spans?) before choosing a fix. depth==n_layers means
+    # deeper than the L heads (structurally undetectable — dropped from training).
+    miss_d, gold_d = Counter(), Counter()
+    miss_t, gold_t = Counter(), Counter()
+    miss_len = Counter()
+    total_miss = total = 0
+    with torch.inference_mode():
+        for i in tqdm(idx, desc="miss analysis"):
+            d = docs[i]
+            gold_sub = [(int(s), int(e)) for s, e in d["span_sub"]]
+            depths = _gold_depths(gold_sub)
+            pred = _bio_predict_doc(model, d, tokenizer, device, window, win_bs, n_layers, thr)
+            for k, (gs, ge) in enumerate(gold_sub):
+                total += 1
+                dep = min(depths[k], n_layers)
+                si, a, b = d["spans"][k]
+                words = d["sentences"][si][a:b]
+                mt = mention_type(words) if words else "?"
+                gold_d[dep] += 1
+                gold_t[mt] += 1
+                if not any(_span_overlap(gs, ge, ps, pe) for ps, pe in pred):
+                    total_miss += 1
+                    miss_d[dep] += 1
+                    miss_t[mt] += 1
+                    miss_len[min(b - a, 6)] += 1
+    print(f"\n=== Miss analysis ({total_miss}/{total} gold missed, {100 * total_miss / max(total, 1):.1f}%) ===")
+    print("by depth (missed/gold = miss-rate):")
+    for dp in sorted(gold_d):
+        print(f"  depth {dp}{'+' if dp == n_layers else ''}: {miss_d.get(dp, 0)}/{gold_d[dp]} ({100 * miss_d.get(dp, 0) / max(gold_d[dp], 1):.1f}%)")
+    print("by type:")
+    for t in sorted(gold_t):
+        print(f"  {t}: {miss_t.get(t, 0)}/{gold_t[t]} ({100 * miss_t.get(t, 0) / max(gold_t[t], 1):.1f}%)")
+    print("missed by word length (1..6+):", {k: miss_len[k] for k in sorted(miss_len)})
+
+
 def _bio_singleton_breakdown(model, docs, idx, tokenizer, device, window, win_bs, n_layers) -> None:
     # Of the disjoint FPs (predicted spans overlapping NO gold mention), how many are valid noun
     # phrases (singletons the coref layer didn't annotate) vs. genuine garbage. This is the test that
@@ -1192,7 +1258,7 @@ def _bio_nested_breakdown(model, docs, idx, tokenizer, device, window, win_bs, n
         )
 
 
-def _bio_epoch(model, docs, idx, optimizer, tokenizer, device, doc_bs, win_bs, window, n_layers) -> float:
+def _bio_epoch(model, docs, idx, optimizer, tokenizer, device, doc_bs, win_bs, window, n_layers, class_weight=None) -> float:
     # one optimizer step per doc_bs docs; windows forwarded in win_bs sub-batches with grad
     # accumulation (fine-tuning roberta-large over ~512-token windows is the 8 GB constraint).
     order = list(idx)
@@ -1214,7 +1280,7 @@ def _bio_epoch(model, docs, idx, optimizer, tokenizer, device, doc_bs, win_bs, w
         bl = 0.0
         for t in range(0, len(cslices), win_bs):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-                loss = _bio_loss(model, cslices[t : t + win_bs], lslices[t : t + win_bs], tokenizer, device)
+                loss = _bio_loss(model, cslices[t : t + win_bs], lslices[t : t + win_bs], tokenizer, device, class_weight)
             (loss * len(cslices[t : t + win_bs]) / len(cslices)).backward()
             bl += loss.item() * len(cslices[t : t + win_bs]) / len(cslices)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1238,6 +1304,8 @@ def train_bio_tagger(
     head_lr: float = 1e-3,
     dropout: float = 0.2,
     weight_decay: float = 0.1,
+    class_weight: str | None = None,
+    select_metric: str = "exact",
     resume: bool = True,
     init_ckpt: Path | str | None = None,
     eval_only: bool = False,
@@ -1297,7 +1365,8 @@ def train_bio_tagger(
     print(f"tagger params: {n_train:,} trainable / {n_tot:,} total")
     mtag = "_ner" if model_name != BACKBONE else ""
     fttag = f"_ft{n_trainable_layers}" if n_trainable_layers else "_head"
-    ckpt = MODELS_DIR / f"bio_tagger_k{window}_L{n_layers}{mtag}{fttag}{'_sent' if sent_aligned else ''}{ENCODER_TAG}.pt"
+    cwtag = "_cw" if class_weight else ""
+    ckpt = MODELS_DIR / f"bio_tagger_k{window}_L{n_layers}{mtag}{fttag}{cwtag}{'_sent' if sent_aligned else ''}{ENCODER_TAG}.pt"
     best_f1, patience_ctr, start_epoch = -1.0, 0, 0
 
     if eval_only:
@@ -1313,6 +1382,7 @@ def train_bio_tagger(
             print(f"thr={('argmax' if thr is None else thr):>6} | {_fmt_bio_eval(m)}")
         _bio_nested_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=None)
         _bio_nested_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=0.2)
+        _bio_miss_analysis(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=0.2)
         _bio_singleton_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers)
         return
 
@@ -1328,25 +1398,27 @@ def train_bio_tagger(
         best_f1 = state.get("best_f1")
         if best_f1 is None:
             model.eval()
-            best_f1 = _bio_eval(model, docs, val_i, tokenizer, device, window, win_bs, n_layers)["exact"][2]
-        print(f"↻ resumed from {ckpt.name} at epoch {start_epoch}, best val exact F1 {100 * best_f1:.2f}")
+            best_f1 = _bio_eval(model, docs, val_i, tokenizer, device, window, win_bs, n_layers)[select_metric][2]
+        print(f"↻ resumed from {ckpt.name} at epoch {start_epoch}, best val {select_metric} F1 {100 * best_f1:.2f}")
     elif init_ckpt is not None:
         # warm-start the weights from another checkpoint (e.g. continue the 85.6 full-FT run under a new
         # config/name) without restarting. Fresh optimizer/scheduler; best_f1 seeded from the init weights
         # so we never overwrite them with a worse epoch. Requires a matching architecture (same backbone/heads).
         model.load_state_dict(torch.load(init_ckpt, map_location=device)["model"])
         model.eval()
-        best_f1 = _bio_eval(model, docs, val_i, tokenizer, device, window, win_bs, n_layers)["exact"][2]
-        print(f"↻ warm-started from {Path(init_ckpt).name}, val exact F1 {100 * best_f1:.2f}")
+        best_f1 = _bio_eval(model, docs, val_i, tokenizer, device, window, win_bs, n_layers)[select_metric][2]
+        print(f"↻ warm-started from {Path(init_ckpt).name}, val {select_metric} F1 {100 * best_f1:.2f}")
+
+    cw = _bio_class_weights(docs, train_i, n_layers, device) if class_weight == "inv" else None
 
     for epoch in range(start_epoch, max_epochs):
         print(f"\n=== BIO Epoch {epoch + 1}/{max_epochs} ===")
         model.train()
-        tr_loss = _bio_epoch(model, docs, train_i, optimizer, tokenizer, device, doc_bs, win_bs, window, n_layers)
+        tr_loss = _bio_epoch(model, docs, train_i, optimizer, tokenizer, device, doc_bs, win_bs, window, n_layers, cw)
         scheduler.step()
         model.eval()
         m = _bio_eval(model, docs, val_i, tokenizer, device, window, win_bs, n_layers)
-        f1 = m["exact"][2]
+        f1 = m[select_metric][2]
         print(f"train loss {tr_loss:.4f} | val {_fmt_bio_eval(m)}")
         if f1 > best_f1 + 1e-4:
             best_f1, patience_ctr = f1, 0
@@ -1361,7 +1433,7 @@ def train_bio_tagger(
                 },
                 ckpt,
             )
-            print(f"✓ saved (val exact F1 {100 * f1:.2f})")
+            print(f"✓ saved (val {select_metric} F1 {100 * f1:.2f})")
         else:
             patience_ctr += 1
             print(f"no improvement {patience_ctr}/{patience}")
