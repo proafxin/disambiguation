@@ -321,6 +321,53 @@ class BIOTagger(nn.Module):
         return torch.stack([head(h) for head in self.heads], dim=0)
 
 
+class SpanDetector(nn.Module):
+    # Full-FT RoBERTa + s2e/Maverick span scorer. Scores each candidate (start,end) span (length<max_span)
+    # as a UNIT: score(i,j) = wₛ·fₛ(xᵢ) + wₑ·fₑ(xⱼ) + fₛ(xᵢ)ᵀ B fₑ(xⱼ). Predicting the exact extent IS the
+    # objective (vs BIO's per-token membership, which clips long NPs). O(T·max_span) per window, no
+    # span-pair comparison. Backbone fine-tuned (frozen features cap boundaries); n_trainable_layers as BIO.
+    def __init__(self, model_name: str = BACKBONE, n_trainable_layers: int = 24, dropout: float = 0.2,
+                 proj: int = 512, max_span: int = 30):
+        super().__init__()
+        self.roberta = AutoModel.from_pretrained(model_name)
+        self.backbone_trainable = n_trainable_layers > 0
+        for p in self.roberta.parameters():
+            p.requires_grad_(False)
+        if n_trainable_layers > 0:
+            for layer in self.roberta.encoder.layer[-n_trainable_layers:]:
+                for p in layer.parameters():
+                    p.requires_grad_(True)
+            self.roberta.gradient_checkpointing_enable()
+        self.max_span = max_span
+        self.drop = nn.Dropout(dropout)
+        self.f_start = nn.Sequential(nn.Linear(CTX_DIM, proj), nn.GELU(), nn.Dropout(dropout))
+        self.f_end = nn.Sequential(nn.Linear(CTX_DIM, proj), nn.GELU(), nn.Dropout(dropout))
+        self.start_score = nn.Linear(proj, 1)
+        self.end_score = nn.Linear(proj, 1)
+        # bilinear as a plain (proj,proj) weight scored manually as (s@B · e). nn.Bilinear materializes a
+        # (n_candidates, proj, proj) intermediate (OOM at ~15k spans); this is just (n, proj).
+        self.B = nn.Parameter(torch.empty(proj, proj))
+        nn.init.xavier_uniform_(self.B)
+
+    def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        if self.backbone_trainable:
+            return self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        with torch.no_grad():
+            return self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    def score(self, h: torch.Tensor) -> tuple:
+        # h (L, CTX) content-token reps of one window -> (start_idx, end_idx, logit) over candidate spans
+        s, e = self.f_start(self.drop(h)), self.f_end(self.drop(h))
+        ss, es = self.start_score(s).squeeze(-1), self.end_score(e).squeeze(-1)
+        L = h.shape[0]
+        i = torch.arange(L, device=h.device).unsqueeze(1)
+        j = i + torch.arange(self.max_span, device=h.device).unsqueeze(0)
+        valid = j < L
+        ii, jj = i.expand_as(j)[valid], j[valid]
+        logit = ss[ii] + es[jj] + ((s[ii] @ self.B) * e[jj]).sum(-1)
+        return ii, jj, logit
+
+
 # ── Stage B ───────────────────────────────────────────────────────────────────
 
 

@@ -41,6 +41,7 @@ from disambiguation.stage2_context_encoder import (
     ENCODER_TAG,
     AntecedentScorer,
     BIOTagger,
+    SpanDetector,
     ContextEncoder,
     MentionDetector,
     MentionTransformer,
@@ -64,7 +65,7 @@ def doc_scores(d: dict, scorer, device, window: int = CONTENT) -> list[tuple[tor
     return results
 
 
-def stage_a_batched_loss(scorer, windows: list, device: str) -> torch.Tensor:
+def stage_a_batched_loss(scorer, windows: list, device: str, null_weight: float = 1.0) -> torch.Tensor:
     # windows: list of (ctx (M,2,CTX), bge (M,BGE), cid (M,) long, weight float), all M>=2.
     # One mention_rep + one chunked FFNN over the global within-window pair list, then a
     # vectorized MLL over a padded (B, maxM, maxM) score tensor. Equivalent to looping
@@ -98,15 +99,20 @@ def stage_a_batched_loss(scorer, windows: list, device: str) -> torch.Tensor:
 
     scores = torch.zeros(b, max_m, max_m, device=device, dtype=g.dtype)
     scores[wid, li, lj] = pair
-    return _padded_mll(scores, sizes, [w[2] for w in windows], [w[3] for w in windows], scorer.null_bias, device)
+    return _padded_mll(
+        scores, sizes, [w[2] for w in windows], [w[3] for w in windows], scorer.null_bias, device, null_weight
+    )
 
 
-def _padded_mll(scores, sizes, cids, weights, null_bias, device) -> torch.Tensor:
+def _padded_mll(scores, sizes, cids, weights, null_bias, device, null_weight: float = 1.0) -> torch.Tensor:
     # Vectorized MLL over a padded (B, maxM, maxM) dense score tensor: each mention i>=1 softmaxes
     # over {ε} ∪ {valid j<i}; gold = earlier mentions sharing its cluster id (else ε). Per-window
     # mean, then dataset-weighted mean. Shared by the FFNN head (scatter-built scores) and the
     # relational MentionTransformer (transformer-built scores). Pairs touching padded positions are
     # masked to neg, so padded rows contribute 0 (no NaN even if their reps are 0/NaN).
+    # null_weight<1 down-weights mentions whose gold antecedent is null (singletons): on PREDICTED
+    # mentions the detector over-generates, flooding the loss with null targets that inflate null_bias
+    # and cause global under-linking; rebalancing them lets predicted fine-tuning learn. 1.0 = gold-identical.
     b, max_m = scores.shape[0], scores.shape[1]
     neg = torch.finfo(scores.dtype).min
     ar = torch.arange(max_m, device=device)
@@ -123,13 +129,15 @@ def _padded_mll(scores, sizes, cids, weights, null_bias, device) -> torch.Tensor
     has_gold = gold.any(dim=2)
     num = torch.where(has_gold, torch.logsumexp(scores.masked_fill(~gold, neg), dim=2), null.squeeze().expand(b, max_m))
     per_ment = denom - num  # (B, maxM)
-    loss_mask = valid & (ar.unsqueeze(0) >= 1)
+    loss_mask = (valid & (ar.unsqueeze(0) >= 1)).to(per_ment.dtype)
+    if null_weight != 1.0:  # down-weight null-gold (singleton) rows so over-generation can't swamp null_bias
+        loss_mask = loss_mask * torch.where(has_gold, 1.0, null_weight)
     w_loss = (per_ment * loss_mask).sum(1) / loss_mask.sum(1).clamp(min=1)  # (B,) per-window mean
     wt = torch.tensor(weights, device=device, dtype=w_loss.dtype)
     return (w_loss * wt).sum() / wt.sum()
 
 
-def mention_transformer_loss(scorer, windows: list, device: str) -> torch.Tensor:
+def mention_transformer_loss(scorer, windows: list, device: str, null_weight: float = 1.0) -> torch.Tensor:
     # Relational Stage A loss: pad the batch's windows to (B, maxM), run one padded transformer
     # forward (mentions attend within each window), then the shared padded MLL.
     sizes = [w[0].shape[0] for w in windows]
@@ -141,7 +149,9 @@ def mention_transformer_loss(scorer, windows: list, device: str) -> torch.Tensor
         m = sizes[k]
         ctx[k, :m], bge[k, :m], pad[k, :m] = w[0], w[1], False
     scores = scorer.batched_scores(ctx, bge, pad)
-    return _padded_mll(scores, sizes, [w[2] for w in windows], [w[3] for w in windows], scorer.null_bias, device)
+    return _padded_mll(
+        scores, sizes, [w[2] for w in windows], [w[3] for w in windows], scorer.null_bias, device, null_weight
+    )
 
 
 def _collect_windows(batch: list, device: str, window: int, loss_weights) -> list:
@@ -168,6 +178,7 @@ def run_epoch(
     doc_bs,
     window: int = CONTENT,
     loss_weights: dict | None = None,
+    null_weight: float = 1.0,
 ) -> float:
     train = optimizer is not None
     total, ndoc = 0.0, 0
@@ -180,9 +191,9 @@ def run_epoch(
             if not windows:
                 continue
             loss = (
-                mention_transformer_loss(scorer, windows, device)
+                mention_transformer_loss(scorer, windows, device, null_weight)
                 if isinstance(scorer, MentionTransformer)
-                else stage_a_batched_loss(scorer, windows, device)
+                else stage_a_batched_loss(scorer, windows, device, null_weight)
             )
         if train:
             loss.backward()
@@ -1454,3 +1465,206 @@ def train_bio_tagger(
     print(_fmt_bio_eval(m))
     # Tier 2 — prove what the disjoint FPs are: valid NP (singleton the coref layer omitted) vs garbage.
     _bio_singleton_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers)
+
+
+# ── Span-based mention detector (full-FT RoBERTa + span scorer, for exact boundaries) ────────────
+
+
+def _span_windows(d: dict, window: int) -> list:
+    # per encoding window: (content_ids slice, gold {(a,b) local inclusive subtoken}, cs)
+    cids = d["content_ids"]
+    chunks = _bio_windows(d, window)
+    out = []
+    for cs, ce in chunks:
+        gold = {(int(ss) - cs, int(se) - cs) for ss, se in d["span_sub"] if cs <= ss and se < ce}
+        out.append((np.asarray(cids[cs:ce], dtype=np.int64), gold, cs))
+    return out
+
+
+def _span_loss(model, content, gold, tokenizer, device, neg_ratio: int = 5):
+    # one window: encode + score every candidate span, BCE with hard-negative mining (gold + top-scoring
+    # non-gold = the truncated/extended near-misses, which is exactly what teaches the exact boundary).
+    ids, mask = _bio_pack([content], tokenizer, device)
+    h = model.encode(ids, mask)[0, 1 : 1 + len(content)]
+    ii, jj, logit = model.score(h)
+    if logit.numel() == 0:
+        return None
+    goldmat = torch.zeros(len(content), model.max_span, device=device)
+    for a, b in gold:
+        if 0 <= b - a < model.max_span:
+            goldmat[a, b - a] = 1.0
+    labels = goldmat[ii, jj - ii]
+    pos = labels.nonzero(as_tuple=True)[0]
+    if pos.numel() == 0:
+        return None
+    neg = (labels == 0).nonzero(as_tuple=True)[0]
+    k = min(neg_ratio * pos.numel(), neg.numel())
+    hard = neg[torch.topk(logit[neg].detach(), k).indices]
+    sel = torch.cat([pos, hard])
+    return F.binary_cross_entropy_with_logits(logit[sel], labels[sel])
+
+
+def _span_epoch(model, docs, idx, optimizer, tokenizer, device, doc_bs, window, neg_ratio) -> float:
+    # one window at a time (the candidate graph is large under full-FT) with grad accumulation per doc_bs
+    order = list(idx)
+    random.shuffle(order)
+    total, n = 0.0, 0
+    for s in tqdm(range(0, len(order), doc_bs), desc="train"):
+        batch = order[s : s + doc_bs]
+        wins = [(c, g) for i in batch for (c, g, _) in _span_windows(docs[i], window)]
+        if not wins:
+            continue
+        optimizer.zero_grad()
+        bl = 0.0
+        for c, g in wins:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
+                loss = _span_loss(model, c, g, tokenizer, device, neg_ratio)
+            if loss is None:
+                continue
+            (loss / len(wins)).backward()
+            bl += loss.item() / len(wins)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total += bl * len(batch)
+        n += len(batch)
+    return total / max(n, 1)
+
+
+def _span_scored(model, docs, idx, tokenizer, device, window) -> tuple:
+    # (sigmoid scores, is_gold flags, gold word-len per candidate (or -1), n_gold, gold-count-by-len)
+    scores, golds, glen, n_gold = [], [], [], 0
+    gold_by_len: Counter = Counter()
+    with torch.inference_mode():
+        for i in idx:
+            d = docs[i]
+            gold_global = {(int(s), int(e)) for s, e in d["span_sub"]}
+            n_gold += len(gold_global)
+            wlen = {
+                (int(d["span_sub"][k][0]), int(d["span_sub"][k][1])): min(d["spans"][k][2] - d["spans"][k][1], 6)
+                for k in range(len(d["span_sub"]))
+            }
+            for v in wlen.values():
+                gold_by_len[v] += 1
+            for c, _g, cs in _span_windows(d, window):
+                ids, mask = _bio_pack([c], tokenizer, device)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
+                    h = model.encode(ids, mask)[0, 1 : 1 + len(c)]
+                    ii, jj, logit = model.score(h)
+                if logit.numel() == 0:
+                    continue
+                sig = torch.sigmoid(logit.float()).cpu().numpy()
+                for a, b, sc in zip(ii.tolist(), jj.tolist(), sig, strict=True):
+                    g = (cs + a, cs + b)
+                    is_g = g in gold_global
+                    scores.append(sc)
+                    golds.append(is_g)
+                    glen.append(wlen[g] if is_g else -1)
+    return np.asarray(scores), np.asarray(golds, dtype=bool), np.asarray(glen), n_gold, gold_by_len
+
+
+def _span_report(scores, golds, glen, n_gold, gold_by_len, thr) -> tuple:
+    keep = scores > thr
+    tp = int(golds[keep].sum())
+    fp = int(keep.sum()) - tp
+    fn = n_gold - tp
+    p, r = tp / max(tp + fp, 1), tp / max(tp + fn, 1)
+    f1 = 2 * p * r / max(p + r, 1e-9)
+    bylen = {
+        L: 100 * int(((glen == L) & keep).sum()) / max(gold_by_len[L], 1) for L in sorted(gold_by_len)
+    }
+    return f1, p, r, bylen
+
+
+def train_span_detector(
+    window: int = 510,
+    n_trainable_layers: int = 24,
+    max_span: int = 30,
+    max_epochs: int = 20,
+    patience: int = 4,
+    doc_bs: int = 4,
+    lr: float = 1e-5,
+    head_lr: float = 1e-3,
+    neg_ratio: int = 5,
+    dropout: float = 0.2,
+    weight_decay: float = 0.1,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> None:
+    print(f"\nTraining SPAN detector (conll2012, window={window}, full-FT top {n_trainable_layers} layers, "
+          f"max_span={max_span}, hard-neg {neg_ratio}:1)")
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(RANDOM_SEED)
+    nom_cache, datasets, preco_n, _ = _data_cfg("conll")
+    docs = _filter_docs(build_docs(device=device, datasets=datasets, nom_cache=nom_cache, preco_n=preco_n), "conll")
+    for d in docs:
+        d["tok_pos"] = np.asarray([s for s, _ in d["span_sub"]], dtype=np.int64)
+    _apply_sentence_windows(docs, window)
+    tokenizer = load_tokenizer()
+    train_i = [i for i, d in enumerate(docs) if d["split"] == "train"]
+    val_i = [i for i, d in enumerate(docs) if d["split"] == "validation"]
+    test_i = [i for i, d in enumerate(docs) if d["split"] == "test"]
+    n_long = sum(1 for d in docs for s, e in d["span_sub"] if e - s >= max_span)
+    n_all = sum(len(d["span_sub"]) for d in docs)
+    print(f"train {len(train_i)} | val {len(val_i)} | test {len(test_i)} | gold >= max_span (unreachable): "
+          f"{n_long}/{n_all} ({100 * n_long / max(n_all, 1):.2f}%)")
+
+    model = SpanDetector(model_name=BACKBONE, n_trainable_layers=n_trainable_layers, dropout=dropout,
+                         max_span=max_span).to(device)
+    head = [p for n, p in model.named_parameters() if not n.startswith("roberta.") and p.requires_grad]
+    bb = [p for p in model.roberta.parameters() if p.requires_grad]
+    optimizer = optim.AdamW([{"params": head, "lr": head_lr}, {"params": bb, "lr": lr}], weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=lr * 0.1)
+    print(f"trainable params: {sum(p.numel() for p in head + bb):,}")
+    ckpt = MODELS_DIR / f"span_detector_k{window}{ENCODER_TAG}.pt"
+    grid = np.arange(0.05, 0.96, 0.05)
+    best_f1, best_thr, patience_ctr = -1.0, 0.5, 0
+
+    for epoch in range(max_epochs):
+        print(f"\n=== Span Epoch {epoch + 1}/{max_epochs} ===")
+        model.train()
+        tr = _span_epoch(model, docs, train_i, optimizer, tokenizer, device, doc_bs, window, neg_ratio)
+        scheduler.step()
+        model.eval()
+        sc, go, gl, ng, gbl = _span_scored(model, docs, val_i, tokenizer, device, window)
+        thr = float(max(grid, key=lambda t: _span_report(sc, go, gl, ng, gbl, t)[0]))
+        f1r, p, r, bylen = _span_report(sc, go, gl, ng, gbl, thr)
+        print(f"train loss {tr:.4f} | val exact P {100 * p:.2f} R {100 * r:.2f} F1 {100 * f1r:.2f} @thr {thr:.2f}")
+        print("  exact recall by gold word-len: " + " ".join(f"{L}{'+' if L == 6 else ''}={v:.0f}%" for L, v in bylen.items()))
+        if f1r > best_f1 + 1e-4:
+            best_f1, best_thr, patience_ctr = f1r, thr, 0
+            torch.save({"model": model.state_dict(), "threshold": thr, "max_span": max_span}, ckpt)
+            print(f"✓ saved (val F1 {100 * f1r:.2f})")
+        else:
+            patience_ctr += 1
+            if patience_ctr >= patience:
+                print(f"⊘ early stop. best val F1 {100 * best_f1:.2f}")
+                break
+
+    model.load_state_dict(torch.load(ckpt, map_location=device)["model"])
+    model.eval()
+    sc, go, gl, ng, gbl = _span_scored(model, docs, test_i, tokenizer, device, window)
+    f1, p, r, bylen = _span_report(sc, go, gl, ng, gbl, best_thr)
+    print(f"\n=== Span detector TEST (conll2012) @thr {best_thr:.2f} ===")
+    print(f"exact P {100 * p:.2f} | R {100 * r:.2f} | F1 {100 * f1:.2f}")
+    print("exact recall by gold word-len (cf. BIO 6+ = 39%): " + " ".join(f"{L}{'+' if L == 6 else ''}={v:.0f}%" for L, v in bylen.items()))
+
+
+def _span_predict_doc(model, d: dict, tokenizer, device, window: int, thr: float) -> set:
+    # decode predicted spans from the span detector: every candidate with sigmoid > thr, union over
+    # windows -> set of (start, end) inclusive SUBTOKEN spans (same format as the BIO detector's output).
+    pred = set()
+    with torch.inference_mode():
+        for c, _g, cs in _span_windows(d, window):
+            ids, mask = _bio_pack([c], tokenizer, device)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
+                h = model.encode(ids, mask)[0, 1 : 1 + len(c)]
+                ii, jj, logit = model.score(h)
+            if logit.numel() == 0:
+                continue
+            sig = torch.sigmoid(logit.float()).cpu().numpy()
+            for a, b, sc in zip(ii.tolist(), jj.tolist(), sig, strict=True):
+                if sc > thr:
+                    pred.add((cs + a, cs + b))
+    return pred

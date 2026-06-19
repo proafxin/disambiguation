@@ -534,9 +534,9 @@ TSWLatexianTemp*
 ARCHITECTURE.md
 data/*
 models/*.pt
-RESEARCH.md
+# RESEARCH.md
 cache/*
 log*.txt
 #paper/*
 STAGE2_DESIGN.md
-paper/jmlr2e.sty
+# paper/jmlr2e.sty
