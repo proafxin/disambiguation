@@ -426,30 +426,56 @@ Transformers pay O(N²) cost because they entangle all signal dimensions into on
 
 ## 10. Predicted Mentions — End-to-End System
 
-All results above use **gold mentions** (the resolution upper bound). This section replaces gold mentions with a learned **mention detector**, making the system end-to-end, and shows it **matches the gold-mention ceiling**.
+All results above use **gold mentions** (the resolution upper bound). This section replaces them with a learned **mention detector**, making the system end-to-end. The honest result: predicted-mention CoNLL F1 ≈ **74** on test vs the **86.46** gold ceiling, and a careful decomposition shows the entire gap is **detection quality** (dominated by mention-boundary accuracy) — *not* the resolution signal and *not* the resolver training.
 
-### 10.1 The detector — stacked-BIO token classifier
+### 10.1 The detector
 
-Mention detection is cast as **BIO token classification** over RoBERTa subtokens. CoNLL nesting is 100% clean containment (0% crossing; depth distribution 88.9 / 10.2 / 0.8 / 0.06%), so mentions are tagged by **L=3 stacked B/I/O heads**, one per containment depth (head 0 = flat/outermost, head 1 = depth-1 nested, …); union of per-head B…I runs is the prediction. Window = 510 content tokens (RoBERTa's position limit), sentence-aligned packing (no stride — CoNLL mentions are within-sentence, so never split).
+Two detectors were built. Both fine-tune RoBERTa-large; both run per window (sentence-aligned, ≤510 content tokens) with no pairwise comparison, preserving the O(NK) thesis.
 
-The lever is **trainable depth**, established by ablation: head-only on a frozen backbone = 52 exact F1 (frozen features encode named-entity boundaries, not full-NP boundaries); top-6 layers = 76; **full fine-tune = 85.6 exact / 92.4 overlap**. Boundary adaptation is distributed through the stack (constituency is mid-stack), so depth is required. An NER-pretrained init (`roberta-large-ner-english`) does *not* beat vanilla — coref mentions ≠ named entities, and at full FT the init washes out. Per-head class weighting to boost nested recall is a wash (≈ a baked-in decode threshold). At decode threshold 0.2 the detector reaches **95.3% overlap recall**; the residual miss is common nouns / short mentions (the same hard bucket that limits resolution), not nesting. Of the false positives, **89% are valid noun phrases** the OntoNotes coref layer omits as singletons (benign — Stage B drops size-1 clusters post-merge), only 11% genuine garbage.
+**BIO token classifier.** Detection as BIO tagging over subtokens. CoNLL nesting is 100% clean containment (depth 88.9 / 10.2 / 0.8 / 0.06%), so mentions are tagged by **L=3 stacked B/I/O heads**, one per containment depth; the union of per-head B…I runs is the prediction. The lever is **trainable depth**: head-only on a frozen backbone = 52 exact F1 (frozen features don't expose full-NP boundaries), top-6 layers = 76, **full fine-tune = 85.6 exact / 92.4 overlap**. An NER-pretrained init does *not* beat vanilla (coref mentions ≠ named entities; at full FT the init washes out), and per-head class weighting for nested recall is a wash. Of its false positives, **89% are valid NPs** the OntoNotes coref layer omits as singletons (benign — Stage B drops size-1 clusters post-merge).
+
+**Span scorer (the boundary fix, §10.5).** BIO's weakness is exposed by a per-length breakdown: it clips **long noun phrases** — exact recall by gold word-length is 1-word 97%, 3-word 79%, **6+ -word 39%** — because per-token membership under-extends the periphery of long NPs. A full-FT RoBERTa + **s2e span scorer** (`score(i,j) = wₛ·f(xᵢ) + wₑ·f(xⱼ) + f(xᵢ)ᵀ B f(xⱼ)`, scoring each `(start,end)` span as a unit with boundary-focused hard negatives) lifts this to **87.33 exact F1, 6+ -word 65%** — a +26-point fix on long NPs. The bilinear is computed as `(s@B)·e` (a plain `(proj,proj)` weight), never `nn.Bilinear`, which materializes a `(n_candidates, proj, proj)` intermediate and OOMs at ~15k spans/window.
 
 ### 10.2 The bridge
 
-`build_predicted_docs` runs the detector, snaps subtoken spans to word boundaries, BGE-encodes the surfaces and gathers **frozen-RoBERTa** context at the predicted spans (the *same* frozen channels as the gold path — the detector's fine-tuned backbone supplies only the span *selection*, never the resolution features), and assigns each predicted span a cluster label by **exact-then-max-overlap** alignment to gold (unmatched → singleton). Gold clusters are retained solely as the scoring **key** (gold is never an input). The gold caches and checkpoints are untouched.
+`build_predicted_docs` runs the detector, snaps subtoken spans to word boundaries, BGE-encodes the surfaces and gathers **frozen-RoBERTa** context at the predicted spans (the *same* frozen channels as the gold path — the detector supplies only span *selection*, never resolution features), and labels each predicted span by **exact-then-max-overlap** alignment to gold (unmatched → singleton). Gold clusters are kept solely as the scoring **key** (gold is never an input). Gold caches/checkpoints are untouched.
 
-### 10.3 Result — predicted mentions match gold
+### 10.3 A measurement caveat that corrected the whole story
 
-The **gold-trained** Stage A + Stage B, **reused without retraining** on predicted mentions (thr=0.2, nb_offset=0):
+An earlier version of this section reported predicted A+B = 86.66, "matching the gold ceiling." **That was a train/test-leakage artifact:** the run helpers evaluated over *all* documents (train+val+test), and the gold-trained models had been trained on those train docs. The honest **test-only** number is ≈ **70** (BIO detector). All end-to-end numbers below are test-only, with the ablation machinery verified to reproduce the 86.46 gold ceiling exactly.
 
-| | MUC | B³ | CEAFe | **CoNLL** |
-| --- | --- | --- | --- | --- |
-| gold mentions (A+B) | 92.47 | 84.37 | 82.54 | **86.46** |
-| **predicted mentions (A+B)** | 91.28 | 84.73 | 83.96 | **86.66** |
-| Δ | −1.19 | +0.36 | +1.42 | **+0.20** |
+### 10.4 Decomposition — it's detection, not signal or training
 
-The end-to-end predicted-mention system **matches the gold-mention upper bound** (86.66 vs 86.46, same scorer and full-document gold key). The metric split is the signature of the trade: **MUC down** (link-based — the ~5% missed mentions break coreference links, the honest cost of detection) but **B³/CEAFe up** (entity-based — the detector filters hard, mis-clusterable common nouns, yielding cleaner entities). The two effects net to parity.
+Two controls rule out the obvious culprits:
 
-Intra-window Stage A alone scores **90.20** vs window-split gold **89.48** — *above* the gold ceiling, but this is flattering: it is the easy intra-window task, and the detector's filtering removes exactly the hard mentions Stage A mis-clusters (a *selection* advantage that exists only within a window). End-to-end, where missed mentions are unrecoverable across windows, the advantage collapses to parity — the trustworthy 86.66.
+- **Not the resolver training.** Training Stage A *and* the Stage B GNN from scratch on predicted mentions yields ≈70.6 on test — *identical* to the gold-trained pipeline applied to predicted mentions (≈70.3). Clean-vs-noisy training is a wash: training on the detector's noise neither helps nor hurts. (Predicted-from-scratch training is also the methodologically correct way to claim "end-to-end on predicted mentions" — training the resolver on gold *spans* and inferring on predicted is a pipeline with a train/test span mismatch, not comparable to joint end-to-end systems.)
+- **Not the signal.** Running the gold pipeline on the *detected subset of gold mentions* — same BGE+RoBERTa signal, read at *correct* boundaries — recovers to **83.43**, within ~3 of the ceiling. The frozen factorized signal is sufficient; predicted mentions just sample it at the wrong token positions.
 
-**Takeaway:** the windowed, factorized, frozen-encoder coref system is fully end-to-end with a learned mention detector and loses nothing against gold mentions. Whether *training* A and B on predicted mentions (vs the clean gold signal used here) improves further is the open question under investigation.
+A controlled ablation (gold pipeline, test-only, removing one error type at a time) splits the gap cleanly:
+
+| mention set | A+B (BIO) | isolates |
+| --- | --- | --- |
+| all gold (ceiling) | 86.46 | — |
+| gold-detected (correct boundaries, drop missed) | 83.43 | missed −3.0 |
+| matched-only (predicted boundaries, no spurious) | 76.87 | **boundary −6.6** |
+| all predicted (+ spurious) | 72.82 | spurious −4.0 |
+
+So the ~13.6-point gap is **boundary −6.6, spurious −4.0, missed −3.0** — and boundary error is the single largest cost. (The metric drop is broad — MUC/B³/CEAFe all fall ~14–17 — i.e. general degradation, not a mention-set signature.)
+
+### 10.5 The boundary fix and its payoff
+
+The boundary cost is the BIO detector handing Stage A the wrong span extent for long NPs (it reads RoBERTa endpoints and the BGE surface for a clipped span). Post-processing was tried and **failed**: snapping predicted spans to spaCy head-subtrees or noun-chunks *lowered* exact recall (−546 / −3658), because OntoNotes mention boundaries are not spaCy constituents. The fix had to be in the detector — hence the span scorer (§10.1), which directly optimizes extent.
+
+The span detector cuts the boundary cost, but the end-to-end payoff is **modest**:
+
+| (test-only, gold pipeline) | BIO | Span | Δ |
+| --- | --- | --- | --- |
+| gold-detected | 83.43 | 82.75 | missed −3.7 (thr 0.5 vs 0.2) |
+| matched-only | 76.87 | 77.35 | **boundary −5.4** (was −6.6) |
+| all predicted | 72.82 | 73.77 | **+0.95** |
+
+The +26 on long NPs only moves end-to-end ~+1, because **6+ -word mentions are ~12% of all mentions**: the boundary cost tracks *overall* exact rate (which improved only +1.7, 85.6→87.3), not the long-NP bucket. The residual gap is now evenly distributed — boundary −5.4, spurious −3.6, missed −3.7 — with no single dominant lever.
+
+### 10.6 Bottom line
+
+The windowed, factorized, frozen-encoder system is **fully end-to-end with a learned detector**, and the resolvers (Stage A & B) are **viable on predicted mentions** — they are not the bottleneck (signal sufficient, training a wash). The end-to-end number is **≈74** (span detector, threshold-tunable) against the **86.46** gold-mention upper bound. The entire ~12-point gap is **detection quality**: correctly diagnosed as boundary-dominated, partly closed by the span scorer, but closing it fully needs broadly better exact detection (87→90%+, across all lengths, not just long NPs), not a different resolution signal or training scheme. The honest framing is therefore: gold-mention 86.46 as the upper bound, predicted-mention ~74 as the end-to-end result, and detector exact-boundary accuracy as the remaining lever.
