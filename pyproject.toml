@@ -11,15 +11,15 @@ dependencies = [
     "datasets>=5.0.0",
     "sentence-transformers>=5.5.1",
     "spacy>=3.8.14",
-    "transformers>=5.10.2",
+    "transformers>=5.13.0",
     "sentencepiece>=0.2.1",
     "protobuf>=7.35.0",
-    "tensorboard>=2.20.0",
+    "tensorboard>=2.21.0",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.3",
+    "pytest>=9.1.1",
 ]
 
 [[tool.uv.index]]
