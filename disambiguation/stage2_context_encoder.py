@@ -16,6 +16,7 @@ BGE_DIM = 1024
 CTX_DIM = 1024
 CONTENT = 512  # tokens per fixed window
 WINDOW = CONTENT + 2  # + <s>/</s>
+CTX_ENCODE_MAX_WINDOWS = 2048  # cross-doc ctx-encode batch cap (~18 GB peak at width 258 on 24 GB; calibrate per GPU)
 
 
 class ContextEncoder(nn.Module):
@@ -46,7 +47,8 @@ def encode_document_ctx(
         ids[k, 1 : 1 + len(w)] = w
         ids[k, 1 + len(w)] = sep_id
         mask[k, : 2 + len(w)] = 1
-    out = encoder(torch.from_numpy(ids).to(device), torch.from_numpy(mask).to(device))
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
+        out = encoder(torch.from_numpy(ids).to(device), torch.from_numpy(mask).to(device))
     pos_list, val_list = [], []
     for k, (s, e) in enumerate(spans):
         pos_list.append(torch.arange(s, e, device=device))
@@ -59,6 +61,43 @@ def encode_document_ctx(
     )
     ctx /= counts.clamp(min=1).unsqueeze(1)  # uncovered positions stay 0 (avoid 0/0 -> NaN)
     return F.normalize(ctx, p=2, dim=-1, eps=1e-4)  # eps>0 in fp16: a zero (uncovered) row -> 0, not NaN
+
+
+def encode_docs_ctx_batched(
+    content_ids_list: list[np.ndarray], chunks_list: list[list[tuple[int, int]] | None],
+    encoder: "ContextEncoder", cls_id: int, sep_id: int, device: str, window: int = CONTENT,
+) -> list[torch.Tensor]:
+    # Cross-doc batched form of encode_document_ctx: packs every window of every doc in the group into
+    # ONE padded encoder forward, then reconstructs each doc's per-token ctx exactly as the per-doc path
+    # (disjoint chunks -> counts=1 -> plain scatter; attention_mask zeroes padding, so reps are identical).
+    # One forward for the whole group, so the frozen encoder runs at a GPU-saturating batch.
+    specs = []
+    for dp, cids in enumerate(content_ids_list):
+        n = len(cids)
+        chunks = chunks_list[dp] if chunks_list[dp] is not None else [(s, min(s + window, n)) for s in range(0, n, window)]
+        for s, e in chunks:
+            specs.append((dp, s, e))
+    width = max(e - s for _, s, e in specs) + 2
+    ids = np.ones((len(specs), width), dtype=np.int64)
+    mask = np.zeros((len(specs), width), dtype=np.int64)
+    for k, (dp, s, e) in enumerate(specs):
+        w = content_ids_list[dp][s:e]
+        ids[k, 0] = cls_id
+        ids[k, 1 : 1 + len(w)] = w
+        ids[k, 1 + len(w)] = sep_id
+        mask[k, : 2 + len(w)] = 1
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
+        out = encoder(torch.from_numpy(ids).to(device), torch.from_numpy(mask).to(device))
+    ctxs = [torch.zeros(len(c), CTX_DIM, device=device, dtype=out.dtype) for c in content_ids_list]
+    counts = [torch.zeros(len(c), device=device, dtype=out.dtype) for c in content_ids_list]
+    for k, (dp, s, e) in enumerate(specs):
+        pos = torch.arange(s, e, device=device)
+        ctxs[dp].index_add_(0, pos, out[k, 1 : 1 + (e - s)])
+        counts[dp].index_add_(0, pos, torch.ones(e - s, device=device, dtype=out.dtype))
+    return [
+        F.normalize(ctxs[dp] / counts[dp].clamp(min=1).unsqueeze(1), p=2, dim=-1, eps=1e-4)
+        for dp in range(len(content_ids_list))
+    ]
 
 
 # ── Stage A ───────────────────────────────────────────────────────────────────
@@ -515,11 +554,14 @@ def antecedent_mll_loss(
     gold_num = torch.logsumexp(scores.masked_fill(~gold, neg), dim=1)
     num = torch.where(has_gold, gold_num, null_bias.squeeze().expand(M))
     per = denom - num
-    if pos_weight == 1.0:
-        return per[idx >= 1].mean()
-    w = torch.where(has_gold, per.new_tensor(pos_weight), per.new_tensor(1.0))
+    # Class-balanced (see _padded_mll): average within should-merge vs should-reject, combine equally,
+    # so the loss is invariant to their counts — the null-heavy cross-window regime can't collapse it.
     sel = idx >= 1
-    return (per * w)[sel].sum() / w[sel].sum()
+    link = sel & has_gold
+    reject = sel & ~has_gold
+    link_loss = per[link].mean() if link.any() else per.new_zeros(())
+    reject_loss = per[reject].mean() if reject.any() else per.new_zeros(())
+    return 0.5 * (link_loss + reject_loss)
 
 
 # ── Shared utilities ──────────────────────────────────────────────────────────

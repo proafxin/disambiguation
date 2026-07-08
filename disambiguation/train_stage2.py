@@ -7,7 +7,7 @@ from disambiguation.stage_b import train_stage_b
 if __name__ == "__main__":
     # sent_aligned=True runs the sentence-packed-window variant end-to-end (own ctx cache, head,
     # clusters); Stage A and Stage B share the exact same windows. Set False for the fixed-K system.
-    window, channel, sent_aligned, subset = 256, "both", True, "all8k"
+    window, channel, sent_aligned, subset = 256, "both", True, "p2c"
     # Canonical Stage A (raw=False, projected + distance = 89.48). raw is abandoned -- it overfits
     # (Stage A -1.58 vs projected); the projection regularizes. Instead we widen ONLY the GNN's
     # RoBERTa projection in Stage B from 512 to 1024 (ctx_proj), since RoBERTa is the dominant and

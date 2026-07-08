@@ -4,8 +4,6 @@ import random
 from pathlib import Path
 
 import numpy as np
-import spacy
-import spacy.tokens
 import torch
 from datasets import load_from_disk
 from sentence_transformers import SentenceTransformer
@@ -15,14 +13,15 @@ from disambiguation.paths import (
     DATA_DIR,
     NOM_CACHE,
     NOM_CACHE_CP8K,
-    SPACY_TRF_DIR,
     SPAN_CTX_CACHE,
     SPAN_CTX_CP8K,
 )
 from disambiguation.stage2_context_encoder import (
     CONTENT,
     CTX_DIM,
+    CTX_ENCODE_MAX_WINDOWS,
     ENCODER_TAG,
+    encode_docs_ctx_batched,
     encode_document_ctx,
     load_tokenizer,
 )
@@ -30,11 +29,12 @@ from disambiguation.stage2_context_encoder import (
 BGE_MODEL = "BAAI/bge-large-en-v1.5"
 CONLL_SPLITS = ["train", "validation", "test"]
 PRECO_SUBSAMPLE = 8000  # ctx_vecs held as float16 in RAM; conll+preco@8k fits ~4.4 GB fully resident
+PRECO_FULL = 36620  # full PreCo train split
 RANDOM_SEED = 42
 
 
-_SUBSET_TAG = {"all": "", "conll": "_conllonly", "nopreco": "_nopreco", "cp8k": "_cp8k", "all8k": "_all8k"}
-_PRECO_CAP = {"cp8k": 8000, "all8k": 8000}  # cap preco *training* docs (cache may hold more)
+_SUBSET_TAG = {"all": "", "conll": "_conllonly", "nopreco": "_nopreco", "cp8k": "_cp8k", "all8k": "_all8k", "p2c": "_p2c"}
+_PRECO_CAP = {"all8k": 8000}  # cap preco *training* docs (cache may hold more)
 
 
 def _data_cfg(subset: str) -> tuple:
@@ -44,8 +44,8 @@ def _data_cfg(subset: str) -> tuple:
     # The nominal cache is encoder-independent (BGE vectors + structure); only the subtoken
     # tokenization is encoder-specific and is re-derived at load by _retokenize for a non-default
     # contextual encoder — so swapping encoders never re-encodes BGE or re-runs spaCy.
-    if subset == "cp8k":
-        return (NOM_CACHE_CP8K, ("conll2012", "preco"), PRECO_SUBSAMPLE, True)
+    if subset in ("cp8k", "p2c"):
+        return (NOM_CACHE_CP8K, ("conll2012", "preco"), PRECO_FULL, True)
     return (NOM_CACHE, ("conll2012", "litbank", "preco", "corefud"), 10000, False)
 
 
@@ -59,6 +59,8 @@ def _train_idx(docs: list, subset: str) -> list:
             continue
         name = d["name"]
         if subset == "nopreco" and name.startswith("preco/"):
+            continue
+        if subset == "p2c" and not name.startswith("preco/"):
             continue
         if cap is not None and name.startswith("preco/"):
             if preco >= cap:
@@ -91,7 +93,7 @@ def _win_names(window: int, subset: str = "all", channel: str = "both", sent_ali
     # ENCODER_TAG separates a non-default contextual encoder's artifacts (e.g. SpanBERT) from RoBERTa's
     sa = "_sent" if sent_aligned else ""
     t = f"_k{window}" + _SUBSET_TAG[subset] + ("" if channel == "both" else f"_{channel}") + sa + ENCODER_TAG
-    ctx = SPAN_CTX_CP8K if subset == "cp8k" else SPAN_CTX_CACHE
+    ctx = SPAN_CTX_CP8K if subset in ("cp8k", "p2c") else SPAN_CTX_CACHE
     return (
         ctx.with_name(ctx.name + f"_k{window}{sa}{ENCODER_TAG}"),
         f"stage2_frozen_head{t}",
@@ -143,34 +145,6 @@ def _apply_sentence_windows(docs: list, window: int) -> None:
         d["win_chunks"] = chunks
         starts = np.asarray([s for s, _ in chunks], dtype=np.int64)
         d["win_ids"] = np.searchsorted(starts, d["tok_pos"], side="right") - 1
-
-
-def _doc_structure_conll(sample: dict, spacy_doc: spacy.tokens.Doc) -> tuple:
-    # Returns (sents, offsets, spans, cluster_id, mention_surfaces)
-    # spans: (sent_idx, start, end) end-exclusive; mention_surfaces: full span text for BGE
-    sents = sample["sentences"]
-    offsets, off = [], 0
-    for s in sents:
-        offsets.append(off)
-        off += len(s)
-    spacy_sents = list(spacy_doc.sents)
-    spans, cluster_id, mention_surfaces, head_lex = [], [], [], []
-    for cid, cluster in enumerate(sample["mention_clusters"]):
-        for si, a, b in cluster:
-            if si >= len(spacy_sents):
-                continue
-            sent_span = spacy_sents[si]
-            if a >= len(sent_span):
-                continue
-            head_tok = sent_span[a : min(b, len(sent_span))].root
-            head_local = head_tok.i - sent_span.start
-            if head_local >= len(sents[si]):
-                continue
-            spans.append((si, a, b))
-            cluster_id.append(cid)
-            mention_surfaces.append(" ".join(sents[si][a:b]))
-            head_lex.append((head_tok.lemma_, head_tok.lower_))
-    return sents, offsets, spans, cluster_id, mention_surfaces, head_lex
 
 
 def _doc_structure_generic(sents: list[list[str]], clusters: list[list[tuple]]) -> tuple:
@@ -321,8 +295,10 @@ def _assemble_docs(raw: list, device: str, cache_path) -> list:
     surface_vocab = sorted({surf for r in raw for surf in r[5]})
     print(f"Encoding {len(surface_vocab)} unique mention surfaces with BGE...")
     bge = SentenceTransformer(BGE_MODEL, device=device)
+    if device != "cpu":
+        bge = bge.half()
     embs = np.asarray(
-        bge.encode(surface_vocab, normalize_embeddings=True, batch_size=512, show_progress_bar=True), dtype=np.float32
+        bge.encode(surface_vocab, normalize_embeddings=True, batch_size=512, show_progress_bar=True), dtype=np.float16
     )
     surf2bge = {s: embs[i] for i, s in enumerate(surface_vocab)}
     del bge
@@ -350,11 +326,11 @@ def _assemble_docs(raw: list, device: str, cache_path) -> list:
                 "span_sub": np.asarray(span_sub, dtype=np.int64),
                 "sent_sub_offsets": np.asarray(sent_sub_offsets, dtype=np.int64),
                 "sent_sub_lengths": np.asarray(sent_sub_lengths, dtype=np.int64),
-                "mention_bge": np.stack([surf2bge[s] for s in mention_surfaces]).astype(np.float32),
+                "mention_bge": np.stack([surf2bge[s] for s in mention_surfaces]).astype(np.float16),
             }
         )
     with cache_path.open("wb") as f:
-        pickle.dump([{**d, "mention_bge": d["mention_bge"].astype(np.float16)} for d in docs], f)
+        pickle.dump(docs, f)
     print(f"Cached {len(docs)} docs to {cache_path.name}")
     return docs
 
@@ -368,8 +344,6 @@ def build_docs(
     if nom_cache.exists():
         with nom_cache.open("rb") as f:
             docs = pickle.load(f)
-        for d in docs:
-            d["mention_bge"] = d["mention_bge"].astype(np.float32)
         if ENCODER_TAG:  # cache is tokenized for the default encoder; re-derive subtokens for this one
             tokenizer = load_tokenizer()
             for d in tqdm(docs, desc="re-tokenizing for current encoder"):
@@ -377,20 +351,21 @@ def build_docs(
         print(f"Loaded cached nominal docs: {len(docs)}")
         return docs
 
-    vocab = spacy.blank("en").vocab
     tokenizer = load_tokenizer()
     raw = []
 
     # --- CoNLL-2012 (all splits) ---
     for split in CONLL_SPLITS:
         ds = load_from_disk(str(DATA_DIR / "conll2012"))[split]
-        db = spacy.tokens.DocBin().from_disk(SPACY_TRF_DIR / f"conll2012_{split}.spacy")
-        for sample, sdoc in tqdm(zip(ds, db.get_docs(vocab), strict=True), total=len(ds), desc=f"conll2012/{split}"):
-            sents, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_conll(sample, sdoc)
+        for sample in tqdm(ds, total=len(ds), desc=f"conll2012/{split}"):
+            clusters = [[(si, a, b) for si, a, b in cl] for cl in sample["mention_clusters"]]
+            sents_str, offsets, spans, cluster_id, mention_surfaces, head_lex = _doc_structure_generic(
+                sample["sentences"], clusters
+            )
             rec = _raw_from_doc(
                 f"conll2012/{sample['doc_id']}#{len(raw)}",
                 split,
-                sents,
+                sents_str,
                 offsets,
                 spans,
                 cluster_id,
@@ -518,11 +493,39 @@ def _pop_built(d: dict) -> None:
         d.pop(k, None)
 
 
+def _n_windows(d: dict, window: int) -> int:
+    ch = d.get("win_chunks")
+    if ch is not None:
+        return len(ch)
+    n = len(d["content_ids"])
+    return max(1, (n + window - 1) // window)
+
+
+def _ctx_encode_groups(indices: list[int], docs: list, window: int) -> list[list[int]]:
+    # Greedily pack consecutive docs into groups whose total window count <= CTX_ENCODE_MAX_WINDOWS,
+    # so each encoder forward is GPU-saturating instead of one doc's worth of windows. A single doc
+    # exceeding the cap is its own group.
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    cnt = 0
+    for i in indices:
+        w = _n_windows(docs[i], window)
+        if cur and cnt + w > CTX_ENCODE_MAX_WINDOWS:
+            groups.append(cur)
+            cur, cnt = [], 0
+        cur.append(i)
+        cnt += w
+    if cur:
+        groups.append(cur)
+    return groups
+
+
 def _precompute_span_ctx_single(encoder, docs, cls_id, sep_id, device, base: Path, window: int) -> None:
-    # Single-file variant: all docs' span ctx packed into one .npy (+ offset index), held fully in RAM.
+    # Single-file variant: all docs' span ctx packed into one .npy (+ offset index), memory-mapped from
+    # disk (mmap_mode="c") so the full array is never RAM-resident — per-doc slices page in on access.
     big_p, off_p = _single_ctx_paths(base)
     if big_p.exists() and off_p.exists():
-        big = np.load(big_p)  # fully resident in RAM; per-doc slices are views into it
+        big = np.load(big_p, mmap_mode="c")  # memory-mapped; per-doc slices are paged views into it
         off = np.load(off_p)
         for i, d in enumerate(docs):
             d["ctx_vecs"] = big[off[i] : off[i + 1]]
@@ -531,26 +534,28 @@ def _precompute_span_ctx_single(encoder, docs, cls_id, sep_id, device, base: Pat
         return
     base.parent.mkdir(parents=True, exist_ok=True)
     total = sum(len(d["span_sub"]) for d in docs)
-    big = np.zeros((total, 2, CTX_DIM), dtype=np.float16)
+    big = np.lib.format.open_memmap(big_p, mode="w+", dtype=np.float16, shape=(total, 2, CTX_DIM))
     off = np.zeros(len(docs) + 1, dtype=np.int64)
     encoder.eval()
     pos = 0
+    groups = _ctx_encode_groups(list(range(len(docs))), docs, window)
     with torch.inference_mode():
-        for i, d in enumerate(tqdm(docs, desc="span ctx (single)")):
-            ctx = (
-                encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device, window, spans=d.get("win_chunks"))
-                .float()
-                .cpu()
-                .numpy()
+        for group in tqdm(groups, desc="span ctx (single)"):
+            ctxs = encode_docs_ctx_batched(
+                [docs[i]["content_ids"] for i in group],
+                [docs[i].get("win_chunks") for i in group],
+                encoder, cls_id, sep_id, device, window,
             )
-            cv = gather_spans_np(ctx, d["span_sub"])
-            big[pos : pos + cv.shape[0]] = cv
-            off[i] = pos
-            pos += cv.shape[0]
-            d["ctx_vecs"] = cv
-            _pop_built(d)
+            for i, ctx in zip(group, ctxs, strict=True):
+                cv = gather_spans_np(ctx.float().cpu().numpy(), docs[i]["span_sub"])
+                n = cv.shape[0]
+                big[pos : pos + n] = cv
+                off[i] = pos
+                docs[i]["ctx_vecs"] = big[pos : pos + n]
+                pos += n
+                _pop_built(docs[i])
     off[len(docs)] = pos
-    np.save(big_p, big)
+    big.flush()
     np.save(off_p, off)
     print(f"Cached span ctx (single file) → {big_p.name}: {pos} mentions, {big.nbytes / 1e9:.2f} GB")
 
@@ -558,7 +563,7 @@ def _precompute_span_ctx_single(encoder, docs, cls_id, sep_id, device, base: Pat
 def load_span_ctx_single(docs: list, base: Path) -> None:
     # populate d["ctx_vecs"] from the single-file cache (used by Stage B, which re-loads from disk)
     big_p, off_p = _single_ctx_paths(base)
-    big = np.load(big_p)  # fully resident in RAM; per-doc slices are views into it
+    big = np.load(big_p, mmap_mode="c")  # memory-mapped; per-doc slices are paged views into it
     off = np.load(off_p)
     for i, d in enumerate(docs):
         if "ctx_vecs" not in d:
@@ -575,42 +580,32 @@ def precompute_span_ctx(
         _precompute_span_ctx_single(encoder, docs, cls_id, sep_id, device, cache_dir, window)
         return
     cache_dir.mkdir(parents=True, exist_ok=True)
-    n_existing = sum(1 for i in range(len(docs)) if _ctx_path(i, cache_dir).exists())
-    if n_existing == len(docs):
-        for i, d in enumerate(docs):
+    todo = []
+    for i, d in enumerate(docs):
+        if _ctx_path(i, cache_dir).exists():
             d["ctx_vecs"] = np.load(_ctx_path(i, cache_dir)).astype(np.float16)
-            d.pop("content_ids", None)
-            d.pop("span_sub", None)
-            d.pop("sent_sub_offsets", None)
-            d.pop("sent_sub_lengths", None)
-        print(f"Loaded cached span ctx: {n_existing} docs")
+            _pop_built(d)
+        else:
+            todo.append(i)
+    if not todo:
+        print(f"Loaded cached span ctx: {len(docs)} docs")
         return
-    if n_existing > 0:
-        print(f"Resuming span ctx precompute from doc {n_existing}/{len(docs)}...")
+    if len(todo) < len(docs):
+        print(f"Resuming span ctx precompute: {len(docs) - len(todo)}/{len(docs)} already cached...")
     encoder.eval()
+    groups = _ctx_encode_groups(todo, docs, window)
     with torch.inference_mode():
-        for i, d in enumerate(tqdm(docs, desc="span ctx precompute")):
-            p = _ctx_path(i, cache_dir)
-            if p.exists():
-                d["ctx_vecs"] = np.load(p).astype(np.float16)
-                d.pop("content_ids", None)
-                d.pop("span_sub", None)
-                d.pop("sent_sub_offsets", None)
-                d.pop("sent_sub_lengths", None)
-                continue
-            ctx = (
-                encode_document_ctx(d["content_ids"], encoder, cls_id, sep_id, device, window, spans=d.get("win_chunks"))
-                .float()
-                .cpu()
-                .numpy()
+        for group in tqdm(groups, desc="span ctx precompute"):
+            ctxs = encode_docs_ctx_batched(
+                [docs[i]["content_ids"] for i in group],
+                [docs[i].get("win_chunks") for i in group],
+                encoder, cls_id, sep_id, device, window,
             )
-            ctx_vecs = gather_spans_np(ctx, d["span_sub"])
-            np.save(p, ctx_vecs)
-            d["ctx_vecs"] = ctx_vecs.astype(np.float16)
-            d.pop("content_ids", None)
-            d.pop("span_sub", None)
-            d.pop("sent_sub_offsets", None)
-            d.pop("sent_sub_lengths", None)
+            for i, ctx in zip(group, ctxs, strict=True):
+                cv = gather_spans_np(ctx.float().cpu().numpy(), docs[i]["span_sub"])
+                np.save(_ctx_path(i, cache_dir), cv)
+                docs[i]["ctx_vecs"] = cv.astype(np.float16)
+                _pop_built(docs[i])
     print(f"Cached span ctx to {cache_dir.name}/")
 
 

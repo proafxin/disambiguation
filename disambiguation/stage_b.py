@@ -327,20 +327,22 @@ def train_stage_b(
 
     train_idx = _train_idx(docs, subset)
     train_docs = [docs[i] for i in train_idx]
-    val_docs = [d for d in docs if d["split"] == "validation" and d["name"].startswith("conll2012/")]
-    test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
+    val_idx = [i for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")]
+    test_idx = [i for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")]
+    if subset == "p2c":  # select on CoNLL-train (transfer) + PreCo val; never training on CoNLL
+        conll_train_idx = [i for i, d in enumerate(docs) if d["split"] == "train" and d["name"].startswith("conll2012/")]
+        preco_val_idx = [i for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("preco/")]
+        val_idx = conll_train_idx + preco_val_idx
+    val_docs = [docs[i] for i in val_idx]
+    test_docs = [docs[i] for i in test_idx]
 
     # precompute Stage A clusters once — avoids re-running Stage A every epoch
     all_stage_a = precompute_stage_a_clusters(
         docs, stage_a, device, window, subset, channel, sent_aligned=sent_aligned, name_tag=arch_tag
     )
     train_clusters = [all_stage_a[i] for i in train_idx]
-    val_clusters = [
-        all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "validation" and d["name"].startswith("conll2012/")
-    ]
-    test_clusters = [
-        all_stage_a[i] for i, d in enumerate(docs) if d["split"] == "test" and d["name"].startswith("conll2012/")
-    ]
+    val_clusters = [all_stage_a[i] for i in val_idx]
+    test_clusters = [all_stage_a[i] for i in test_idx]
 
     all_train_pairs_count = sum(
         len(per_window) * (len(per_window) - 1) // 2 for per_window in train_clusters if per_window
@@ -410,9 +412,7 @@ def train_stage_b(
         tr_loss = total / max(n_pairs, 1)
 
         val_scores_all = {
-            ds: eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"val_{ds}_epoch{epoch + 1}")
-            for ds, (vdocs, vclusters) in val_sets.items()
-            if vdocs
+            "conll2012": eval_stage_b(val_docs, val_clusters, cluster_matcher, device, f"val_conll2012_epoch{epoch + 1}")
         }
         val_scores = val_scores_all["conll2012"]
         print(f"Loss: {tr_loss:.6f}")
@@ -436,6 +436,14 @@ def train_stage_b(
     print("\n✓ Stage B training complete")
     cluster_matcher.load_state_dict(torch.load(ckpt_path, map_location=device)["cluster_matcher"])
     cluster_matcher.eval()
+    for ds, (vdocs, vclusters) in val_sets.items():
+        if not vdocs:
+            continue
+        sc = eval_stage_b(vdocs, vclusters, cluster_matcher, device, f"final_val_{ds}")
+        print(
+            f"  val/{ds:10s} CoNLL {sc['CoNLL'] * 100:.2f} "
+            f"(MUC {sc['muc'] * 100:.2f} B3 {sc['bcub'] * 100:.2f} CEAFe {sc['ceafe'] * 100:.2f})"
+        )
     print("\n=== Stage B Test ===")
     test_scores = eval_stage_b(test_docs, test_clusters, cluster_matcher, device, "test", type_breakdown=True)
     print(

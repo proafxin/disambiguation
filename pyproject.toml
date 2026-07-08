@@ -50,7 +50,8 @@ exclude = [
     ".pytest_cache",
     "node_modules",
     "backend/alembic",
-    "scripts/migrations/**"
+    "scripts/migrations/**",
+    "ontonotes_parser.py"
 ]
 
 [tool.ruff.lint]
@@ -109,6 +110,11 @@ skips = ['*_test.py', '*/test_*.py', 'tests/*', '.venv/*', 'venv/*']
 python_version = "3.13"
 exclude = []
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "ontonotes_parser"
+follow_imports = "skip"
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -6,10 +6,8 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-import spacy.tokens
 import torch
 import torch.nn.functional as F
-from datasets import load_from_disk
 from torch import optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -26,12 +24,11 @@ from disambiguation.data import (
     _train_idx,
     _win_ids,
     _win_names,
-    _word_to_subtok,
     build_docs,
     precompute_full_ctx,
     precompute_span_ctx,
 )
-from disambiguation.paths import DATA_DIR, MODELS_DIR, SPACY_TRF_DIR, TENSORBOARD_DIR
+from disambiguation.paths import MODELS_DIR, TENSORBOARD_DIR
 from disambiguation.stage2_context_encoder import (
     BACKBONE,
     BGE_DIM,
@@ -129,12 +126,15 @@ def _padded_mll(scores, sizes, cids, weights, null_bias, device, null_weight: fl
     has_gold = gold.any(dim=2)
     num = torch.where(has_gold, torch.logsumexp(scores.masked_fill(~gold, neg), dim=2), null.squeeze().expand(b, max_m))
     per_ment = denom - num  # (B, maxM)
-    loss_mask = (valid & (ar.unsqueeze(0) >= 1)).to(per_ment.dtype)
-    if null_weight != 1.0:  # down-weight null-gold (singleton) rows so over-generation can't swamp null_bias
-        loss_mask = loss_mask * torch.where(has_gold, 1.0, null_weight)
-    w_loss = (per_ment * loss_mask).sum(1) / loss_mask.sum(1).clamp(min=1)  # (B,) per-window mean
-    wt = torch.tensor(weights, device=device, dtype=w_loss.dtype)
-    return (w_loss * wt).sum() / wt.sum()
+    # Class-balanced: average the loss WITHIN each outcome (should-link vs should-reject) and combine
+    # equally, so the objective is invariant to how many of each there are — the majority outcome
+    # (usually null) can no longer dominate the gradient. No count/dataset weighting.
+    sel = valid & (ar.unsqueeze(0) >= 1)
+    link = sel & has_gold
+    reject = sel & ~has_gold
+    link_loss = per_ment[link].mean() if link.any() else per_ment.new_zeros(())
+    reject_loss = per_ment[reject].mean() if reject.any() else per_ment.new_zeros(())
+    return 0.5 * (link_loss + reject_loss)
 
 
 def mention_transformer_loss(scorer, windows: list, device: str, null_weight: float = 1.0) -> torch.Tensor:
@@ -272,11 +272,15 @@ def train_stage_a(
 
     conll_val_docs = [d for d in docs if d["split"] == "validation" and d["name"].startswith("conll2012/")]
     conll_test_docs = [d for d in docs if d["split"] == "test" and d["name"].startswith("conll2012/")]
+    preco_val_docs = [d for d in docs if d["split"] == "validation" and d["name"].startswith("preco/")]
     train_docs = [docs[i] for i in _train_idx(docs, subset)]
+    if subset == "p2c":  # train PreCo only; select on CoNLL-train (transfer) + PreCo val, never training on CoNLL
+        conll_train_docs = [d for d in docs if d["split"] == "train" and d["name"].startswith("conll2012/")]
+        conll_val_docs = conll_train_docs + preco_val_docs
     val_sets = {
         "conll2012": conll_val_docs,
         "litbank": [d for d in docs if d["split"] == "validation" and d["name"].startswith("litbank/")],
-        "preco": [d for d in docs if d["split"] == "validation" and d["name"].startswith("preco/")],
+        "preco": preco_val_docs,
         "corefud": [d for d in docs if d["split"] == "validation" and d["name"].startswith("corefud/")],
     }
 
@@ -331,9 +335,7 @@ def train_stage_a(
             }
         val_loss = val_losses["conll2012"]
         val_scores = {
-            ds: eval_conll(scorer, vdocs, device, f"{tag}_val_{ds}", window=window)
-            for ds, vdocs in val_sets.items()
-            if vdocs
+            "conll2012": eval_conll(scorer, conll_val_docs, device, f"{tag}_val_conll2012", window=window)
         }
         val = val_scores["conll2012"]
         print(f"Loss: {tr_loss:.6f} | Val loss: {val_loss:.6f}")
@@ -511,7 +513,7 @@ def _stage_a_run(docs: list, test_idx: list, scorer, window: int, device: str) -
             with torch.inference_mode():
                 sc, mask = scorer(ctx, bge)
             sc, mask = sc.float().cpu().numpy(), mask.cpu().numpy()
-            wc, bg = cid[gidx], bge_all[gidx]
+            wc, bg = cid[gidx], bge_all[gidx].astype(np.float32)
             wt = [types[k] for k in gidx]
             wh = [toks[k][-1] for k in gidx]
             for a in range(1, len(gidx)):
@@ -1131,36 +1133,6 @@ def _fmt_bio_eval(m: dict) -> str:
     )
 
 
-def _plausible_spans_for_docs(docs, idx, tokenizer) -> dict:
-    # our doc index -> set of plausible-mention (start, end) inclusive SUBTOKEN spans, read from the
-    # cached spaCy DocBins (token-aligned 1:1 to dataset words, verified), so no parser model is
-    # needed. "Plausible mention" = any noun chunk, named entity, or pronoun — what a syntactic
-    # detector would propose — mapped into the same subtoken coordinate as gold/pred.
-    vocab = spacy.blank("en").vocab
-    by_words = {tuple(w for s in docs[i]["sentences"] for w in s): i for i in idx}
-    out: dict = {}
-    for split in sorted({docs[i]["split"] for i in idx}):
-        ds = load_from_disk(str(DATA_DIR / "conll2012"))[split]
-        db = spacy.tokens.DocBin().from_disk(SPACY_TRF_DIR / f"conll2012_{split}.spacy")
-        for sample, sdoc in zip(ds, db.get_docs(vocab), strict=False):
-            words = [w for s in sample["sentences"] for w in s]
-            di = by_words.get(tuple(words))
-            if di is None:
-                continue
-            content_ids, w2s = _word_to_subtok(words, tokenizer)
-            last = len(content_ids) - 1
-            wspans = [(c.start, c.end) for c in sdoc.noun_chunks]
-            wspans += [(e.start, e.end) for e in sdoc.ents]
-            wspans += [(t.i, t.i + 1) for t in sdoc if t.pos_ == "PRON"]
-            spans = set()
-            for ws, we in wspans:
-                ss = w2s.get(ws, min(ws, last))
-                se = min(max(w2s.get(we, len(content_ids)) - 1, ss), last)
-                spans.add((ss, se))
-            out[di] = spans
-    return out
-
-
 def _bio_miss_analysis(model, docs, idx, tokenizer, device, window, win_bs, n_layers, thr=None) -> None:
     # Characterize the *unrecoverable* misses — gold mentions with NO overlapping prediction — by
     # containment depth, mention type (PRON/PROPN/NOUN), and word length, to see where detector recall
@@ -1197,37 +1169,6 @@ def _bio_miss_analysis(model, docs, idx, tokenizer, device, window, win_bs, n_la
     for t in sorted(gold_t):
         print(f"  {t}: {miss_t.get(t, 0)}/{gold_t[t]} ({100 * miss_t.get(t, 0) / max(gold_t[t], 1):.1f}%)")
     print("missed by word length (1..6+):", {k: miss_len[k] for k in sorted(miss_len)})
-
-
-def _bio_singleton_breakdown(model, docs, idx, tokenizer, device, window, win_bs, n_layers) -> None:
-    # Of the disjoint FPs (predicted spans overlapping NO gold mention), how many are valid noun
-    # phrases (singletons the coref layer didn't annotate) vs. genuine garbage. This is the test that
-    # confirms whether the precision loss is the OntoNotes singleton convention — Stage A's problem —
-    # rather than the tagger emitting junk.
-    plaus_by_doc = _plausible_spans_for_docs(docs, idx, tokenizer)
-    disjoint = plausible = garbage = 0
-    with torch.inference_mode():
-        for i in tqdm(idx, desc="singleton breakdown"):
-            d = docs[i]
-            gold = [(int(s), int(e)) for s, e in d["span_sub"]]
-            gset = set(gold)
-            pred = _bio_predict_doc(model, d, tokenizer, device, window, win_bs, n_layers)
-            disj = [
-                (ps, pe)
-                for ps, pe in pred
-                if (ps, pe) not in gset and not any(_span_overlap(ps, pe, gs, ge) for gs, ge in gold)
-            ]
-            plaus = plaus_by_doc.get(i, set())
-            for ps, pe in disj:
-                disjoint += 1
-                if any(_span_overlap(ps, pe, qs, qe) for qs, qe in plaus):
-                    plausible += 1
-                else:
-                    garbage += 1
-    print(
-        f"disjoint FPs: {disjoint} | valid NP (likely singleton, Stage A handles): {plausible} "
-        f"({100 * plausible / max(disjoint, 1):.1f}%) | garbage: {garbage} ({100 * garbage / max(disjoint, 1):.1f}%)"
-    )
 
 
 def _bio_nested_breakdown(model, docs, idx, tokenizer, device, window, win_bs, n_layers, thr=None) -> None:
@@ -1394,7 +1335,6 @@ def train_bio_tagger(
         _bio_nested_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=None)
         _bio_nested_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=0.2)
         _bio_miss_analysis(model, docs, test_i, tokenizer, device, window, win_bs, n_layers, thr=0.2)
-        _bio_singleton_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers)
         return
 
     if resume and ckpt.exists():
@@ -1463,8 +1403,6 @@ def train_bio_tagger(
     m = _bio_eval(model, docs, test_i, tokenizer, device, window, win_bs, n_layers)
     print("\n=== BIO tagger TEST (conll2012) ===")
     print(_fmt_bio_eval(m))
-    # Tier 2 — prove what the disjoint FPs are: valid NP (singleton the coref layer omitted) vs garbage.
-    _bio_singleton_breakdown(model, docs, test_i, tokenizer, device, window, win_bs, n_layers)
 
 
 # ── Span-based mention detector (full-FT RoBERTa + span scorer, for exact boundaries) ────────────
